@@ -1,0 +1,56 @@
+#!/system/bin/sh
+
+PT="/tmp/production_tool"
+
+# ── ADB settings ──────────────────────────────────────────────────────────────
+setprop service.adb.tcp.port 5555
+setprop persist.adb.tcp.port 5555
+setprop persist.sys.usb.config mtp,adb
+stop adbd
+sleep 1
+start adbd
+
+# ── Wi-Fi client settings ──────────────────────────────────────────────────────
+cp $PT/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf
+chmod 660 /data/misc/wifi/wpa_supplicant.conf
+chown system:wifi /data/misc/wifi/wpa_supplicant.conf
+
+# restart Wi-Fi
+svc wifi disable
+sleep 2
+svc wifi enable
+sleep 5
+
+# ── Install MQTT bridge (persistent, survives USB removal) ────────────────────
+
+# copy config and bridge script to /data/local (always writable)
+cp $PT/config.json    /data/local/config.json
+cp $PT/mqtt_bridge.py /data/local/mqtt_bridge.py
+chmod 755 /data/local/mqtt_bridge.py
+
+# make root filesystem writable so we can update init RC files
+mount -o rw,remount /
+
+# disable wisund (it holds /dev/ttyS1 and blocks our bridge)
+cp $PT/wisund_disabled.rc /system/etc/init/wisund.rc
+
+# disable ndeclite_agent (depends on wisund socket, not needed)
+cp $PT/ndeclite_disabled.rc /system/etc/init/ndeclite_agent.rc
+
+# install our MQTT bridge as an init service (auto-start on next boot)
+cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
+
+# ── Stop conflicting services immediately ──────────────────────────────────────
+stop wisund
+stop NDEcLiteAgent
+sleep 2
+
+# ── Start MQTT bridge immediately via init (survives USB removal and reboot) ───
+stop mqtt_ha_bridge 2>/dev/null || true
+sleep 1
+start mqtt_ha_bridge
+
+# ── Finish LED (blink white) ───────────────────────────────────────────────
+cp $PT/led_effect.sh /data/local/led_effect.sh
+chmod 755 /data/local/led_effect.sh
+/data/local/led_effect.sh blink * 10
