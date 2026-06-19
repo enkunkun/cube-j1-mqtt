@@ -130,6 +130,18 @@ def apply_defaults(cfg):
     return out
 
 
+def compute_next_poll_sleep(last_poll_start, now, poll_interval):
+    """How long to sleep so the next poll begins `poll_interval` seconds after
+    the *start* of the previous one (deadline-based pacing). Clamped to 0 so
+    that an overrun (ERXUDP timeout) does not waste an extra cycle of silence.
+    """
+    deadline = last_poll_start + float(poll_interval)
+    remaining = deadline - now
+    if remaining <= 0:
+        return 0.0
+    return remaining
+
+
 # ---------------------------------------------------------------------------
 # Embedded admin UI: pure helpers
 # ---------------------------------------------------------------------------
@@ -2173,6 +2185,7 @@ def main():
 
     while True:
         try:
+            last_poll_start = time.time()
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
@@ -2225,7 +2238,10 @@ def main():
                 mqtt.ping()
                 last_ping = time.time()
 
-            time.sleep(poll_interval)
+            # Deadline-based pacing: keep ~poll_interval between *poll starts*
+            # rather than between cycle ends, so ERXUDP timeouts don't push
+            # the next measurement out by (timeout + poll_interval).
+            time.sleep(compute_next_poll_sleep(last_poll_start, time.time(), poll_interval))
 
         except Exception as e:
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
