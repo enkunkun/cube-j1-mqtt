@@ -342,6 +342,107 @@ def test_api_wisun_quality_empty(config_dir, admin_creds):
 
 
 # ---------------------------------------------------------------------------
+# AP toggle: /api/ap_state (spec 008)
+# ---------------------------------------------------------------------------
+
+class _FakeApCtrl(object):
+    def __init__(self):
+        self.state = {"enabled": True, "interface": "p2p-wlan0-0"}
+
+    def get(self):
+        return dict(self.state)
+
+    def enable(self):
+        self.state["enabled"] = True
+        return dict(self.state)
+
+    def disable(self):
+        self.state["enabled"] = False
+        return dict(self.state)
+
+
+def _spin_admin_with_ap(config_dir, admin_creds, ap_ctrl):
+    port = _free_port()
+    server = mb.start_admin_server(
+        port=port,
+        user=admin_creds["user"],
+        password=admin_creds["password"],
+        diag_state_provider=lambda: _FakeDiag(),
+        config_path=str(config_dir / "config.json"),
+        bridge_path=str(config_dir / "mqtt_bridge.py"),
+        wpa_supplicant_path=str(config_dir / "wpa_supplicant.conf"),
+        log_path=str(config_dir / "bridge.log"),
+        ap_controller=ap_ctrl,
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                break
+        except OSError:
+            time.sleep(0.02)
+    return server, port
+
+
+def test_get_ap_state_returns_enabled(config_dir, admin_creds):
+    ap = _FakeApCtrl()
+    server, port = _spin_admin_with_ap(config_dir, admin_creds, ap)
+    try:
+        r = requests.get(
+            "http://127.0.0.1:{}/api/ap_state".format(port),
+            headers=_auth(admin_creds), timeout=2)
+        assert r.status_code == 200
+        assert r.json()["enabled"] is True
+    finally:
+        server.stop()
+
+
+def test_put_ap_state_disables(config_dir, admin_creds):
+    ap = _FakeApCtrl()
+    server, port = _spin_admin_with_ap(config_dir, admin_creds, ap)
+    try:
+        r = requests.put(
+            "http://127.0.0.1:{}/api/ap_state".format(port),
+            headers={**_auth(admin_creds), "Content-Type": "application/json"},
+            json={"enabled": False}, timeout=2)
+        assert r.status_code == 200
+        assert r.json()["enabled"] is False
+        assert ap.state["enabled"] is False
+    finally:
+        server.stop()
+
+
+def test_put_ap_state_enables(config_dir, admin_creds):
+    ap = _FakeApCtrl()
+    ap.state["enabled"] = False
+    server, port = _spin_admin_with_ap(config_dir, admin_creds, ap)
+    try:
+        r = requests.put(
+            "http://127.0.0.1:{}/api/ap_state".format(port),
+            headers={**_auth(admin_creds), "Content-Type": "application/json"},
+            json={"enabled": True}, timeout=2)
+        assert r.status_code == 200
+        assert r.json()["enabled"] is True
+        assert ap.state["enabled"] is True
+    finally:
+        server.stop()
+
+
+def test_put_ap_state_requires_auth(config_dir, admin_creds):
+    ap = _FakeApCtrl()
+    server, port = _spin_admin_with_ap(config_dir, admin_creds, ap)
+    try:
+        # Body-less PUT so the server-side 401 + close doesn't race the
+        # client mid-stream (mirrors test_put_wifi_requires_authentication).
+        r = requests.put(
+            "http://127.0.0.1:{}/api/ap_state".format(port),
+            timeout=2)
+        assert r.status_code == 401
+    finally:
+        server.stop()
+
+
+# ---------------------------------------------------------------------------
 # GET /api/log
 # ---------------------------------------------------------------------------
 

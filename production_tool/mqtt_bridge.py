@@ -622,6 +622,14 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._send_text(200, WISUN_HTML,
                             content_type="text/html; charset=utf-8")
             return
+        if path == "/api/ap_state":
+            try:
+                state = self.ap_controller.get()
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+                return
+            self._send_json(200, state)
+            return
         if path == "/api/wisun_quality":
             try:
                 ds = self.diag_state_provider()
@@ -694,6 +702,20 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             wpa_output = _run_wpa_reconfigure()
             self._send_json(200, {"status": "ok",
                                    "wpa_cli_output": wpa_output})
+            return
+        if path == "/api/ap_state":
+            body = self._read_json_body()
+            if body is None or not isinstance(body, dict) or "enabled" not in body:
+                self._send_json(400, {"error": "expected { enabled: bool }"})
+                return
+            wants_enabled = bool(body["enabled"])
+            try:
+                state = (self.ap_controller.enable()
+                         if wants_enabled else self.ap_controller.disable())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+                return
+            self._send_json(200, state)
             return
         self._send_json(404, {"error": "not found"})
 
@@ -914,7 +936,8 @@ def start_admin_server(port, user, password, diag_state_provider,
                        config_path=ADMIN_CONFIG_PATH,
                        bridge_path=ADMIN_BRIDGE_PATH,
                        wpa_supplicant_path=ADMIN_WPA_PATH,
-                       log_path=ADMIN_LOG_PATH):
+                       log_path=ADMIN_LOG_PATH,
+                       ap_controller=None):
     """Construct and start an AdminServer with the given settings.
 
     Returns the running AdminServer.
@@ -929,6 +952,7 @@ def start_admin_server(port, user, password, diag_state_provider,
     AdminHandler.bridge_path = bridge_path
     AdminHandler.wpa_supplicant_path = wpa_supplicant_path
     AdminHandler.log_path = log_path
+    AdminHandler.ap_controller = ap_controller or ApController()
     AdminHandler.lock = threading.Lock()
 
     httpd = _ReusingHTTPServer(("", port), AdminHandler)
@@ -1165,6 +1189,89 @@ def _percentile(sorted_samples, pct):
     return sorted_samples[lo] + (sorted_samples[hi] - sorted_samples[lo]) * frac
 
 
+# ---------------------------------------------------------------------------
+# AP (Wi-Fi Direct GO mode) toggle — spec 008
+#
+# Cube J1 の `CubeJ-*` AP は wpa_supplicant 配下の P2P GO group。
+# wpa_cli の p2p_group_remove / p2p_group_add で manual 制御できる。
+# 状態は getprop net.wifi.ap.state で観測可能。
+# ---------------------------------------------------------------------------
+
+_WPA_CLI_SOCKET = "/data/misc/wifi/sockets"
+
+
+def build_wpa_cli_cmd(interface, action):
+    if action == "disable":
+        return ["wpa_cli", "-p", _WPA_CLI_SOCKET, "-i", interface,
+                "p2p_group_remove", interface]
+    if action == "enable":
+        return ["wpa_cli", "-p", _WPA_CLI_SOCKET, "-i", interface,
+                "p2p_group_add", "persistent=0", "freq=2412"]
+    raise ValueError("unknown ap action: {}".format(action))
+
+
+def parse_ap_state(text):
+    """Map `getprop net.wifi.ap.state` output to True / False / None."""
+    if not text:
+        return None
+    s = text.strip().lower()
+    if not s:
+        return None
+    if s in ("created", "enabled", "started", "running"):
+        return True
+    if s in ("disabled", "removed", "stopped", "uninitialized"):
+        return False
+    return None
+
+
+def _default_subprocess_runner(cmd, timeout=5):
+    import subprocess
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, _err = proc.communicate(timeout=timeout)
+    except TypeError:
+        # Py2 communicate has no timeout
+        out, _err = proc.communicate()
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    return out
+
+
+class ApController(object):
+    """Toggle the Wi-Fi Direct GO mode AP via wpa_cli + getprop.
+
+    `runner(cmd, timeout=5) -> str` is injectable so unit tests don't spawn
+    real subprocesses. Production callers pass nothing and pick up the
+    default subprocess runner.
+    """
+
+    def __init__(self, interface=None, runner=None):
+        self._interface = interface
+        self._runner = runner or _default_subprocess_runner
+
+    def _resolve_interface(self):
+        if self._interface:
+            return self._interface
+        out = self._runner(["getprop", "net.wifi.ap.interface"], timeout=2)
+        iface = (out or "").strip()
+        return iface or "p2p-wlan0-0"
+
+    def get(self):
+        iface = self._resolve_interface()
+        out = self._runner(["getprop", "net.wifi.ap.state"], timeout=2)
+        return {"enabled": parse_ap_state(out), "interface": iface}
+
+    def disable(self):
+        iface = self._resolve_interface()
+        self._runner(build_wpa_cli_cmd(iface, "disable"), timeout=5)
+        return self.get()
+
+    def enable(self):
+        iface = self._resolve_interface()
+        self._runner(build_wpa_cli_cmd(iface, "enable"), timeout=5)
+        return self.get()
+
+
 def render_sparkline(samples, width, height):
     """Return an SVG path string sketching *samples* over a (width, height)
     box. Min sample sits near y=height (bottom), max near y=0 (top). Returns
@@ -1215,10 +1322,28 @@ text-align:center;background:#222}
 .meta code{background:#222;padding:2px 6px;border-radius:4px;color:#bbb;
 word-break:break-all;display:inline-block;max-width:100%}
 .offline{color:#f55}
+.ap{margin-bottom:16px;padding:14px 16px;border-radius:10px;background:#222;
+display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.ap .label{font-size:13px;color:#aaa}
+.ap .state{font-weight:700;padding:2px 10px;border-radius:6px;font-size:13px}
+.state.on{background:#0a5;color:#fff}
+.state.off{background:#555;color:#ddd}
+.state.unknown{background:#a40;color:#fff}
+.ap button{padding:8px 16px;border-radius:6px;border:0;cursor:pointer;
+font-size:13px;font-weight:600;background:#5af;color:#000}
+.ap button:disabled{opacity:.5;cursor:not-allowed}
+.ap .iface{color:#888;font-size:11px;font-family:monospace}
 </style>
 </head>
 <body>
 <h1>Wi-SUN Quality (real-time)</h1>
+<div class="ap">
+  <span class="label">AP mode (CubeJ-...):</span>
+  <span class="state unknown" id="ap_state">...</span>
+  <span class="iface" id="ap_iface"></span>
+  <button id="ap_toggle" disabled>--</button>
+  <span class="iface" id="ap_msg"></span>
+</div>
 <div class="row">
   <div class="stat" id="card_p50"><div class="label">p50 RTT</div>
     <div class="v"><span id="p50">--</span><span class="unit">ms</span></div></div>
@@ -1290,6 +1415,54 @@ async function tick(){
 }
 tick();
 setInterval(tick,1500);
+
+// ---- AP toggle (spec 008) ----
+function renderAp(state){
+  var el=document.getElementById('ap_state');
+  var btn=document.getElementById('ap_toggle');
+  var iface=document.getElementById('ap_iface');
+  iface.textContent=state.interface||'';
+  if(state.enabled===true){
+    el.textContent='ON';el.className='state on';
+    btn.textContent='Turn OFF';btn.disabled=false;btn.dataset.next='false';
+  }else if(state.enabled===false){
+    el.textContent='OFF';el.className='state off';
+    btn.textContent='Turn ON';btn.disabled=false;btn.dataset.next='true';
+  }else{
+    el.textContent='UNKNOWN';el.className='state unknown';
+    btn.textContent='--';btn.disabled=true;
+  }
+}
+async function refreshAp(){
+  try{
+    var r=await fetch('/api/ap_state',{cache:'no-store'});
+    renderAp(await r.json());
+    document.getElementById('ap_msg').textContent='';
+  }catch(e){
+    document.getElementById('ap_msg').textContent='offline';
+  }
+}
+document.getElementById('ap_toggle').addEventListener('click',async function(){
+  var btn=this;var next=btn.dataset.next==='true';
+  btn.disabled=true;btn.textContent='...';
+  document.getElementById('ap_msg').textContent='applying...';
+  try{
+    var r=await fetch('/api/ap_state',{method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:next})});
+    if(!r.ok){
+      var j=await r.json().catch(function(){return{};});
+      throw new Error(j.error||('http '+r.status));
+    }
+    renderAp(await r.json());
+    document.getElementById('ap_msg').textContent='ok';
+  }catch(e){
+    document.getElementById('ap_msg').textContent='failed: '+e.message;
+    setTimeout(refreshAp,500);
+  }
+});
+refreshAp();
+setInterval(refreshAp,5000);
 </script>
 </body>
 </html>
@@ -2433,6 +2606,7 @@ def main():
                 user=cfg["admin_user"],
                 password=cfg["admin_password"],
                 diag_state_provider=lambda: diag_state,
+                ap_controller=ApController(),
             )
             LOGGER.info(event="admin_ui_started",
                         context={"port": int(cfg.get("admin_ui_port", 8080))})
