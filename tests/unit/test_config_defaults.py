@@ -36,6 +36,12 @@ def test_apply_defaults_returns_dict_with_new_keys_filled_in():
     assert cfg["log_level"] == "info"
     assert cfg["log_max_bytes"] == 1048576
     assert cfg["log_backup_count"] == 3
+    assert cfg["mqtt_keepalive"] == 300
+
+
+def test_apply_defaults_respects_explicit_mqtt_keepalive():
+    cfg = mb.apply_defaults({"mqtt_keepalive": 120})
+    assert cfg["mqtt_keepalive"] == 120
 
 
 def test_apply_defaults_preserves_all_upstream_keys_and_values():

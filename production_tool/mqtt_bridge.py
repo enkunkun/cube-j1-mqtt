@@ -42,6 +42,13 @@ except ImportError:
 BRIDGE_SEMVER = "1.0.0"
 BRIDGE_GIT_HASH = "unknown"
 
+# Python 2/3 compatible string type tuple. json.loads returns `unicode` on
+# Python 2, plain `str` on Python 3 — both must be accepted as "text".
+try:
+    _TEXT_TYPES = (str, unicode)  # noqa: F821 (unicode only exists on Py2)
+except NameError:
+    _TEXT_TYPES = (str,)
+
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
 
@@ -110,6 +117,11 @@ def apply_defaults(cfg):
     # Wi-SUN re-join. 0 = disabled (legacy behaviour). Default 5 corresponds
     # to ~5 minutes of silence at the default poll_interval.
     out.setdefault("erxudp_timeout_force_reconnect_threshold", 5)
+    # MQTT keep-alive (seconds). Cube J1 のメインループは ECHONET Lite
+    # の同期 poll で詰まることがあり、上流デフォルトの 60s では broker から
+    # 切断される（実測 約 12 分間隔）。300s なら poll が一時的に滞っても
+    # PINGREQ をギリギリ間に合わせられる。
+    out.setdefault("mqtt_keepalive", 300)
     return out
 
 
@@ -238,9 +250,13 @@ def validate_wifi_patch(payload):
     """
     ssid = payload.get("ssid")
     psk = payload.get("psk")
-    if not isinstance(ssid, str) or not ssid.strip():
+    # Accept both Python 2 `str`/`unicode` and Python 3 `str`. json.loads
+    # on Py2 always returns `unicode` for string values, so a plain
+    # isinstance(ssid, str) check incorrectly rejects every JSON body
+    # arriving on the Cube J1 (Python 2.7.13).
+    if not isinstance(ssid, _TEXT_TYPES) or not ssid.strip():
         return None, "ssid is required"
-    if not isinstance(psk, str):
+    if not isinstance(psk, _TEXT_TYPES):
         return None, "psk must be a string"
     if len(psk) < 8 or len(psk) > 63:
         return None, "psk must be 8-63 characters"
@@ -1583,12 +1599,13 @@ def _encode_str(s):
 
 class MQTTClient(object):
     def __init__(self, host, port, client_id, username=None, password=None,
-                 on_reconnect=None):
+                 on_reconnect=None, keepalive=60):
         self.host         = host
         self.port         = port
         self.client_id    = client_id
         self.username     = username
         self.password     = password
+        self.keepalive    = int(keepalive)
         self.sock         = None
         self._out_queue   = collections.deque()
         self.on_reconnect = on_reconnect  # called after a successful re-connect
@@ -1618,7 +1635,7 @@ class MQTTClient(object):
         var_hdr = (b"\x00\x04MQTT"
                    + b"\x04"
                    + struct.pack("B", flags)
-                   + b"\x00\x3C")   # keep-alive 60s
+                   + struct.pack(">H", self.keepalive))
 
         payload = _encode_str(self.client_id)
         if self.username: payload += _encode_str(self.username)
@@ -1925,7 +1942,8 @@ def main():
     # time the broker session is re-established.
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
                       username=ha_user, password=ha_pass,
-                      on_reconnect=diag_state.on_mqtt_reconnect)
+                      on_reconnect=diag_state.on_mqtt_reconnect,
+                      keepalive=cfg["mqtt_keepalive"])
     while True:
         try:
             mqtt.connect()
