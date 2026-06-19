@@ -717,10 +717,21 @@ def decode_measurements(props):
         result["energy_reverse_raw"] = struct.unpack(">I", bytes(props[0xE3][:4]))[0]
 
     # E8: instantaneous current R,T phase (2×signed short, 0.1A)
+    #
+    # ECHONET Lite low-voltage smart meter class defines:
+    #   - valid range 0x8001..0x7FFD (-3276.7 .. +3276.5 A)
+    #   - 0x7FFE = "not measured" / phase not connected
+    #   - 0x7FFF = reserved
+    # Drop both sentinels so a 単相2線式 contract or unwired T phase shows up
+    # as "unknown" in HA rather than the literal 3276.6 A.
     if 0xE8 in props and len(props[0xE8]) >= 4:
-        r, t = struct.unpack(">hh", bytes(props[0xE8][:4]))
-        result["current_r_a"] = r / 10.0
-        result["current_t_a"] = t / 10.0
+        r_raw, t_raw = struct.unpack(">HH", bytes(props[0xE8][:4]))
+        if r_raw not in (0x7FFE, 0x7FFF):
+            r_signed = struct.unpack(">h", struct.pack(">H", r_raw))[0]
+            result["current_r_a"] = r_signed / 10.0
+        if t_raw not in (0x7FFE, 0x7FFF):
+            t_signed = struct.unpack(">h", struct.pack(">H", t_raw))[0]
+            result["current_t_a"] = t_signed / 10.0
 
     return result
 

@@ -104,6 +104,40 @@ def test_decode_measurements_extracts_currents_in_amperes_with_0_1A_resolution()
     assert m["current_t_a"] == -0.8
 
 
+def test_decode_measurements_skips_invalid_current_value_0x7FFE_for_t_phase():
+    """ECHONET Lite "未取得" sentinel for 単相2線式 / T 相未接続."""
+    # R = 90 (9.0 A), T = 0x7FFE (32766, "not measured")
+    props = {0xE8: bytearray(struct.pack(">hH", 90, 0x7FFE))}
+    m = mb.decode_measurements(props)
+    assert m["current_r_a"] == 9.0
+    assert "current_t_a" not in m
+
+
+def test_decode_measurements_skips_invalid_current_value_0x7FFE_for_r_phase():
+    """Same sentinel may appear on R phase too."""
+    props = {0xE8: bytearray(struct.pack(">Hh", 0x7FFE, 90))}
+    m = mb.decode_measurements(props)
+    assert "current_r_a" not in m
+    assert m["current_t_a"] == 9.0
+
+
+def test_decode_measurements_skips_reserved_current_value_0x7FFF():
+    """0x7FFF is reserved per spec — also treat as no data."""
+    props = {0xE8: bytearray(struct.pack(">HH", 0x7FFF, 0x7FFF))}
+    m = mb.decode_measurements(props)
+    assert "current_r_a" not in m
+    assert "current_t_a" not in m
+
+
+def test_decode_measurements_keeps_in_range_currents_including_negative():
+    """Reverse current flow (solar export) yields negative values; those stay."""
+    # R = -32765 (-3276.5 A, just inside valid range), T = -1 (-0.1 A)
+    props = {0xE8: bytearray(struct.pack(">hh", -32765, -1))}
+    m = mb.decode_measurements(props)
+    assert m["current_r_a"] == -3276.5
+    assert m["current_t_a"] == -0.1
+
+
 def test_decode_measurements_extracts_coefficient_and_unit_kwh():
     props = {
         0xD3: bytearray(b"\x00\x00\x00\x02"),  # coeff = 2
