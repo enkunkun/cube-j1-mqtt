@@ -604,6 +604,20 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self._send_text(200, body,
                             content_type="application/x-ndjson; charset=utf-8")
             return
+        if path == "/api/erxudp_raw":
+            try:
+                ds = self.diag_state_provider()
+                line = ds.last_erxudp_raw_line
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+                return
+            tokens = line.split() if line else []
+            self._send_json(200, {
+                "raw": line,
+                "token_count": len(tokens),
+                "tokens": tokens,
+            })
+            return
         self._send_json(404, {"error": "not found"})
 
     # ------------------------------------------------------------------
@@ -1169,6 +1183,10 @@ class DiagState(object):
         # / _PUBLISHED_SK_ERROR_CODES are emitted by snapshot().
         self.sk_event_counts = {}
         self.sk_error_counts = {}
+        # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
+        # admin UI to inspect firmware-specific token layout (RSSI / LQI
+        # placement varies across SKSTACK builds).
+        self.last_erxudp_raw_line = None
 
     # --- counters (monotonically non-decreasing) ---
 
@@ -1197,6 +1215,9 @@ class DiagState(object):
     def on_sk_error(self, error_code):
         key = str(error_code).upper()
         self.sk_error_counts[key] = self.sk_error_counts.get(key, 0) + 1
+
+    def on_erxudp_raw(self, line):
+        self.last_erxudp_raw_line = line
 
     # --- timestamps ---
 
@@ -1687,6 +1708,11 @@ def read_erxudp(fd, timeout=15, diag_state=None):
                     log("diag on_sk_error error: {}".format(e))
             continue
         if kind == "erxudp":
+            if diag_state is not None:
+                try:
+                    diag_state.on_erxudp_raw(line)
+                except Exception as e:
+                    log("diag on_erxudp_raw error: {}".format(e))
             if not value.startswith("1081"):
                 continue
             try:
