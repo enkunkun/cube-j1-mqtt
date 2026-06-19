@@ -350,3 +350,158 @@ def test_post_restart_returns_200_without_running_bridge_commands(
     )
     assert r.status_code == 200
     assert r.json()["status"] == "restarting"
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/wifi (US3, T034)
+# ---------------------------------------------------------------------------
+
+WPA_TEMPLATE = (
+    "ctrl_interface=/data/misc/wifi/sockets\n"
+    "update_config=1\n"
+    "\n"
+    "network={\n"
+    "        ssid=\"OLD-NET\"\n"
+    "        psk=\"oldpassword\"\n"
+    "        key_mgmt=WPA-PSK\n"
+    "        scan_ssid=1\n"
+    "}\n"
+)
+
+
+def _stub_wpa_reconfigure(monkeypatch, return_value="OK"):
+    monkeypatch.setattr(mb, "_run_wpa_reconfigure", lambda: return_value)
+
+
+def test_put_wifi_atomically_updates_supplicant_and_runs_reconfigure(
+    admin_server, admin_creds, config_dir, monkeypatch
+):
+    _stub_wpa_reconfigure(monkeypatch, return_value="OK")
+    # Seed the supplicant template that the server will rewrite.
+    (config_dir / "wpa_supplicant.conf").write_text(WPA_TEMPLATE)
+    base, _ = admin_server
+
+    r = requests.put(
+        base + "/api/wifi",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"]),
+                 "Content-Type": "application/json"},
+        json={"ssid": "NEW-NET", "psk": "secret123"},
+        timeout=2,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["wpa_cli_output"] == "OK"
+
+    written = (config_dir / "wpa_supplicant.conf").read_text()
+    assert "ssid=\"NEW-NET\"" in written
+    assert "psk=\"secret123\"" in written
+    # Other template lines must survive intact.
+    assert "key_mgmt=WPA-PSK" in written
+    assert "scan_ssid=1" in written
+
+
+def test_put_wifi_rejects_empty_ssid(admin_server, admin_creds, config_dir,
+                                       monkeypatch):
+    _stub_wpa_reconfigure(monkeypatch)
+    (config_dir / "wpa_supplicant.conf").write_text(WPA_TEMPLATE)
+    base, _ = admin_server
+
+    r = requests.put(
+        base + "/api/wifi",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"]),
+                 "Content-Type": "application/json"},
+        json={"ssid": "", "psk": "12345678"},
+        timeout=2,
+    )
+    assert r.status_code == 400
+    assert "ssid" in r.json()["error"].lower()
+    # File must not be modified.
+    assert (config_dir / "wpa_supplicant.conf").read_text() == WPA_TEMPLATE
+
+
+def test_put_wifi_rejects_short_psk(admin_server, admin_creds, config_dir,
+                                      monkeypatch):
+    _stub_wpa_reconfigure(monkeypatch)
+    (config_dir / "wpa_supplicant.conf").write_text(WPA_TEMPLATE)
+    base, _ = admin_server
+
+    r = requests.put(
+        base + "/api/wifi",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"]),
+                 "Content-Type": "application/json"},
+        json={"ssid": "x", "psk": "short"},
+        timeout=2,
+    )
+    assert r.status_code == 400
+    assert "psk" in r.json()["error"].lower()
+    assert (config_dir / "wpa_supplicant.conf").read_text() == WPA_TEMPLATE
+
+
+def test_put_wifi_requires_authentication(admin_server, config_dir, monkeypatch):
+    _stub_wpa_reconfigure(monkeypatch)
+    (config_dir / "wpa_supplicant.conf").write_text(WPA_TEMPLATE)
+    base, _ = admin_server
+
+    # Send no body — the server should reject before reading any payload,
+    # and sending a body would race with the server closing the connection
+    # right after 401 on HTTP/1.0 (manifests as ConnectionResetError on
+    # macOS).
+    r = requests.put(base + "/api/wifi", timeout=2)
+    assert r.status_code == 401
+    assert (config_dir / "wpa_supplicant.conf").read_text() == WPA_TEMPLATE
+
+
+# ---------------------------------------------------------------------------
+# GET /api/log clamp (US4, T040)
+# ---------------------------------------------------------------------------
+
+def test_get_log_clamps_huge_lines_request_to_1000(admin_server, admin_creds,
+                                                     config_dir):
+    log_path = config_dir / "bridge.log"
+    log_path.write_text("\n".join(
+        "line{}".format(i) for i in range(1500)) + "\n")
+    base, _ = admin_server
+    r = requests.get(
+        base + "/api/log?lines=99999",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+        timeout=2,
+    )
+    assert r.status_code == 200
+    text_lines = [l for l in r.text.split("\n") if l]
+    assert len(text_lines) == 1000
+    assert text_lines[-1] == "line1499"
+
+
+def test_get_log_clamps_negative_lines_request(admin_server, admin_creds,
+                                                 config_dir):
+    log_path = config_dir / "bridge.log"
+    log_path.write_text("a\nb\nc\n")
+    base, _ = admin_server
+    r = requests.get(
+        base + "/api/log?lines=-5",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+        timeout=2,
+    )
+    assert r.status_code == 200
+    text_lines = [l for l in r.text.split("\n") if l]
+    # Clamped to >= 1, so at least 1 line returned (the latest one).
+    assert len(text_lines) >= 1
+
+
+def test_get_log_invalid_lines_query_falls_back_to_default(admin_server,
+                                                            admin_creds,
+                                                            config_dir):
+    log_path = config_dir / "bridge.log"
+    log_path.write_text("\n".join(
+        "x{}".format(i) for i in range(200)) + "\n")
+    base, _ = admin_server
+    r = requests.get(
+        base + "/api/log?lines=notanumber",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+        timeout=2,
+    )
+    assert r.status_code == 200
+    text_lines = [l for l in r.text.split("\n") if l]
+    # Default 100 when the query string is unparsable.
+    assert len(text_lines) == 100
