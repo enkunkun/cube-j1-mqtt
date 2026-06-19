@@ -491,7 +491,15 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_text(self, status, text, content_type="text/plain; charset=utf-8"):
-        body = text.encode("utf-8") if isinstance(text, str) else text
+        # Python 2: str IS bytes — calling .encode("utf-8") on str holding
+        # raw UTF-8 bytes triggers an implicit str→unicode decode through
+        # the ASCII codec and blows up on any non-ASCII byte. Detect bytes
+        # via `isinstance(text, bytes)` which holds on both interpreters
+        # (Py2: bytes == str, Py3: bytes != str).
+        if isinstance(text, bytes):
+            body = text
+        else:
+            body = text.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
