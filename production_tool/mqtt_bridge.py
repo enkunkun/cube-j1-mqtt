@@ -106,6 +106,10 @@ def apply_defaults(cfg):
     out.setdefault("admin_ui_port", 8080)
     out.setdefault("admin_user", "")
     out.setdefault("admin_password", "")
+    # Number of consecutive ERXUDP timeouts before the bridge forces a
+    # Wi-SUN re-join. 0 = disabled (legacy behaviour). Default 5 corresponds
+    # to ~5 minutes of silence at the default poll_interval.
+    out.setdefault("erxudp_timeout_force_reconnect_threshold", 5)
     return out
 
 
@@ -859,6 +863,17 @@ def bridge_version():
     """Return the bridge self-version string `<semver>+<git_hash>`."""
     return "{}+{}".format(BRIDGE_SEMVER, BRIDGE_GIT_HASH)
 
+
+def should_force_wisun_reconnect(consecutive, threshold):
+    """Decide whether to force a Wi-SUN re-join after consecutive ERXUDP timeouts.
+
+    `threshold <= 0` opts out of the safety net (legacy behaviour where the
+    bridge only reconnects on uncaught exceptions in the main loop).
+    """
+    if not isinstance(threshold, int) or threshold <= 0:
+        return False
+    return consecutive >= threshold
+
 # ---------------------------------------------------------------------------
 # Structured JSON Lines logger
 # ---------------------------------------------------------------------------
@@ -1055,6 +1070,9 @@ class DiagState(object):
         self.wisun_reconnects_total = 0
         self.mqtt_reconnects_total = 0
         self.erxudp_timeouts_total = 0
+        # Consecutive (not total) ERXUDP timeouts since the last successful
+        # poll. Drives auto-reconnect when the smart meter stops answering.
+        self.consecutive_erxudp_timeouts = 0
 
     # --- counters (monotonically non-decreasing) ---
 
@@ -1069,11 +1087,13 @@ class DiagState(object):
 
     def on_erxudp_timeout(self):
         self.erxudp_timeouts_total += 1
+        self.consecutive_erxudp_timeouts += 1
 
     # --- timestamps ---
 
     def on_poll_success(self, now):
         self.last_poll_success_ts = now
+        self.consecutive_erxudp_timeouts = 0
 
     def on_poll_failure(self, now):
         self.last_poll_failure_ts = now
@@ -1961,6 +1981,16 @@ def main():
                         diag_state.on_poll_failure(now)
                     except Exception as e:
                         log("diag poll_failure error: {}".format(e))
+                    # Safety net: if the meter has stopped replying while the
+                    # Wi-SUN session still looks alive, bail out of the main
+                    # loop so the outer except runs wisun_connect again.
+                    if should_force_wisun_reconnect(
+                        diag_state.consecutive_erxudp_timeouts,
+                        int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
+                    ):
+                        raise RuntimeError(
+                            "erxudp timeout {} times in a row, forcing wisun reconnect"
+                            .format(diag_state.consecutive_erxudp_timeouts))
                 # Publish diag snapshot once per poll cycle (FR-004).
                 # best-effort: never let diag failure block the measurement
                 # path (Constitution IV / FR-005).

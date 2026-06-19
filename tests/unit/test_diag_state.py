@@ -177,3 +177,51 @@ def test_snapshot_always_includes_version_string():
     state = make_state(version="2.5.0+deadbee")
     snap = state.snapshot(now=state.start_time)
     assert snap["version"] == "2.5.0+deadbee"
+
+
+# ---------------------------------------------------------------------------
+# Auto-recovery: consecutive ERXUDP timeouts
+# ---------------------------------------------------------------------------
+
+def test_consecutive_erxudp_timeouts_starts_at_zero():
+    state = make_state()
+    assert state.consecutive_erxudp_timeouts == 0
+
+
+def test_consecutive_erxudp_timeouts_increments_on_each_timeout():
+    state = make_state()
+    state.on_erxudp_timeout()
+    state.on_erxudp_timeout()
+    assert state.consecutive_erxudp_timeouts == 2
+
+
+def test_consecutive_erxudp_timeouts_resets_on_poll_success():
+    state = make_state()
+    state.on_erxudp_timeout()
+    state.on_erxudp_timeout()
+    state.on_erxudp_timeout()
+    state.on_poll_success(now=1.0)
+    assert state.consecutive_erxudp_timeouts == 0
+
+
+def test_consecutive_does_not_reset_on_poll_failure_path():
+    """`on_poll_failure` updates the failure timestamp but the consecutive
+    counter is only reset by a real success — multiple failure events keep
+    the counter rising."""
+    state = make_state()
+    state.on_erxudp_timeout()
+    state.on_poll_failure(now=1.0)
+    state.on_erxudp_timeout()
+    state.on_poll_failure(now=2.0)
+    assert state.consecutive_erxudp_timeouts == 2
+
+
+def test_total_erxudp_counter_continues_to_grow_after_reset():
+    state = make_state()
+    state.on_erxudp_timeout()
+    state.on_erxudp_timeout()
+    state.on_poll_success(now=1.0)
+    state.on_erxudp_timeout()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["erxudp_timeouts_total"] == 3
+    assert state.consecutive_erxudp_timeouts == 1
