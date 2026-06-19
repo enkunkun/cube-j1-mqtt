@@ -1897,7 +1897,11 @@ def skcommand(fd, cmd, timeout=10):
 # Scan settings
 # ---------------------------------------------------------------------------
 
-SCAN_DURATION_BASE = 4
+# ROHM SKSCAN duration: scan dwell time = (192 * 2^duration + 1) symbol times.
+# duration=4 → 約 8 秒、 5 → 16 秒、 6 → 32 秒、 7 → 64 秒。
+# 4 は最小推奨だが弱信号環境では PAN を取りこぼし scan_retries が嵩む。
+# 6 にすると初回 scan が 32 秒、 LQI 推定精度も上がる。
+SCAN_DURATION_BASE = 6
 SCAN_RETRY_LIMIT = 10
 
 # ---------------------------------------------------------------------------
