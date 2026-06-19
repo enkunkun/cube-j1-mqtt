@@ -1101,6 +1101,48 @@ _DIAG_SNAPSHOT_KEYS = (
     "version",
 )
 
+# Spec 006: Wi-SUN health observability. EVENT and FAIL ids that we expose
+# as named counters. Anything outside this list is still counted in memory
+# (sk_event_counts) but not published — keeps HA discovery noise-free.
+_PUBLISHED_SK_EVENT_IDS = ("22", "24", "25", "26", "28", "29", "32", "33")
+_PUBLISHED_SK_ERROR_CODES = ("05", "09", "10")
+
+
+def _percentile(sorted_samples, pct):
+    """Linear-interpolation percentile on a pre-sorted list. Spec 006."""
+    if not sorted_samples:
+        return 0.0
+    if len(sorted_samples) == 1:
+        return float(sorted_samples[0])
+    k = (len(sorted_samples) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_samples) - 1)
+    frac = k - lo
+    return sorted_samples[lo] + (sorted_samples[hi] - sorted_samples[lo]) * frac
+
+
+def classify_sk_line(line):
+    """Return ('erxudp', payload_hex) / ('event', id_hex_upper) /
+    ('error', code_hex_upper) / None for a single SK output line."""
+    if not line:
+        return None
+    if line.startswith("ERXUDP"):
+        parts = line.split()
+        if len(parts) >= 10:
+            return ("erxudp", parts[-1].strip())
+        return None
+    if line.startswith("EVENT "):
+        rest = line[6:].strip().split()
+        if not rest:
+            return None
+        return ("event", rest[0].upper())
+    if line.startswith("FAIL ER"):
+        rest = line[7:].strip().split()
+        if not rest:
+            return None
+        return ("error", rest[0].upper())
+    return None
+
 
 class DiagState(object):
     """Single-thread mutable diagnostics aggregator (main loop only)."""
@@ -1119,6 +1161,14 @@ class DiagState(object):
         # Consecutive (not total) ERXUDP timeouts since the last successful
         # poll. Drives auto-reconnect when the smart meter stops answering.
         self.consecutive_erxudp_timeouts = 0
+        # Spec 006: Wi-SUN health observability. Rolling window of recent
+        # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
+        self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
+        # SK EVENT and FAIL counters keyed by 2-digit hex (upper). All
+        # observed ids are counted; only the ids in _PUBLISHED_SK_EVENT_IDS
+        # / _PUBLISHED_SK_ERROR_CODES are emitted by snapshot().
+        self.sk_event_counts = {}
+        self.sk_error_counts = {}
 
     # --- counters (monotonically non-decreasing) ---
 
@@ -1134,6 +1184,19 @@ class DiagState(object):
     def on_erxudp_timeout(self):
         self.erxudp_timeouts_total += 1
         self.consecutive_erxudp_timeouts += 1
+
+    # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
+
+    def on_erxudp_latency(self, ms):
+        self.erxudp_latency_ms_recent.append(float(ms))
+
+    def on_sk_event(self, event_id):
+        key = str(event_id).upper()
+        self.sk_event_counts[key] = self.sk_event_counts.get(key, 0) + 1
+
+    def on_sk_error(self, error_code):
+        key = str(error_code).upper()
+        self.sk_error_counts[key] = self.sk_error_counts.get(key, 0) + 1
 
     # --- timestamps ---
 
@@ -1183,6 +1246,26 @@ class DiagState(object):
             if value is None:
                 continue
             out[key] = value
+
+        # Spec 006: latency percentiles. Omit when no samples so HA does not
+        # see a misleading "0 ms" entity at boot.
+        samples = list(self.erxudp_latency_ms_recent)
+        if samples:
+            ordered = sorted(samples)
+            out["erxudp_latency_p50_ms"] = round(_percentile(ordered, 50), 2)
+            out["erxudp_latency_p95_ms"] = round(_percentile(ordered, 95), 2)
+            out["erxudp_latency_max_ms"] = round(ordered[-1], 2)
+
+        # Spec 006: named EVENT / ER counters. Omit zero-count entries
+        # so HA discovery does not advertise sensors that have never fired.
+        for eid in _PUBLISHED_SK_EVENT_IDS:
+            n = self.sk_event_counts.get(eid, 0)
+            if n > 0:
+                out["sk_event_{}_total".format(eid)] = n
+        for code in _PUBLISHED_SK_ERROR_CODES:
+            n = self.sk_error_counts.get(code, 0)
+            if n > 0:
+                out["sk_error_ER{}_total".format(code)] = n
         return out
 
 # ---------------------------------------------------------------------------
@@ -1574,24 +1657,42 @@ def send_el_get(fd, ipv6, tid):
     serial_write(fd, frame)
     serial_write(fd, b"\r\n")
 
-def read_erxudp(fd, timeout=15):
-    """Wait for ERXUDP and return payload as bytearray, or None."""
+def read_erxudp(fd, timeout=15, diag_state=None):
+    """Wait for ERXUDP and return payload as bytearray, or None.
+
+    When *diag_state* is supplied, EVENT/FAIL lines observed before the
+    ERXUDP are dispatched into Wi-SUN health counters (spec 006).
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
         if line is None:
             continue
-        if line.startswith("ERXUDP"):
-            parts = line.split()
-            # Tail fields are stable: ... <secured> <side> <datalen> <data>
-            if len(parts) >= 10:
-                hex_data = parts[-1].strip()
-                if not hex_data.startswith("1081"):
-                    continue
+        classified = classify_sk_line(line)
+        if classified is None:
+            continue
+        kind, value = classified
+        if kind == "event":
+            if diag_state is not None:
                 try:
-                    return bytearray(binascii.unhexlify(hex_data))
+                    diag_state.on_sk_event(value)
                 except Exception as e:
-                    log("ERXUDP hex decode error: {}".format(e))
+                    log("diag on_sk_event error: {}".format(e))
+            continue
+        if kind == "error":
+            if diag_state is not None:
+                try:
+                    diag_state.on_sk_error(value)
+                except Exception as e:
+                    log("diag on_sk_error error: {}".format(e))
+            continue
+        if kind == "erxudp":
+            if not value.startswith("1081"):
+                continue
+            try:
+                return bytearray(binascii.unhexlify(value))
+            except Exception as e:
+                log("ERXUDP hex decode error: {}".format(e))
     return None
 
 # ---------------------------------------------------------------------------
@@ -2191,9 +2292,14 @@ def main():
             try:
                 send_el_get(fd, ipv6, tid)
                 tid = (tid + 1) & 0xFFFF
-                data = read_erxudp(fd, timeout=15)
+                t_send = time.time()
+                data = read_erxudp(fd, timeout=15, diag_state=diag_state)
                 now = time.time()
                 if data:
+                    try:
+                        diag_state.on_erxudp_latency((now - t_send) * 1000.0)
+                    except Exception as e:
+                        log("diag on_erxudp_latency error: {}".format(e))
                     props = parse_el_response(data)
                     m     = decode_measurements(props)
                     m     = apply_energy_scale(m, coeff, unit_kwh)
