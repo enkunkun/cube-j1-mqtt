@@ -149,7 +149,12 @@ class AdminConfig(object):
             return False
         encoded = header_value[6:].strip()
         try:
-            decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            # Constitution II — Python 2.7 stdlib only. The `validate` kwarg
+            # only landed in CPython 2.7.6, but Cube J1 ships 2.7.13 *without*
+            # it on this build, so stay on the lowest-common-denominator API.
+            # An accidentally-junk decode just yields junk and fails the
+            # subsequent string compare anyway.
+            decoded = base64.b64decode(encoded.encode("ascii")).decode("utf-8")
         except Exception:
             return False
         if ":" not in decoded:
