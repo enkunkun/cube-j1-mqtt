@@ -1906,25 +1906,24 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
-                # SKPING <ipv6> returned ER05 (invalid argument, not
-                # ER01=unsupported) — the command exists, only the syntax
-                # is wrong. Try several plausible variants and log each one
-                # so we can spot the working format.
-                for variant in (
-                    "SKPING 0001 {}".format(ipv6),
-                    "SKPING 1 {}".format(ipv6),
-                    "SKPING {} 0001".format(ipv6),
-                    "SKPING 0001 0040 {}".format(ipv6),
-                    "SKPING {} 0001 0040".format(ipv6),
-                    "SKPING 1 0040 {}".format(ipv6),
-                    "SKPING {} 1".format(ipv6),
-                    "SKPING 0 {}".format(ipv6),
-                ):
-                    try:
-                        out = skcommand(fd, variant, timeout=3)
-                        log("SKPING try [{}]: {}".format(variant, out))
-                    except Exception as e:
-                        log("SKPING try [{}] error: {}".format(variant, e))
+                # `SKPING 1 <ipv6>` was the form that returned OK on this
+                # firmware. Send one and drain the serial for ~3 s so we
+                # can see what EVENT (if any) carries the echo reply.
+                try:
+                    ping_cmd = "SKPING 1 {}".format(ipv6)
+                    t0 = time.time()
+                    out = skcommand(fd, ping_cmd, timeout=2)
+                    log("SKPING send: {} (OK after {:.0f}ms)".format(
+                        out, (time.time() - t0) * 1000))
+                    drain_deadline = time.time() + 3.0
+                    while time.time() < drain_deadline:
+                        ln = serial_readline(fd, timeout=0.5)
+                        if ln is None:
+                            continue
+                        log("SKPING drain[+{:.0f}ms]: {!r}".format(
+                            (time.time() - t0) * 1000, ln))
+                except Exception as e:
+                    log("SKPING send failed: {}".format(e))
                 return ipv6
             if "EVENT 24" in line:
                 if LOGGER is not None:
