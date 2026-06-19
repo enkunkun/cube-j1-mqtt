@@ -2113,6 +2113,21 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_timeouts_total",  "ERXUDP Timeouts",     None, None,        "total_increasing", "diagnostic"),
     ("uptime_seconds",         "Uptime",              "s",  None,        "measurement",      "diagnostic"),
     ("version",                "Bridge Version",      None, None,        None,               "diagnostic"),
+    # Spec 006: Wi-SUN health observability — RTT distribution + EVENT/FAIL.
+    ("erxudp_latency_p50_ms",  "ERXUDP Latency p50",  "ms", None,        "measurement",      "diagnostic"),
+    ("erxudp_latency_p95_ms",  "ERXUDP Latency p95",  "ms", None,        "measurement",      "diagnostic"),
+    ("erxudp_latency_max_ms",  "ERXUDP Latency Max",  "ms", None,        "measurement",      "diagnostic"),
+    ("sk_event_22_total",      "SK EVENT 22 (PANA OK)",       None, None, "total_increasing", "diagnostic"),
+    ("sk_event_24_total",      "SK EVENT 24 (PANA Failed)",   None, None, "total_increasing", "diagnostic"),
+    ("sk_event_25_total",      "SK EVENT 25 (PANA Done)",     None, None, "total_increasing", "diagnostic"),
+    ("sk_event_26_total",      "SK EVENT 26 (Re-auth)",       None, None, "total_increasing", "diagnostic"),
+    ("sk_event_28_total",      "SK EVENT 28 (Session End)",   None, None, "total_increasing", "diagnostic"),
+    ("sk_event_29_total",      "SK EVENT 29 (Session Timeout)", None, None, "total_increasing", "diagnostic"),
+    ("sk_event_32_total",      "SK EVENT 32 (Scan Done)",     None, None, "total_increasing", "diagnostic"),
+    ("sk_event_33_total",      "SK EVENT 33 (Scan Started)",  None, None, "total_increasing", "diagnostic"),
+    ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
+    ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
+    ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
 ]
 
 

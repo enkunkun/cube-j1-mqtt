@@ -62,21 +62,27 @@ def test_measurement_discovery_payloads_are_published_with_retain():
 # Diagnostic discovery
 # ---------------------------------------------------------------------------
 
-def test_diag_discovery_publishes_ten_sensors():
+def test_diag_discovery_publishes_all_defined_sensors():
     mqtt = FakeMQTT()
     mb.publish_ha_discovery_diag(mqtt, "cubej1")
     payloads = _payloads_by_topic(mqtt)
-    expected_keys = {
+    # Core 10 are baseline; spec 006 added Wi-SUN health rows. Use the
+    # SOURCE OF TRUTH (DIAG_SENSOR_DEFS) so this test doesn't churn every
+    # time we add an observability row.
+    expected_topics = {
+        "homeassistant/sensor/cubej1/{}/config".format(sid)
+        for (sid, *_rest) in mb.DIAG_SENSOR_DEFS
+    }
+    assert expected_topics == set(payloads.keys())
+    # Sanity: at least the original 10 must still be present.
+    core10 = {
         "last_poll_success_ts", "last_poll_failure_ts",
         "lqi", "pan_channel",
         "scan_retries_total", "wisun_reconnects_total",
         "mqtt_reconnects_total", "erxudp_timeouts_total",
         "uptime_seconds", "version",
     }
-    expected_topics = {
-        "homeassistant/sensor/cubej1/{}/config".format(k) for k in expected_keys
-    }
-    assert expected_topics == set(payloads.keys())
+    assert core10.issubset({sid for (sid, *_r) in mb.DIAG_SENSOR_DEFS})
 
 
 def test_diag_discovery_payload_for_timestamp_sensor():
@@ -131,7 +137,7 @@ def test_diag_discovery_payload_for_version_is_minimal():
 def test_measurement_and_diag_share_identical_device_block():
     mqtt = FakeMQTT()
     mb.publish_ha_discovery(mqtt, "cubej1")       # 5 measurement configs
-    mb.publish_ha_discovery_diag(mqtt, "cubej1")  # 10 diag configs
+    mb.publish_ha_discovery_diag(mqtt, "cubej1")  # diag configs (count varies)
     devices = set()
     for _topic, payload, _retain in mqtt.calls:
         if isinstance(payload, dict) and "device" in payload:
@@ -142,13 +148,14 @@ def test_measurement_and_diag_share_identical_device_block():
 
 def test_publish_ha_discovery_includes_diag_when_called_once():
     """After integration the single entry point publish_ha_discovery should
-    publish both measurement (5) and diagnostic (10) configs."""
+    publish both measurement and diagnostic configs (count = 5 measurement
+    + len(DIAG_SENSOR_DEFS) diagnostic)."""
     mqtt = FakeMQTT()
     mb.publish_ha_discovery(mqtt, "cubej1")
     payloads = _payloads_by_topic(mqtt)
     assert "homeassistant/sensor/cubej1/power/config" in payloads
     assert "homeassistant/sensor/cubej1/mqtt_reconnects_total/config" in payloads
-    assert len(payloads) == 15
+    assert len(payloads) == 5 + len(mb.DIAG_SENSOR_DEFS)
 
 
 def test_device_id_threads_through_topic_and_unique_id():
