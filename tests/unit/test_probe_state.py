@@ -71,3 +71,41 @@ def test_start_overwrites_previous_settings():
     p.start(interval_sec=2, duration_sec=120, now=1010.0)
     assert p.interval_sec == 2
     assert p.deadline_ts == 1130.0
+
+
+# ---------------------------------------------------------------------------
+# decide_cycle_kind: pure helper that mixes probe + normal cycles
+# ---------------------------------------------------------------------------
+
+def test_decide_cycle_kind_normal_when_probe_inactive():
+    assert mb.decide_cycle_kind(
+        probe_active=False, last_normal_start=0.0, now=100.0, poll_interval=60,
+    ) == "normal"
+
+
+def test_decide_cycle_kind_normal_when_first_ever_cycle():
+    """Active probe but no normal cycle ever recorded — run normal first."""
+    assert mb.decide_cycle_kind(
+        probe_active=True, last_normal_start=0.0, now=1000.0, poll_interval=60,
+    ) == "normal"
+
+
+def test_decide_cycle_kind_probe_within_normal_interval():
+    """5 秒前に normal poll が走った直後の cycle は probe (まだ 60s 経って
+    ないので電力値は十分新しい)."""
+    assert mb.decide_cycle_kind(
+        probe_active=True, last_normal_start=1000.0, now=1005.0, poll_interval=60,
+    ) == "probe"
+
+
+def test_decide_cycle_kind_normal_after_interval_elapsed():
+    """前回 normal から poll_interval 経過したら次は normal で電力値更新."""
+    assert mb.decide_cycle_kind(
+        probe_active=True, last_normal_start=1000.0, now=1060.0, poll_interval=60,
+    ) == "normal"
+
+
+def test_decide_cycle_kind_normal_when_far_past_interval():
+    assert mb.decide_cycle_kind(
+        probe_active=True, last_normal_start=1000.0, now=1200.0, poll_interval=60,
+    ) == "normal"

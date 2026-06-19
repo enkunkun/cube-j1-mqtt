@@ -172,6 +172,24 @@ class ProbeState(object):
         }
 
 
+def decide_cycle_kind(probe_active, last_normal_start, now, poll_interval):
+    """Pick "probe" or "normal" for the next poll cycle. In probe mode we
+    interleave fast 0x80 probes with the usual 0xE7 measurements so HA
+    still gets power values at the regular cadence.
+
+    Spec 009: a normal cycle runs whenever the previous one was at least
+    poll_interval seconds ago. The very first cycle of a probe session is
+    also normal so the rolling window starts with a fresh measurement.
+    """
+    if not probe_active:
+        return "normal"
+    if last_normal_start <= 0:
+        return "normal"
+    if (now - last_normal_start) >= float(poll_interval):
+        return "normal"
+    return "probe"
+
+
 def compute_next_poll_sleep(last_poll_start, now, poll_interval):
     """How long to sleep so the next poll begins `poll_interval` seconds after
     the *start* of the previous one (deadline-based pacing). Clamped to 0 so
@@ -2826,15 +2844,22 @@ def main():
     coeff     = 1
     unit_kwh  = 1.0
     last_ping = time.time()
+    # spec 009 mixed pattern: track the last normal-EPCS cycle so probe
+    # mode can interleave fast probes without starving HA of power values.
+    last_normal_poll_start = 0.0
 
     while True:
         try:
             last_poll_start = time.time()
-            # spec 009: probe mode swaps the EPC list (light 0x80 only)
-            # and tightens the inter-cycle interval. Auto-expires at the
-            # deadline_ts set by /api/probe.
             probing = probe_state.is_active(last_poll_start)
-            cycle_epcs = PROBE_EPCS if probing else None
+            kind = decide_cycle_kind(probing, last_normal_poll_start,
+                                     last_poll_start, poll_interval)
+            cycle_epcs = PROBE_EPCS if kind == "probe" else None
+            if kind == "normal":
+                last_normal_poll_start = last_poll_start
+            # In probe mode, schedule the next cycle at the tight probe
+            # interval; the normal mixed-in cycle uses the same interval so
+            # we don't oversleep into the next probe slot.
             cycle_interval = probe_state.interval_sec if probing else poll_interval
             orig_led = led_read()
             led_rgb(0, 0, 255)
@@ -2856,10 +2881,9 @@ def main():
                         coeff = m["coefficient"]
                     if "unit_kwh" in m:
                         unit_kwh = m["unit_kwh"]
-                    if not probing:
-                        # 0x80-only probe responses don't carry power values;
-                        # skip the measurement publish so HA doesn't see stale
-                        # zeros.
+                    if kind == "normal":
+                        # Probe responses (0x80 only) carry no power values;
+                        # publish only on real measurement cycles.
                         publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)
                     try:
