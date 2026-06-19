@@ -20,7 +20,7 @@ Constitution III の「観測性は MQTT を第一の出力にする」を踏襲
 - Q: Telegraf を稼働させる場所は？ → A: lab-ub01 上の Docker Compose (`/opt/compose/telegraf/`)、Mosquitto と同じ edge ネットワークに参加
 - Q: MQTT subscribe に使う認証ユーザーは？ → A: `homeassistant`（既存 ACL で `cubej/#` 全 subscribe 権を持つ）。専用ユーザーは作らず既存資格情報を再利用する
 - Q: Grafana Cloud の送信先は？ → A: マネージド Prometheus (`sougen.grafana.net` 配下、datasource `grafanacloud-sougen-prom`)、remote_write プロトコル
-- Q: メトリクス命名規約は？ → A: `cube_j1_smart_meter_<key>_<unit>` パターン。`power` → `cube_j1_smart_meter_power_watts`、`energy_forward` → `cube_j1_smart_meter_energy_forward_kwh`、累積カウンタは `_total` で終わる
+- Q: メトリクス命名規約は？ → A: `cube_j1_smart_meter_<key>_<unit>` パターン。`power` → `cube_j1_smart_meter_power_watts`、`energy_forward` → `cube_j1_smart_meter_energy_forward_kwh_total_total`（累積カウンタは `_total` で終わる）。実装上の注意: Telegraf prometheusremotewrite は `<measurement>_<field>` で連結するため、starlark processor では measurement=`cube_j1_smart_meter`・field=`<suffix>` の形に揃え、出力名の重複（例 `..._lqi_..._lqi`）と末尾 `_value` を防ぐ
 - Q: 文字列値（`version`、`last_poll_success_ts` 等）はどう扱う？ → A: `version` は `cube_j1_smart_meter_info{device_id, version} 1` の info メトリクスとして export。タイムスタンプ系は Unix 秒へ変換して `cube_j1_smart_meter_last_poll_success_timestamp_seconds` などのゲージにする（label 化はカーディナリティ過大）
 - Q: 設定変更の反映方法は？ → A: `docker compose up -d --force-recreate` または `docker compose restart telegraf`、Watchtower で latest tag は自動更新する
 
@@ -28,7 +28,7 @@ Constitution III の「観測性は MQTT を第一の出力にする」を踏襲
 
 ### User Story 1 - Grafana Cloud で計測値が時系列として見える (Priority: P1)
 
-運用者は Grafana Cloud (`sougen.grafana.net`) の Explore で `cube_j1_smart_meter_power_watts` を投げると、Cube J1 が publish している瞬時電力が 60 秒粒度で線グラフとして表示される。`cube_j1_smart_meter_energy_forward_kwh` も同様で、`increase()` や `rate()` 等の PromQL を適用できる。
+運用者は Grafana Cloud (`sougen.grafana.net`) の Explore で `cube_j1_smart_meter_power_watts` を投げると、Cube J1 が publish している瞬時電力が 60 秒粒度で線グラフとして表示される。`cube_j1_smart_meter_energy_forward_kwh_total` も同様で、`increase()` や `rate()` 等の PromQL を適用できる。
 
 **Why this priority**: 本 feature の主目的そのもの。HA でしか見えなかった計測値が、Grafana の長期保存・アラート・PromQL の世界に乗ることで運用上の価値が一気に増える。
 
@@ -37,7 +37,7 @@ Constitution III の「観測性は MQTT を第一の出力にする」を踏襲
 **Acceptance Scenarios**:
 
 1. **Given** telegraf コンテナが稼働し Mosquitto に接続済み、Cube J1 が `cubej/cubej1/power` に publish した直後, **When** Grafana Explore で `cube_j1_smart_meter_power_watts{device_id="cubej1"}` を range query する, **Then** publish 値と一致する time series が描画される
-2. **Given** 過去 24 時間 telegraf が稼働した, **When** `increase(cube_j1_smart_meter_energy_forward_kwh[24h])` を query する, **Then** 24 時間の積算電力量が単位 kWh で返る
+2. **Given** 過去 24 時間 telegraf が稼働した, **When** `increase(cube_j1_smart_meter_energy_forward_kwh_total[24h])` を query する, **Then** 24 時間の積算電力量が単位 kWh で返る
 3. **Given** Cube J1 が単相 2 線式接続で `current_t` を publish していない, **When** `cube_j1_smart_meter_current_t_amperes` を query する, **Then** 系列が無い（エラーではなく empty result）
 
 ---
