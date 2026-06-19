@@ -1906,14 +1906,25 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
-                # Probe whether SKPING (ICMPv6 Echo) is supported on this
-                # firmware. If yes we have a cheap RTT probe that bypasses
-                # ECHONET. Failure here is non-fatal — the bridge moves on.
-                try:
-                    out = skcommand(fd, "SKPING {}".format(ipv6), timeout=3)
-                    log("SKPING probe: {}".format(out))
-                except Exception as e:
-                    log("SKPING probe failed: {}".format(e))
+                # SKPING <ipv6> returned ER05 (invalid argument, not
+                # ER01=unsupported) — the command exists, only the syntax
+                # is wrong. Try several plausible variants and log each one
+                # so we can spot the working format.
+                for variant in (
+                    "SKPING 0001 {}".format(ipv6),
+                    "SKPING 1 {}".format(ipv6),
+                    "SKPING {} 0001".format(ipv6),
+                    "SKPING 0001 0040 {}".format(ipv6),
+                    "SKPING {} 0001 0040".format(ipv6),
+                    "SKPING 1 0040 {}".format(ipv6),
+                    "SKPING {} 1".format(ipv6),
+                    "SKPING 0 {}".format(ipv6),
+                ):
+                    try:
+                        out = skcommand(fd, variant, timeout=3)
+                        log("SKPING try [{}]: {}".format(variant, out))
+                    except Exception as e:
+                        log("SKPING try [{}] error: {}".format(variant, e))
                 return ipv6
             if "EVENT 24" in line:
                 if LOGGER is not None:
