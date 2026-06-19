@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 .specify-cache/
 .benchmarks/
+.DS_Store
+
+# Local secrets: real B-route credentials, Wi-Fi PSK, MQTT password.
+# scripts/prepare_usb.sh overlays these onto the USB after copying
+# production_tool/ templates.
+secrets/
