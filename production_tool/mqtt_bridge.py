@@ -22,6 +22,19 @@ import re
 import threading
 import logging
 import logging.handlers
+import base64
+import hmac
+import tempfile
+import subprocess
+
+try:
+    # Python 2.7
+    import BaseHTTPServer
+    import urlparse
+except ImportError:
+    # Python 3 (for host tests)
+    from http import server as BaseHTTPServer
+    import urllib.parse as urlparse
 
 # Bridge self-version. SemVer is updated manually; git short hash is overwritten
 # by scripts/embed_git_hash.sh before USB distribution. When the embed script
@@ -79,16 +92,755 @@ def load_config():
 
 
 def apply_defaults(cfg):
-    """Return a copy of *cfg* with optional observability keys filled in.
+    """Return a copy of *cfg* with optional observability + admin keys filled in.
 
-    Preserves every existing entry (FR-012). Unknown keys are passed through
-    unchanged so future config additions don't crash older bridge versions.
+    Preserves every existing entry (FR-012 / 003 FR-018). Unknown keys are
+    passed through unchanged so future config additions don't crash older
+    bridge versions.
     """
     out = dict(cfg)
     out.setdefault("log_level", "info")
     out.setdefault("log_max_bytes", 1048576)
     out.setdefault("log_backup_count", 3)
+    out.setdefault("admin_ui_enabled", False)
+    out.setdefault("admin_ui_port", 8080)
+    out.setdefault("admin_user", "")
+    out.setdefault("admin_password", "")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Embedded admin UI: pure helpers
+# ---------------------------------------------------------------------------
+
+# Path to the live config the bridge reads on startup. The admin UI reads /
+# atomically rewrites this file so the next bridge restart picks up the new
+# values. Tests can override these constants.
+ADMIN_CONFIG_PATH = "/data/local/config.json"
+ADMIN_BRIDGE_PATH = "/data/local/mqtt_bridge.py"
+ADMIN_WPA_PATH    = "/data/misc/wifi/wpa_supplicant.conf"
+ADMIN_LOG_PATH    = LOG_PATH
+
+
+class AdminConfig(object):
+    """Immutable admin UI configuration loaded from config.json."""
+
+    def __init__(self, enabled, port, user, password):
+        self.enabled  = bool(enabled)
+        self.port     = int(port)
+        self.user     = user or ""
+        self.password = password or ""
+
+    def is_active(self):
+        return bool(self.enabled and self.user and self.password)
+
+    def match_basic_auth(self, header_value):
+        """Constant-time compare an `Authorization: Basic ...` header value.
+
+        Returns False for any malformed input rather than raising.
+        """
+        if not header_value or not isinstance(header_value, str):
+            return False
+        if not header_value.startswith("Basic "):
+            return False
+        encoded = header_value[6:].strip()
+        try:
+            decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except Exception:
+            return False
+        if ":" not in decoded:
+            return False
+        sent_user, _, sent_pwd = decoded.partition(":")
+        # Use compare_digest on bytes so the same-length check is constant.
+        u_ok = hmac.compare_digest(
+            sent_user.encode("utf-8"), self.user.encode("utf-8"))
+        p_ok = hmac.compare_digest(
+            sent_pwd.encode("utf-8"), self.password.encode("utf-8"))
+        return bool(u_ok and p_ok)
+
+
+class AtomicWriter(object):
+    """File writes via temp + os.rename so the target is never half-written."""
+
+    @staticmethod
+    def write_bytes(path, data):
+        dir_ = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".tmp.", dir=dir_)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass  # fsync may fail on some FS — best-effort
+            os.rename(tmp, path)
+            tmp = None  # rename consumed it
+        finally:
+            if tmp is not None and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def write_json(path, obj):
+        AtomicWriter.write_bytes(
+            path, json.dumps(obj, indent=2, separators=(",", ": ")).encode("utf-8"))
+
+
+_VALID_LOG_LEVELS = ("debug", "info", "warn", "error")
+
+_POSITIVE_INT_KEYS = (
+    "mqtt_port", "poll_interval", "log_max_bytes", "log_backup_count",
+    "admin_ui_port",
+)
+
+
+def validate_config_patch(patch, current):
+    """Merge *patch* into *current* with type/range checks (FR-010).
+
+    Returns (merged_dict, None) on success, (None, error_message) on failure.
+    Unknown keys are passed through.
+    """
+    merged = dict(current)
+    for key, value in patch.items():
+        if key in _POSITIVE_INT_KEYS:
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                return None, "{} must be a positive integer".format(key)
+        elif key == "log_level":
+            if value not in _VALID_LOG_LEVELS:
+                return None, ("log_level must be one of {}"
+                              .format("/".join(_VALID_LOG_LEVELS)))
+        elif key == "admin_ui_enabled":
+            if not isinstance(value, bool):
+                return None, "admin_ui_enabled must be true or false"
+        elif key == "admin_password" and value == "***":
+            value = current.get("admin_password", "")
+        merged[key] = value
+    return merged, None
+
+
+def validate_wifi_patch(payload):
+    """Verify SSID/PSK shape per WPA2 PSK spec.
+
+    Returns (normalized_dict, None) on success, (None, error_message)
+    on failure. PSK must be 8..63 characters per IEEE 802.11i.
+    """
+    ssid = payload.get("ssid")
+    psk = payload.get("psk")
+    if not isinstance(ssid, str) or not ssid.strip():
+        return None, "ssid is required"
+    if not isinstance(psk, str):
+        return None, "psk must be a string"
+    if len(psk) < 8 or len(psk) > 63:
+        return None, "psk must be 8-63 characters"
+    return {"ssid": ssid, "psk": psk}, None
+
+
+def read_config_masked(path):
+    """Read config.json and replace admin_password with '***' if present."""
+    with open(path) as f:
+        cfg = json.load(f)
+    if "admin_password" in cfg:
+        cfg["admin_password"] = "***"
+    return cfg
+
+
+_TAIL_LOG_MAX = 1000
+_TAIL_LOG_READ_CHUNK = 4096
+
+
+def tail_log(path, n):
+    """Return the last `n` non-empty lines of `path` (clamped to 1..1000).
+
+    Reads the file backwards in CHUNK-sized blocks so it stays cheap even for
+    multi-megabyte rotated logs. Missing file returns an empty list.
+    """
+    if not isinstance(n, int) or n < 1:
+        n = 1
+    if n > _TAIL_LOG_MAX:
+        n = _TAIL_LOG_MAX
+    try:
+        f = open(path, "rb")
+    except (IOError, OSError):
+        return []
+    try:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        buf = b""
+        lines = []
+        pos = end
+        while pos > 0 and len(lines) <= n:
+            read_size = min(_TAIL_LOG_READ_CHUNK, pos)
+            pos -= read_size
+            f.seek(pos)
+            buf = f.read(read_size) + buf
+            lines = buf.split(b"\n")
+        decoded = [line.decode("utf-8", errors="replace") for line in lines]
+        non_empty = [line for line in decoded if line.strip()]
+        return non_empty[-n:]
+    finally:
+        f.close()
+
+
+# ---------------------------------------------------------------------------
+# Embedded admin UI: HTTP handler / server
+# ---------------------------------------------------------------------------
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Cube J1 Admin</title>
+<style>
+body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem auto;
+       max-width: 760px; color: #222; }
+h1 { font-size: 1.4rem; }
+fieldset { border: 1px solid #ccc; padding: 1rem; margin: 1rem 0; }
+legend { padding: 0 .4rem; font-weight: 600; }
+label { display: block; margin: .4rem 0; font-size: .9rem; }
+input, select { width: 100%; box-sizing: border-box; padding: .4rem .6rem;
+                 font: inherit; }
+button { padding: .55rem 1.2rem; font: inherit; cursor: pointer; }
+.ok { color: #186a3b; } .err { color: #b71c1c; }
+pre { background: #f4f4f4; padding: .6rem; font-size: .8rem;
+      max-height: 12rem; overflow: auto; }
+.notice { background: #fff8e1; border-left: 3px solid #f57f17; padding: .5rem;
+          font-size: .85rem; margin: .5rem 0; }
+</style>
+</head>
+<body>
+<h1>Cube J1 Admin</h1>
+<div id="status"></div>
+<fieldset><legend>Config</legend>
+  <form id="config-form"></form>
+  <button id="config-save" type="button">Save Config</button>
+</fieldset>
+<fieldset><legend>Wi-Fi</legend>
+  <p class="notice">&#9888; Wi-Fi 変更後に AP に再接続できないと Cube J1 は
+     LAN から見えなくなります。USB 経由で復旧する覚悟がある場合のみ実行してください.</p>
+  <form id="wifi-form">
+    <label>SSID <input name="ssid" required></label>
+    <label>PSK  <input name="psk" type="password" required minlength="8" maxlength="63"></label>
+    <button type="submit">Save Wi-Fi</button>
+  </form>
+</fieldset>
+<fieldset><legend>Bridge Update</legend>
+  <form id="update-form" enctype="multipart/form-data">
+    <label><input type="file" name="update_file" accept=".py" required></label>
+    <button type="submit">Upload &amp; Restart</button>
+  </form>
+</fieldset>
+<fieldset><legend>Diagnostics</legend>
+  <button id="btn-diag" type="button">Refresh Diag</button>
+  <button id="btn-restart" type="button">Restart Bridge</button>
+  <pre id="diag-output">(press refresh)</pre>
+</fieldset>
+<script>
+var status = document.getElementById('status');
+function showOk(msg) { status.innerHTML = '<p class="ok">' + msg + '</p>'; }
+function showErr(msg) { status.innerHTML = '<p class="err">' + msg + '</p>'; }
+function renderConfig(cfg) {
+  var form = document.getElementById('config-form');
+  form.innerHTML = '';
+  Object.keys(cfg).sort().forEach(function(k) {
+    var v = cfg[k];
+    var row = document.createElement('label');
+    row.textContent = k + ' ';
+    var inp = document.createElement('input');
+    inp.name = k;
+    if (typeof v === 'boolean') {
+      inp.type = 'checkbox'; inp.checked = v;
+    } else {
+      inp.value = v == null ? '' : String(v);
+    }
+    row.appendChild(inp);
+    form.appendChild(row);
+  });
+}
+function fetchConfig() {
+  fetch('/api/config').then(function(r){ return r.json(); }).then(renderConfig);
+}
+document.getElementById('config-save').addEventListener('click', function() {
+  var form = document.getElementById('config-form');
+  var patch = {};
+  Array.from(form.elements).forEach(function(el) {
+    if (!el.name) return;
+    if (el.type === 'checkbox') {
+      patch[el.name] = el.checked;
+    } else if (/^(mqtt_port|poll_interval|log_max_bytes|log_backup_count|admin_ui_port)$/.test(el.name)) {
+      patch[el.name] = parseInt(el.value, 10);
+    } else {
+      patch[el.name] = el.value;
+    }
+  });
+  fetch('/api/config', { method: 'PUT', headers: {'Content-Type':'application/json'},
+                          body: JSON.stringify(patch) })
+    .then(function(r){ return r.json().then(function(j){ return [r.status, j]; }); })
+    .then(function(pair){ if(pair[0]===200) showOk('Config saved'); else showErr(pair[1].error || 'Save failed'); });
+});
+document.getElementById('wifi-form').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var f = ev.target;
+  var body = JSON.stringify({ ssid: f.ssid.value, psk: f.psk.value });
+  fetch('/api/wifi', { method: 'PUT', headers:{'Content-Type':'application/json'}, body: body })
+    .then(function(r){ return r.json().then(function(j){ return [r.status, j]; }); })
+    .then(function(pair){ if(pair[0]===200) showOk('Wi-Fi updated'); else showErr(pair[1].error||'Failed'); });
+});
+document.getElementById('update-form').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var fd = new FormData(ev.target);
+  fetch('/api/update', { method:'POST', body: fd })
+    .then(function(r){ return r.json().then(function(j){ return [r.status, j]; }); })
+    .then(function(pair){ if(pair[0]===200) showOk('Bridge updated, restarting...'); else showErr(pair[1].error||'Upload failed'); });
+});
+document.getElementById('btn-diag').addEventListener('click', function() {
+  fetch('/api/diag').then(function(r){return r.json();}).then(function(j){
+    document.getElementById('diag-output').textContent = JSON.stringify(j, null, 2);
+  });
+});
+document.getElementById('btn-restart').addEventListener('click', function() {
+  if (!confirm('Restart bridge process?')) return;
+  fetch('/api/restart', { method:'POST' })
+    .then(function(r){ return r.json(); })
+    .then(function(){ showOk('Restart requested'); });
+});
+fetchConfig();
+</script>
+</body>
+</html>"""
+
+
+def _restart_bridge_async():
+    """Schedule a stop/start of mqtt_ha_bridge 200 ms in the future.
+
+    Run from a timer thread so the HTTP response can be written first.
+    """
+    def _do():
+        try:
+            subprocess.Popen(["stop", "mqtt_ha_bridge"]).wait()
+            time.sleep(1)
+            subprocess.Popen(["start", "mqtt_ha_bridge"]).wait()
+        except Exception:
+            pass
+    threading.Timer(0.2, _do).start()
+
+
+class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+    """Handler injected with config / paths / lock by start_admin_server."""
+
+    # Class attributes set by start_admin_server before HTTPServer construction.
+    admin_config = None        # AdminConfig
+    diag_state_provider = None # callable() -> DiagState-like
+    config_path = ADMIN_CONFIG_PATH
+    bridge_path = ADMIN_BRIDGE_PATH
+    wpa_supplicant_path = ADMIN_WPA_PATH
+    log_path = ADMIN_LOG_PATH
+    lock = None                # threading.Lock
+
+    server_version = "CubeJ1Admin/1.0"
+
+    # ------------------------------------------------------------------
+    # framework hooks
+    # ------------------------------------------------------------------
+
+    def log_message(self, fmt, *args):
+        if LOGGER is not None:
+            try:
+                LOGGER.debug(event="admin_http",
+                             msg=fmt % args,
+                             context={"client": self.address_string()})
+                return
+            except Exception:
+                pass
+        # Fallback: suppress noisy stderr (default would print every request).
+
+    # ------------------------------------------------------------------
+    # auth + helpers
+    # ------------------------------------------------------------------
+
+    def _authenticate(self):
+        header = self.headers.get("Authorization")
+        if self.admin_config is None:
+            return False
+        if not self.admin_config.match_basic_auth(header):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="cubej"')
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": "Authentication required"}')
+            return False
+        return True
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, status, text, content_type="text/plain; charset=utf-8"):
+        body = text.encode("utf-8") if isinstance(text, str) else text
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return None
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def _wrap(self, fn):
+        try:
+            return fn()
+        except Exception as e:
+            if LOGGER is not None:
+                try:
+                    LOGGER.error(event="admin_unhandled_error",
+                                 context={"path": self.path,
+                                          "error": str(e)})
+                except Exception:
+                    pass
+            self._send_json(500, {"error": "internal server error"})
+
+    # ------------------------------------------------------------------
+    # GET dispatch
+    # ------------------------------------------------------------------
+
+    def do_GET(self):
+        if not self._authenticate():
+            return
+        self._wrap(self._do_get_dispatch)
+
+    def _do_get_dispatch(self):
+        parsed = urlparse.urlparse(self.path)
+        path = parsed.path
+        if path == "/" or path == "":
+            self._send_text(200, ADMIN_HTML,
+                            content_type="text/html; charset=utf-8")
+            return
+        if path == "/api/config":
+            cfg = read_config_masked(self.config_path)
+            self._send_json(200, cfg)
+            return
+        if path == "/api/diag":
+            try:
+                snap = self.diag_state_provider().snapshot(time.time())
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+                return
+            self._send_json(200, snap)
+            return
+        if path == "/api/log":
+            qs = urlparse.parse_qs(parsed.query)
+            try:
+                n = int(qs.get("lines", ["100"])[0])
+            except ValueError:
+                n = 100
+            lines = tail_log(self.log_path, n)
+            body = ("\n".join(lines) + "\n") if lines else ""
+            self._send_text(200, body,
+                            content_type="application/x-ndjson; charset=utf-8")
+            return
+        self._send_json(404, {"error": "not found"})
+
+    # ------------------------------------------------------------------
+    # PUT dispatch
+    # ------------------------------------------------------------------
+
+    def do_PUT(self):
+        if not self._authenticate():
+            return
+        self._wrap(self._do_put_dispatch)
+
+    def _do_put_dispatch(self):
+        path = urlparse.urlparse(self.path).path
+        if path == "/api/config":
+            patch = self._read_json_body()
+            if patch is None:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            with self.lock:
+                with open(self.config_path) as f:
+                    current = json.load(f)
+                merged, err = validate_config_patch(patch, current)
+                if err:
+                    self._send_json(400, {"error": err})
+                    return
+                AtomicWriter.write_json(self.config_path, merged)
+            self._send_json(200, {"status": "ok"})
+            return
+        if path == "/api/wifi":
+            body = self._read_json_body()
+            if body is None:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            normalized, err = validate_wifi_patch(body)
+            if err:
+                self._send_json(400, {"error": err})
+                return
+            with self.lock:
+                content = _rewrite_wpa_supplicant(
+                    self.wpa_supplicant_path, normalized["ssid"],
+                    normalized["psk"])
+                AtomicWriter.write_bytes(
+                    self.wpa_supplicant_path, content.encode("utf-8"))
+            wpa_output = _run_wpa_reconfigure()
+            self._send_json(200, {"status": "ok",
+                                   "wpa_cli_output": wpa_output})
+            return
+        self._send_json(404, {"error": "not found"})
+
+    # ------------------------------------------------------------------
+    # POST dispatch (US2)
+    # ------------------------------------------------------------------
+
+    def do_POST(self):
+        if not self._authenticate():
+            return
+        self._wrap(self._do_post_dispatch)
+
+    def _do_post_dispatch(self):
+        path = urlparse.urlparse(self.path).path
+        if path == "/api/restart":
+            self._send_json(200, {"status": "restarting"})
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            _restart_bridge_async()
+            return
+        if path == "/api/update":
+            self._handle_update()
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def _handle_update(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "missing Content-Length"})
+            return
+        if length > 100 * 1024:
+            self._send_json(413, {"error": "File too large (max 100KB)"})
+            return
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("multipart/form-data"):
+            self._send_json(400,
+                {"error": "expected multipart/form-data"})
+            return
+        try:
+            body = self.rfile.read(length)
+        except Exception as e:
+            self._send_json(400, {"error": "read failed: {}".format(e)})
+            return
+        filename, data, err = _parse_multipart_file(body, ctype, "update_file")
+        if err:
+            self._send_json(400, {"error": err})
+            return
+        if not filename.endswith(".py"):
+            self._send_json(415, {"error": "Only .py files are accepted"})
+            return
+        # syntax check via py_compile (does NOT execute the code)
+        import py_compile
+        dir_ = os.path.dirname(self.bridge_path) or "."
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".py", dir=dir_, prefix=".upload.")
+        except (IOError, OSError) as e:
+            self._send_json(500, {"error": "cannot create temp file: {}".format(e)})
+            return
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            try:
+                py_compile.compile(tmp, doraise=True)
+            except py_compile.PyCompileError as e:
+                self._send_json(400, {"error": str(e).strip()})
+                return
+            with self.lock:
+                os.rename(tmp, self.bridge_path)
+                tmp = None
+        finally:
+            if tmp is not None and os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        self._send_json(200, {"status": "ok", "restarting": True})
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        _restart_bridge_async()
+
+
+_MULTIPART_BOUNDARY_RE = re.compile(r'boundary=(?:"([^"]+)"|([^;\s]+))')
+_MULTIPART_FILENAME_RE = re.compile(r'filename="([^"]*)"')
+_MULTIPART_NAME_RE = re.compile(r'name="([^"]+)"')
+
+
+def _parse_multipart_file(body, content_type, field_name):
+    """Extract a single file upload from a multipart/form-data body.
+
+    Returns (filename, data, None) on success or (None, None, error_message).
+    Pure stdlib (re only) — works on both Python 2.7 (Cube J1 runtime) and
+    Python 3 (host test runner) where `cgi.FieldStorage` is unavailable.
+    """
+    m = _MULTIPART_BOUNDARY_RE.search(content_type)
+    if not m:
+        return None, None, "missing multipart boundary"
+    boundary = (m.group(1) or m.group(2)).encode("ascii")
+    sep = b"--" + boundary
+    parts = body.split(sep)
+    for part in parts:
+        if not part or part in (b"", b"--", b"--\r\n"):
+            continue
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        idx = part.find(b"\r\n\r\n")
+        if idx == -1:
+            continue
+        headers_blob = part[:idx].decode("utf-8", errors="replace")
+        payload = part[idx + 4:]
+        # strip trailing CRLF that precedes the next boundary
+        if payload.endswith(b"\r\n"):
+            payload = payload[:-2]
+        name_match = _MULTIPART_NAME_RE.search(headers_blob)
+        if not name_match or name_match.group(1) != field_name:
+            continue
+        fn_match = _MULTIPART_FILENAME_RE.search(headers_blob)
+        filename = fn_match.group(1) if fn_match else ""
+        return filename, payload, None
+    return None, None, "field '{}' not found".format(field_name)
+
+
+def _rewrite_wpa_supplicant(path, ssid, psk):
+    """Replace the ssid= and psk= lines in the existing template, preserving
+    other directives (`freq_list`, `scan_ssid`, etc).
+
+    Falls back to a minimal template if the file is missing.
+    """
+    try:
+        with open(path) as f:
+            existing = f.read()
+    except (IOError, OSError):
+        return ('ctrl_interface=/data/misc/wifi/sockets\n'
+                'update_config=1\n\n'
+                'network={{\n'
+                '        ssid="{}"\n'
+                '        psk="{}"\n'
+                '        key_mgmt=WPA-PSK\n'
+                '}}\n').format(ssid, psk)
+    lines = existing.splitlines()
+    out_lines = []
+    in_network = False
+    saw_ssid = False
+    saw_psk = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("network={"):
+            in_network = True
+            out_lines.append(line)
+            continue
+        if in_network and stripped == "}":
+            if not saw_ssid:
+                out_lines.append('        ssid="{}"'.format(ssid))
+            if not saw_psk:
+                out_lines.append('        psk="{}"'.format(psk))
+            out_lines.append(line)
+            in_network = False
+            continue
+        if in_network and stripped.startswith("ssid="):
+            out_lines.append('        ssid="{}"'.format(ssid))
+            saw_ssid = True
+            continue
+        if in_network and stripped.startswith("psk="):
+            out_lines.append('        psk="{}"'.format(psk))
+            saw_psk = True
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines) + "\n"
+
+
+def _run_wpa_reconfigure():
+    """Invoke wpa_cli reconfigure on wlan0. Returns the captured stdout."""
+    try:
+        proc = subprocess.Popen(
+            ["wpa_cli", "-p", "/data/misc/wifi/sockets",
+             "-i", "wlan0", "reconfigure"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = proc.communicate()
+        return (out or b"").decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        return "wpa_cli failed: {}".format(e)
+
+
+class _ReusingHTTPServer(BaseHTTPServer.HTTPServer):
+    allow_reuse_address = True
+
+
+class AdminServer(object):
+    """HTTPServer + dedicated thread wrapper."""
+
+    def __init__(self, httpd, port):
+        self.httpd = httpd
+        self.port = port
+        self.thread = threading.Thread(
+            target=httpd.serve_forever,
+            name="cubej-admin-http",
+        )
+        self.thread.daemon = True
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        except Exception:
+            pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=2)
+
+
+def start_admin_server(port, user, password, diag_state_provider,
+                       config_path=ADMIN_CONFIG_PATH,
+                       bridge_path=ADMIN_BRIDGE_PATH,
+                       wpa_supplicant_path=ADMIN_WPA_PATH,
+                       log_path=ADMIN_LOG_PATH):
+    """Construct and start an AdminServer with the given settings.
+
+    Returns the running AdminServer.
+    """
+    admin_config = AdminConfig(enabled=True, port=port,
+                                user=user, password=password)
+    AdminHandler.admin_config = admin_config
+    # staticmethod prevents the function from being bound to instances
+    # (so `self.diag_state_provider()` doesn't pass a phantom self).
+    AdminHandler.diag_state_provider = staticmethod(diag_state_provider)
+    AdminHandler.config_path = config_path
+    AdminHandler.bridge_path = bridge_path
+    AdminHandler.wpa_supplicant_path = wpa_supplicant_path
+    AdminHandler.log_path = log_path
+    AdminHandler.lock = threading.Lock()
+
+    httpd = _ReusingHTTPServer(("", port), AdminHandler)
+    server = AdminServer(httpd, port)
+    server.start()
+    return server
 
 # ---------------------------------------------------------------------------
 # Pure helpers (no I/O) shared by observability features
@@ -1117,9 +1869,24 @@ def main():
                         backup_count=int(cfg["log_backup_count"]))
     emit_bridge_start(LOGGER, device_id=device_id, version=bridge_version())
 
-    # Diagnostics aggregator. Counter / timestamp updates feed into MQTT
-    # diag/* topics with retain=true (FR-001).
+    # Diagnostics aggregator declared early so the admin UI can read it.
     diag_state = DiagState(start_time=time.time(), version=bridge_version())
+
+    # Embedded admin UI (Constitution VI). Off by default; opted in via
+    # config. Failure to start is logged but never aborts the bridge.
+    if cfg.get("admin_ui_enabled") and cfg.get("admin_user") and cfg.get("admin_password"):
+        try:
+            start_admin_server(
+                port=int(cfg.get("admin_ui_port", 8080)),
+                user=cfg["admin_user"],
+                password=cfg["admin_password"],
+                diag_state_provider=lambda: diag_state,
+            )
+            LOGGER.info(event="admin_ui_started",
+                        context={"port": int(cfg.get("admin_ui_port", 8080))})
+        except Exception as e:
+            LOGGER.error(event="admin_ui_start_failed",
+                         context={"error": str(e)})
 
     # Connect MQTT. The on_reconnect callback bumps the diag counter every
     # time the broker session is re-established.
