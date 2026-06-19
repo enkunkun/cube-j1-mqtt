@@ -1826,6 +1826,14 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
     skcommand(fd, "SKRESET", timeout=5)
     time.sleep(1)
 
+    # Probe firmware identity for diagnostics (effect on ERXUDP format depends
+    # on the SKSTACK build — see spec 007/008).
+    try:
+        ver = skcommand(fd, "SKVER", timeout=2)
+        log("SKVER: {}".format(ver))
+    except Exception as e:
+        log("SKVER failed: {}".format(e))
+
     log("SKSETPWD")
     skcommand(fd, "SKSETPWD C {}".format(br_pwd))
 
@@ -1834,6 +1842,14 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
 
     # Force ASCII-hex ERXUDP payload format so parser stays stable.
     skcommand(fd, "WOPT 1")
+    # Best-effort: ROHM BP35A1 系の拡張で、 ERXUDP の末尾に RSSI を 1 byte
+    # 追加する設定。 対応してない firmware では FAIL ER* を返すだけで害なし。
+    # token_count が 10 → 11 に増えたら本物の RSSI を載せられる。
+    try:
+        ropt_out = skcommand(fd, "ROPT 1", timeout=2)
+        log("ROPT 1: {}".format(ropt_out))
+    except Exception as e:
+        log("ROPT 1 not supported (this is expected on some firmwares): {}".format(e))
 
     log("SKSCAN (may take up to 60s)")
     pan = skscan(fd, diag_state=diag_state)
