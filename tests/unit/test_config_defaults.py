@@ -44,6 +44,17 @@ def test_apply_defaults_respects_explicit_mqtt_keepalive():
     assert cfg["mqtt_keepalive"] == 120
 
 
+def test_apply_defaults_enables_mqtt_threading_by_default():
+    cfg = mb.apply_defaults(_upstream_config())
+    assert cfg["mqtt_threading_enabled"] is True
+    assert cfg["mqtt_send_queue_maxsize"] == 1000
+
+
+def test_apply_defaults_respects_explicit_threading_flag():
+    cfg = mb.apply_defaults({"mqtt_threading_enabled": False})
+    assert cfg["mqtt_threading_enabled"] is False
+
+
 def test_apply_defaults_preserves_all_upstream_keys_and_values():
     upstream = _upstream_config()
     cfg = mb.apply_defaults(dict(upstream))

@@ -122,6 +122,11 @@ def apply_defaults(cfg):
     # 切断される（実測 約 12 分間隔）。300s なら poll が一時的に滞っても
     # PINGREQ をギリギリ間に合わせられる。
     out.setdefault("mqtt_keepalive", 300)
+    # MQTT クライアントを送信ワーカ + keepalive ワーカに分離 (spec 005)。
+    # メインループの ECHONET poll が詰まっても broker session を維持する。
+    # 切り戻し用の fallback として False で従来パスに戻せる。
+    out.setdefault("mqtt_threading_enabled", True)
+    out.setdefault("mqtt_send_queue_maxsize", 1000)
     return out
 
 
@@ -1597,18 +1602,38 @@ def _encode_str(s):
     b = s.encode("utf-8")
     return struct.pack(">H", len(b)) + b
 
+try:
+    import Queue as _queue_mod  # Py2
+except ImportError:
+    import queue as _queue_mod  # Py3
+
+
 class MQTTClient(object):
     def __init__(self, host, port, client_id, username=None, password=None,
-                 on_reconnect=None, keepalive=60):
-        self.host         = host
-        self.port         = port
-        self.client_id    = client_id
-        self.username     = username
-        self.password     = password
-        self.keepalive    = int(keepalive)
-        self.sock         = None
-        self._out_queue   = collections.deque()
-        self.on_reconnect = on_reconnect  # called after a successful re-connect
+                 on_reconnect=None, keepalive=60,
+                 threading_enabled=False, send_queue_maxsize=1000):
+        self.host              = host
+        self.port              = port
+        self.client_id         = client_id
+        self.username          = username
+        self.password          = password
+        self.keepalive         = int(keepalive)
+        self.threading_enabled = bool(threading_enabled)
+        self.sock              = None
+        self._out_queue        = collections.deque()  # legacy fallback only
+        self.on_reconnect      = on_reconnect  # called after a successful re-connect
+
+        # Threaded-mode primitives (spec 005). Allocated even in legacy mode
+        # so that diagnostic snapshots (publish_dropped_total など) never
+        # raise AttributeError.
+        self.send_queue              = _queue_mod.Queue(maxsize=int(send_queue_maxsize))
+        self.publish_dropped_total   = 0
+        self.ping_failures_total     = 0
+        self._send_lock              = threading.Lock()
+        self._stop_event             = threading.Event()
+        self._reconnect_event        = threading.Event()
+        self._sender_thread          = None
+        self._keepalive_thread       = None
 
     def connect(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1667,11 +1692,15 @@ class MQTTClient(object):
         else:
             log("MQTT connected to {}:{}".format(self.host, self.port))
 
-        # flush any queued messages
-        try:
-            self._flush_queue()
-        except Exception as e:
-            log("MQTT flush queue error: {}".format(e))
+        if self.threading_enabled:
+            self._reconnect_event.clear()
+            self._start_workers_if_needed()
+        else:
+            # legacy: flush in-memory deque
+            try:
+                self._flush_queue()
+            except Exception as e:
+                log("MQTT flush queue error: {}".format(e))
 
     def _make_pkt(self, topic, payload, retain=False):
         if isinstance(payload, dict):
@@ -1684,6 +1713,10 @@ class MQTTClient(object):
         return struct.pack("B", fixed) + _encode_remaining(len(remaining)) + remaining
 
     def publish(self, topic, payload, retain=False):
+        if self.threading_enabled:
+            self._enqueue(topic, payload, retain)
+            return
+        # ---- legacy synchronous path (fallback when threading is disabled) ----
         pkt = self._make_pkt(topic, payload, retain)
         try:
             if not self.sock:
@@ -1714,6 +1747,157 @@ class MQTTClient(object):
                 except Exception:
                     pass
 
+    # ------------------------------------------------------------------
+    # Threaded mode helpers (spec 005-mqtt-threading)
+    # ------------------------------------------------------------------
+
+    def _enqueue(self, topic, payload, retain):
+        """Non-blocking enqueue. On saturation drops the OLDEST entry (FIFO)
+        and bumps publish_dropped_total so the most-recent value survives —
+        important for HA dashboards that display "now"."""
+        item = (topic, payload, retain)
+        try:
+            self.send_queue.put_nowait(item)
+        except _queue_mod.Full:
+            try:
+                self.send_queue.get_nowait()
+                self.publish_dropped_total += 1
+            except _queue_mod.Empty:
+                pass
+            try:
+                self.send_queue.put_nowait(item)
+            except _queue_mod.Full:
+                # Worker is faster than the drop loop expected; bump anyway.
+                self.publish_dropped_total += 1
+
+    def _start_workers_if_needed(self):
+        if self._sender_thread is None or not self._sender_thread.is_alive():
+            self._sender_thread = threading.Thread(
+                target=self._sender_loop, name="mqtt-sender")
+            self._sender_thread.daemon = True
+            self._sender_thread.start()
+        if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
+            self._keepalive_thread = threading.Thread(
+                target=self._keepalive_loop, name="mqtt-keepalive")
+            self._keepalive_thread.daemon = True
+            self._keepalive_thread.start()
+
+    def _sender_loop(self):
+        """Pull from send_queue, send under _send_lock. On send failure or
+        on a reconnect_event from the keepalive worker, perform an in-thread
+        reconnect (also under lock so PINGREQ can't race)."""
+        while not self._stop_event.is_set():
+            if self._reconnect_event.is_set():
+                self._reconnect_event.clear()
+                try:
+                    self._reconnect_under_lock()
+                except Exception as e:
+                    log("MQTT sender reconnect failed: {}".format(e))
+            try:
+                item = self.send_queue.get(timeout=1.0)
+            except _queue_mod.Empty:
+                continue
+            if item is None:
+                # stop sentinel
+                self.send_queue.task_done()
+                break
+            topic, payload, retain = item
+            pkt = self._make_pkt(topic, payload, retain)
+            ok = self._send_under_lock(pkt)
+            self.send_queue.task_done()
+            if not ok:
+                # Reconnect synchronously inside this thread; then retry once.
+                try:
+                    self._reconnect_under_lock()
+                    self._send_under_lock(pkt)  # best-effort retry, no further loop
+                except Exception as e:
+                    log("MQTT sender post-reconnect retry failed: {}".format(e))
+
+    def _keepalive_loop(self):
+        """Send PINGREQ every keepalive/2 seconds. On send failure signal the
+        sender thread to reconnect; do not attempt the reconnect here to keep
+        the connect serialization simple."""
+        interval = max(1.0, self.keepalive / 2.0)
+        while not self._stop_event.wait(interval):
+            ok = self._send_under_lock(b"\xC0\x00")
+            if not ok:
+                self.ping_failures_total += 1
+                self._reconnect_event.set()
+
+    def _send_under_lock(self, pkt):
+        with self._send_lock:
+            sock = self.sock
+            if sock is None:
+                return False
+            try:
+                sock.sendall(pkt)
+                return True
+            except Exception as e:
+                log("MQTT socket send failed: {}".format(e))
+                return False
+
+    def _reconnect_under_lock(self):
+        with self._send_lock:
+            self._reconnect_socket_unlocked()
+
+    def _reconnect_socket_unlocked(self):
+        if LOGGER is not None:
+            emit_mqtt_reconnect(LOGGER)
+        else:
+            log("MQTT reconnecting …")
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        # Re-establish; connect() itself does not take _send_lock so it is
+        # safe to call from here.  Keep retrying until success or shutdown.
+        while not self._stop_event.is_set():
+            try:
+                self._do_connect_socket_only()
+                if self.on_reconnect is not None:
+                    try:
+                        self.on_reconnect()
+                    except Exception as e:
+                        log("on_reconnect callback error: {}".format(e))
+                return
+            except Exception as e:
+                log("MQTT reconnect failed: {} - retry in 15s".format(e))
+                # Use stop_event so shutdown wakes us promptly.
+                if self._stop_event.wait(15):
+                    return
+
+    def _do_connect_socket_only(self):
+        """Re-execute the TCP+CONNECT handshake without starting new workers
+        (we are *inside* the sender worker)."""
+        prev_flag = self.threading_enabled
+        self.threading_enabled = False
+        try:
+            self.connect()
+        finally:
+            self.threading_enabled = prev_flag
+
+    def shutdown(self, timeout=5.0):
+        self._stop_event.set()
+        try:
+            # nudge sender out of the blocking get()
+            self.send_queue.put_nowait(None)
+        except Exception:
+            pass
+        for t in (self._sender_thread, self._keepalive_thread):
+            if t is not None and t.is_alive():
+                try:
+                    t.join(timeout)
+                except Exception:
+                    pass
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
     def _flush_queue(self):
         while self._out_queue and self.sock:
             topic, payload, retain = self._out_queue[0]
@@ -1726,6 +1910,9 @@ class MQTTClient(object):
                 break
 
     def ping(self):
+        if self.threading_enabled:
+            # The keepalive worker owns PINGREQ in threaded mode.
+            return
         try:
             self.sock.sendall(b"\xC0\x00")
         except Exception as e:
@@ -1943,7 +2130,9 @@ def main():
     mqtt = MQTTClient(ha_host, ha_port, "cubej1_{}".format(device_id),
                       username=ha_user, password=ha_pass,
                       on_reconnect=diag_state.on_mqtt_reconnect,
-                      keepalive=cfg["mqtt_keepalive"])
+                      keepalive=cfg["mqtt_keepalive"],
+                      threading_enabled=cfg["mqtt_threading_enabled"],
+                      send_queue_maxsize=cfg["mqtt_send_queue_maxsize"])
     while True:
         try:
             mqtt.connect()
