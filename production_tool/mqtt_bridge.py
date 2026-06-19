@@ -368,6 +368,13 @@ pre { background: #f4f4f4; padding: .6rem; font-size: .8rem;
     <button type="submit">Save Wi-Fi</button>
   </form>
 </fieldset>
+<fieldset><legend>AP Mode (CubeJ-...)</legend>
+  <p class="notice">&#9888; CubeJ-* AP はデフォルトで 12345678 で公開されている。使わない間は OFF にしておいた方が安全。自宅 Wi-Fi 経由でいつでも戻せる.</p>
+  <p>state: <strong id="ap_state">...</strong>
+     <span id="ap_iface" style="font-family:monospace;font-size:.8rem;color:#888"></span></p>
+  <button id="ap_toggle" type="button" disabled>--</button>
+  <span id="ap_msg" style="font-size:.85rem;color:#888;margin-left:.6rem"></span>
+</fieldset>
 <fieldset><legend>Bridge Update</legend>
   <form id="update-form" enctype="multipart/form-data">
     <label><input type="file" name="update_file" accept=".py" required></label>
@@ -449,6 +456,51 @@ document.getElementById('btn-restart').addEventListener('click', function() {
     .then(function(){ showOk('Restart requested'); });
 });
 fetchConfig();
+
+// ---- AP toggle (spec 008) ----
+function apRender(state) {
+  var el = document.getElementById('ap_state');
+  var btn = document.getElementById('ap_toggle');
+  document.getElementById('ap_iface').textContent = state.interface || '';
+  if (state.enabled === true) {
+    el.textContent = 'ON'; el.style.color = '#186a3b';
+    btn.textContent = 'Turn OFF'; btn.disabled = false; btn.dataset.next = 'false';
+  } else if (state.enabled === false) {
+    el.textContent = 'OFF'; el.style.color = '#555';
+    btn.textContent = 'Turn ON'; btn.disabled = false; btn.dataset.next = 'true';
+  } else {
+    el.textContent = 'unknown'; el.style.color = '#b71c1c';
+    btn.textContent = '--'; btn.disabled = true;
+  }
+}
+function apRefresh() {
+  fetch('/api/ap_state', {cache:'no-store'})
+    .then(function(r){ return r.json(); })
+    .then(apRender)
+    .catch(function(){ document.getElementById('ap_msg').textContent = 'offline'; });
+}
+document.getElementById('ap_toggle').addEventListener('click', function() {
+  var btn = this, next = btn.dataset.next === 'true';
+  btn.disabled = true; btn.textContent = '...';
+  document.getElementById('ap_msg').textContent = 'applying...';
+  fetch('/api/ap_state', {
+    method: 'PUT',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: next})
+  })
+    .then(function(r){ return r.json().then(function(j){ return [r.status, j]; }); })
+    .then(function(pair){
+      if (pair[0] !== 200) throw new Error(pair[1].error || ('http '+pair[0]));
+      apRender(pair[1]);
+      document.getElementById('ap_msg').textContent = 'ok';
+    })
+    .catch(function(e){
+      document.getElementById('ap_msg').textContent = 'failed: ' + e.message;
+      setTimeout(apRefresh, 500);
+    });
+});
+apRefresh();
+setInterval(apRefresh, 10000);
 </script>
 </body>
 </html>"""
@@ -1322,28 +1374,10 @@ text-align:center;background:#222}
 .meta code{background:#222;padding:2px 6px;border-radius:4px;color:#bbb;
 word-break:break-all;display:inline-block;max-width:100%}
 .offline{color:#f55}
-.ap{margin-bottom:16px;padding:14px 16px;border-radius:10px;background:#222;
-display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-.ap .label{font-size:13px;color:#aaa}
-.ap .state{font-weight:700;padding:2px 10px;border-radius:6px;font-size:13px}
-.state.on{background:#0a5;color:#fff}
-.state.off{background:#555;color:#ddd}
-.state.unknown{background:#a40;color:#fff}
-.ap button{padding:8px 16px;border-radius:6px;border:0;cursor:pointer;
-font-size:13px;font-weight:600;background:#5af;color:#000}
-.ap button:disabled{opacity:.5;cursor:not-allowed}
-.ap .iface{color:#888;font-size:11px;font-family:monospace}
 </style>
 </head>
 <body>
 <h1>Wi-SUN Quality (real-time)</h1>
-<div class="ap">
-  <span class="label">AP mode (CubeJ-...):</span>
-  <span class="state unknown" id="ap_state">...</span>
-  <span class="iface" id="ap_iface"></span>
-  <button id="ap_toggle" disabled>--</button>
-  <span class="iface" id="ap_msg"></span>
-</div>
 <div class="row">
   <div class="stat" id="card_p50"><div class="label">p50 RTT</div>
     <div class="v"><span id="p50">--</span><span class="unit">ms</span></div></div>
@@ -1415,54 +1449,6 @@ async function tick(){
 }
 tick();
 setInterval(tick,1500);
-
-// ---- AP toggle (spec 008) ----
-function renderAp(state){
-  var el=document.getElementById('ap_state');
-  var btn=document.getElementById('ap_toggle');
-  var iface=document.getElementById('ap_iface');
-  iface.textContent=state.interface||'';
-  if(state.enabled===true){
-    el.textContent='ON';el.className='state on';
-    btn.textContent='Turn OFF';btn.disabled=false;btn.dataset.next='false';
-  }else if(state.enabled===false){
-    el.textContent='OFF';el.className='state off';
-    btn.textContent='Turn ON';btn.disabled=false;btn.dataset.next='true';
-  }else{
-    el.textContent='UNKNOWN';el.className='state unknown';
-    btn.textContent='--';btn.disabled=true;
-  }
-}
-async function refreshAp(){
-  try{
-    var r=await fetch('/api/ap_state',{cache:'no-store'});
-    renderAp(await r.json());
-    document.getElementById('ap_msg').textContent='';
-  }catch(e){
-    document.getElementById('ap_msg').textContent='offline';
-  }
-}
-document.getElementById('ap_toggle').addEventListener('click',async function(){
-  var btn=this;var next=btn.dataset.next==='true';
-  btn.disabled=true;btn.textContent='...';
-  document.getElementById('ap_msg').textContent='applying...';
-  try{
-    var r=await fetch('/api/ap_state',{method:'PUT',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({enabled:next})});
-    if(!r.ok){
-      var j=await r.json().catch(function(){return{};});
-      throw new Error(j.error||('http '+r.status));
-    }
-    renderAp(await r.json());
-    document.getElementById('ap_msg').textContent='ok';
-  }catch(e){
-    document.getElementById('ap_msg').textContent='failed: '+e.message;
-    setTimeout(refreshAp,500);
-  }
-});
-refreshAp();
-setInterval(refreshAp,5000);
 </script>
 </body>
 </html>
