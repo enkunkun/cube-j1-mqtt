@@ -1,0 +1,73 @@
+"""ProbeState: in-memory toggle + auto-expiry (spec 009)."""
+import pytest
+
+import mqtt_bridge as mb
+
+
+def test_default_state_inactive():
+    p = mb.ProbeState()
+    assert p.is_active(now=1000.0) is False
+    snap = p.snapshot(now=1000.0)
+    assert snap["active"] is False
+    assert "deadline_ts" in snap
+
+
+def test_start_makes_state_active():
+    p = mb.ProbeState()
+    p.start(interval_sec=5, duration_sec=300, now=1000.0)
+    assert p.is_active(now=1000.0) is True
+    assert p.interval_sec == 5
+    assert p.deadline_ts == 1300.0
+
+
+def test_active_until_deadline():
+    p = mb.ProbeState()
+    p.start(interval_sec=5, duration_sec=60, now=1000.0)
+    assert p.is_active(now=1059.0) is True
+    assert p.is_active(now=1060.0) is False
+    assert p.is_active(now=1100.0) is False
+
+
+def test_stop_disables_immediately():
+    p = mb.ProbeState()
+    p.start(interval_sec=5, duration_sec=600, now=1000.0)
+    assert p.is_active(now=1010.0) is True
+    p.stop()
+    assert p.is_active(now=1010.0) is False
+
+
+def test_snapshot_includes_remaining_seconds():
+    p = mb.ProbeState()
+    p.start(interval_sec=5, duration_sec=300, now=1000.0)
+    snap = p.snapshot(now=1100.0)
+    assert snap["active"] is True
+    assert snap["interval_sec"] == 5
+    assert snap["remaining_sec"] == 200
+    assert snap["deadline_ts"] == 1300.0
+
+
+def test_snapshot_when_inactive_has_zero_remaining():
+    p = mb.ProbeState()
+    snap = p.snapshot(now=1000.0)
+    assert snap["active"] is False
+    assert snap["remaining_sec"] == 0
+
+
+def test_start_rejects_zero_interval():
+    p = mb.ProbeState()
+    with pytest.raises(ValueError):
+        p.start(interval_sec=0, duration_sec=300, now=1000.0)
+
+
+def test_start_rejects_zero_duration():
+    p = mb.ProbeState()
+    with pytest.raises(ValueError):
+        p.start(interval_sec=5, duration_sec=0, now=1000.0)
+
+
+def test_start_overwrites_previous_settings():
+    p = mb.ProbeState()
+    p.start(interval_sec=5, duration_sec=60, now=1000.0)
+    p.start(interval_sec=2, duration_sec=120, now=1010.0)
+    assert p.interval_sec == 2
+    assert p.deadline_ts == 1130.0

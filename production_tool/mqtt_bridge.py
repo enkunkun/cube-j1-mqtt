@@ -130,6 +130,48 @@ def apply_defaults(cfg):
     return out
 
 
+# ---------------------------------------------------------------------------
+# ProbeState: high-frequency RTT sampling toggle (spec 009)
+# ---------------------------------------------------------------------------
+
+class ProbeState(object):
+    """In-memory probe-mode flag. Time-limited; auto-disables once the
+    `deadline_ts` is crossed. The main loop checks `is_active(now)` before
+    every cycle to decide which EPC list / interval to use."""
+
+    def __init__(self):
+        self.active = False
+        self.interval_sec = 0
+        self.deadline_ts = 0.0
+
+    def start(self, interval_sec, duration_sec, now):
+        if int(interval_sec) <= 0:
+            raise ValueError("interval_sec must be > 0")
+        if int(duration_sec) <= 0:
+            raise ValueError("duration_sec must be > 0")
+        self.active = True
+        self.interval_sec = int(interval_sec)
+        self.deadline_ts = float(now) + float(duration_sec)
+
+    def stop(self):
+        self.active = False
+        self.interval_sec = 0
+        self.deadline_ts = 0.0
+
+    def is_active(self, now):
+        return bool(self.active and now < self.deadline_ts)
+
+    def snapshot(self, now):
+        active = self.is_active(now)
+        remaining = max(0, int(self.deadline_ts - now)) if active else 0
+        return {
+            "active": active,
+            "interval_sec": self.interval_sec if active else 0,
+            "deadline_ts": self.deadline_ts,
+            "remaining_sec": remaining,
+        }
+
+
 def compute_next_poll_sleep(last_poll_start, now, poll_interval):
     """How long to sleep so the next poll begins `poll_interval` seconds after
     the *start* of the previous one (deadline-based pacing). Clamped to 0 so
@@ -682,6 +724,13 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 return
             self._send_json(200, state)
             return
+        if path == "/api/probe":
+            try:
+                ps = self.probe_state_provider()
+                self._send_json(200, ps.snapshot(time.time()))
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
         if path == "/api/wisun_quality":
             try:
                 ds = self.diag_state_provider()
@@ -768,6 +817,36 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
                 return
             self._send_json(200, state)
+            return
+        if path == "/api/probe":
+            body = self._read_json_body()
+            if body is None or not isinstance(body, dict) or "enabled" not in body:
+                self._send_json(400, {"error": "expected { enabled, interval_sec?, duration_sec? }"})
+                return
+            ps = self.probe_state_provider()
+            now = time.time()
+            if not body["enabled"]:
+                ps.stop()
+                # Keep the rolling latency window meaningful: on stop we
+                # leave the deque alone (post-probe samples will refill it).
+                self._send_json(200, ps.snapshot(now))
+                return
+            try:
+                interval = int(body.get("interval_sec", 5))
+                duration = int(body.get("duration_sec", 300))
+                ps.start(interval_sec=interval, duration_sec=duration, now=now)
+            except (ValueError, TypeError) as e:
+                self._send_json(400, {"error": str(e)})
+                return
+            # Clear the deque so the sparkline shows only probe samples
+            # from this run.
+            try:
+                ds = self.diag_state_provider()
+                if hasattr(ds, "erxudp_latency_ms_recent"):
+                    ds.erxudp_latency_ms_recent.clear()
+            except Exception as e:
+                log("probe deque clear failed: {}".format(e))
+            self._send_json(200, ps.snapshot(now))
             return
         self._send_json(404, {"error": "not found"})
 
@@ -989,7 +1068,8 @@ def start_admin_server(port, user, password, diag_state_provider,
                        bridge_path=ADMIN_BRIDGE_PATH,
                        wpa_supplicant_path=ADMIN_WPA_PATH,
                        log_path=ADMIN_LOG_PATH,
-                       ap_controller=None):
+                       ap_controller=None,
+                       probe_state_provider=None):
     """Construct and start an AdminServer with the given settings.
 
     Returns the running AdminServer.
@@ -1005,6 +1085,8 @@ def start_admin_server(port, user, password, diag_state_provider,
     AdminHandler.wpa_supplicant_path = wpa_supplicant_path
     AdminHandler.log_path = log_path
     AdminHandler.ap_controller = ap_controller or ApController()
+    AdminHandler.probe_state_provider = staticmethod(
+        probe_state_provider or (lambda: ProbeState()))
     AdminHandler.lock = threading.Lock()
 
     httpd = _ReusingHTTPServer(("", port), AdminHandler)
@@ -1378,6 +1460,26 @@ word-break:break-all;display:inline-block;max-width:100%}
 </head>
 <body>
 <h1>Wi-SUN Quality (real-time)</h1>
+<div class="sparkline" style="padding:14px 16px;display:flex;align-items:center;
+     gap:12px;flex-wrap:wrap;margin-bottom:16px">
+  <strong style="color:#aaa">Probe Mode:</strong>
+  <span id="probe_state" style="color:#888">--</span>
+  <select id="probe_interval" style="background:#222;color:#eee;border:1px solid #333;
+          border-radius:6px;padding:4px 8px">
+    <option value="2">2s</option><option value="3">3s</option>
+    <option value="5" selected>5s</option><option value="10">10s</option>
+  </select>
+  <select id="probe_duration" style="background:#222;color:#eee;border:1px solid #333;
+          border-radius:6px;padding:4px 8px">
+    <option value="60">1 min</option><option value="180">3 min</option>
+    <option value="300" selected>5 min</option><option value="600">10 min</option>
+  </select>
+  <button id="probe_start" style="background:#5af;border:0;border-radius:6px;
+          padding:6px 14px;cursor:pointer;font-weight:600">Start Probe</button>
+  <button id="probe_stop" style="background:#a40;color:#fff;border:0;border-radius:6px;
+          padding:6px 14px;cursor:pointer;font-weight:600" disabled>Stop</button>
+  <span id="probe_msg" style="color:#888;font-size:11px"></span>
+</div>
 <div class="row">
   <div class="stat" id="card_p50"><div class="label">p50 RTT</div>
     <div class="v"><span id="p50">--</span><span class="unit">ms</span></div></div>
@@ -1449,6 +1551,60 @@ async function tick(){
 }
 tick();
 setInterval(tick,1500);
+
+// ---- Probe mode (spec 009) ----
+async function probeRefresh(){
+  try{
+    var r=await fetch('/api/probe',{cache:'no-store'});
+    var j=await r.json();
+    var el=document.getElementById('probe_state');
+    var btnStart=document.getElementById('probe_start');
+    var btnStop=document.getElementById('probe_stop');
+    if(j.active){
+      el.textContent='ON ('+j.interval_sec+'s, '+j.remaining_sec+'s left)';
+      el.style.color='#0fc';
+      btnStart.disabled=true;btnStop.disabled=false;
+    }else{
+      el.textContent='OFF';el.style.color='#888';
+      btnStart.disabled=false;btnStop.disabled=true;
+    }
+  }catch(e){
+    document.getElementById('probe_msg').textContent='offline';
+  }
+}
+document.getElementById('probe_start').addEventListener('click',async function(){
+  var iv=parseInt(document.getElementById('probe_interval').value,10);
+  var du=parseInt(document.getElementById('probe_duration').value,10);
+  document.getElementById('probe_msg').textContent='starting...';
+  try{
+    var r=await fetch('/api/probe',{method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:true,interval_sec:iv,duration_sec:du})});
+    if(!r.ok){
+      var j=await r.json().catch(function(){return{};});
+      throw new Error(j.error||('http '+r.status));
+    }
+    document.getElementById('probe_msg').textContent='probe started';
+    probeRefresh();
+  }catch(e){
+    document.getElementById('probe_msg').textContent='failed: '+e.message;
+  }
+});
+document.getElementById('probe_stop').addEventListener('click',async function(){
+  document.getElementById('probe_msg').textContent='stopping...';
+  try{
+    var r=await fetch('/api/probe',{method:'PUT',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled:false})});
+    if(!r.ok)throw new Error('http '+r.status);
+    document.getElementById('probe_msg').textContent='stopped';
+    probeRefresh();
+  }catch(e){
+    document.getElementById('probe_msg').textContent='failed: '+e.message;
+  }
+});
+probeRefresh();
+setInterval(probeRefresh,2000);
 </script>
 </body>
 </html>
@@ -1826,8 +1982,7 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
     skcommand(fd, "SKRESET", timeout=5)
     time.sleep(1)
 
-    # Probe firmware identity for diagnostics (effect on ERXUDP format depends
-    # on the SKSTACK build — see spec 007/008).
+    # SKVER は起動時の identity log として残す (debug 用、 副作用なし)。
     try:
         ver = skcommand(fd, "SKVER", timeout=2)
         log("SKVER: {}".format(ver))
@@ -1842,26 +1997,6 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
 
     # Force ASCII-hex ERXUDP payload format so parser stays stable.
     skcommand(fd, "WOPT 1")
-    # Best-effort: ROHM BP35A1 系の拡張で、 ERXUDP の末尾に RSSI を 1 byte
-    # 追加する設定。 対応してない firmware では FAIL ER* を返すだけで害なし。
-    # token_count が 10 → 11 に増えたら本物の RSSI を載せられる。
-    try:
-        ropt_out = skcommand(fd, "ROPT 1", timeout=2)
-        log("ROPT 1: {}".format(ropt_out))
-    except Exception as e:
-        log("ROPT 1 not supported (this is expected on some firmwares): {}".format(e))
-
-    # Spec 008 follow-up: dump candidate registers to find any that carries
-    # a real signal-quality metric (RSSI/LQI). One-shot at startup; if a
-    # useful one is identified we'll wire periodic polling in a later commit.
-    for sreg in ("S02", "S03", "S07", "SA0", "SA1", "SA2", "SA9",
-                 "SD0", "SD1", "SD2", "SD3", "SD4", "SE0", "SE1",
-                 "SF0", "SFA", "SFB", "SFD", "SFE"):
-        try:
-            out = skcommand(fd, "SKSREG " + sreg, timeout=2)
-            log("SKSREG {}: {}".format(sreg, out))
-        except Exception as e:
-            log("SKSREG {} failed: {}".format(sreg, e))
 
     log("SKSCAN (may take up to 60s)")
     pan = skscan(fd, diag_state=diag_state)
@@ -1906,27 +2041,9 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
-                # `SKPING 1 <ipv6>` is the working form. Fire 3 pings spaced
-                # 2 s apart and drain the serial after each one for 4 s to
-                # identify which EVENT (if any) carries the ICMPv6 echo
-                # reply on this firmware.
-                for attempt in range(3):
-                    try:
-                        ping_cmd = "SKPING 1 {}".format(ipv6)
-                        t0 = time.time()
-                        out = skcommand(fd, ping_cmd, timeout=2)
-                        log("SKPING#{} send: {} (OK after {:.0f}ms)".format(
-                            attempt + 1, out, (time.time() - t0) * 1000))
-                        drain_deadline = time.time() + 4.0
-                        while time.time() < drain_deadline:
-                            ln = serial_readline(fd, timeout=0.5)
-                            if ln is None:
-                                continue
-                            log("SKPING#{} drain[+{:.0f}ms]: {!r}".format(
-                                attempt + 1, (time.time() - t0) * 1000, ln))
-                    except Exception as e:
-                        log("SKPING#{} failed: {}".format(attempt + 1, e))
-                    time.sleep(2)
+                # SKPING probing (spec 008 follow-up) は、 ICMPv6 echo を
+                # メーターが返さないこと、 SK 内部処理時間が 80ms 固定で
+                # 信号品質を反映しないことが実機で確認できたので除去。
                 return ipv6
             if "EVENT 24" in line:
                 if LOGGER is not None:
@@ -2039,13 +2156,24 @@ def apply_energy_scale(measurements, coeff, unit_kwh):
 # Send ECHONET Lite Get via SKSENDTO
 # ---------------------------------------------------------------------------
 
-def send_el_get(fd, ipv6, tid):
-    frame = build_el_get(tid, EPCS)
+def send_el_get(fd, ipv6, tid, epc_list=None):
+    """Send an ECHONET Get request to *ipv6*. Defaults to the full
+    measurement EPC set; pass `epc_list=[0x80]` for a lightweight probe
+    (spec 009)."""
+    epcs = EPCS if epc_list is None else list(epc_list)
+    frame = build_el_get(tid, epcs)
     # SKSENDTO expects 4-hex-digit payload length and trailing CRLF after raw data.
     cmd = "SKSENDTO 1 {} 0E1A 1 0 {:04X} ".format(ipv6, len(frame))
     serial_write(fd, cmd)
     serial_write(fd, frame)
     serial_write(fd, b"\r\n")
+
+
+# Lightweight EPC set used during probe mode. 0x80 (operation status) is
+# a static 1-byte property the meter returns from internal flags, so RTT
+# is closer to the pure Wi-SUN round-trip than 0xE7 (instant power, which
+# requires the meter to take a fresh measurement).
+PROBE_EPCS = [0x80]
 
 def read_erxudp(fd, timeout=15, diag_state=None):
     """Wait for ERXUDP and return payload as bytearray, or None.
@@ -2632,6 +2760,9 @@ def main():
     # Diagnostics aggregator declared early so the admin UI can read it.
     diag_state = DiagState(start_time=time.time(), version=bridge_version())
 
+    # spec 009: high-frequency RTT probe mode. In-memory; resets at restart.
+    probe_state = ProbeState()
+
     # Embedded admin UI (Constitution VI). Off by default; opted in via
     # config. Failure to start is logged but never aborts the bridge.
     if cfg.get("admin_ui_enabled") and cfg.get("admin_user") and cfg.get("admin_password"):
@@ -2642,6 +2773,7 @@ def main():
                 password=cfg["admin_password"],
                 diag_state_provider=lambda: diag_state,
                 ap_controller=ApController(),
+                probe_state_provider=lambda: probe_state,
             )
             LOGGER.info(event="admin_ui_started",
                         context={"port": int(cfg.get("admin_ui_port", 8080))})
@@ -2698,10 +2830,16 @@ def main():
     while True:
         try:
             last_poll_start = time.time()
+            # spec 009: probe mode swaps the EPC list (light 0x80 only)
+            # and tightens the inter-cycle interval. Auto-expires at the
+            # deadline_ts set by /api/probe.
+            probing = probe_state.is_active(last_poll_start)
+            cycle_epcs = PROBE_EPCS if probing else None
+            cycle_interval = probe_state.interval_sec if probing else poll_interval
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
-                send_el_get(fd, ipv6, tid)
+                send_el_get(fd, ipv6, tid, epc_list=cycle_epcs)
                 tid = (tid + 1) & 0xFFFF
                 t_send = time.time()
                 data = read_erxudp(fd, timeout=15, diag_state=diag_state)
@@ -2718,7 +2856,11 @@ def main():
                         coeff = m["coefficient"]
                     if "unit_kwh" in m:
                         unit_kwh = m["unit_kwh"]
-                    publish_measurements(mqtt, device_id, m)
+                    if not probing:
+                        # 0x80-only probe responses don't carry power values;
+                        # skip the measurement publish so HA doesn't see stale
+                        # zeros.
+                        publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)
                     try:
                         diag_state.on_poll_success(now)
@@ -2755,10 +2897,11 @@ def main():
                 mqtt.ping()
                 last_ping = time.time()
 
-            # Deadline-based pacing: keep ~poll_interval between *poll starts*
+            # Deadline-based pacing: keep ~cycle_interval between *poll starts*
             # rather than between cycle ends, so ERXUDP timeouts don't push
-            # the next measurement out by (timeout + poll_interval).
-            time.sleep(compute_next_poll_sleep(last_poll_start, time.time(), poll_interval))
+            # the next measurement out by (timeout + interval). In probe mode
+            # cycle_interval is the tight probe interval (e.g. 5 s).
+            time.sleep(compute_next_poll_sleep(last_poll_start, time.time(), cycle_interval))
 
         except Exception as e:
             log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
