@@ -1906,24 +1906,27 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
-                # `SKPING 1 <ipv6>` was the form that returned OK on this
-                # firmware. Send one and drain the serial for ~3 s so we
-                # can see what EVENT (if any) carries the echo reply.
-                try:
-                    ping_cmd = "SKPING 1 {}".format(ipv6)
-                    t0 = time.time()
-                    out = skcommand(fd, ping_cmd, timeout=2)
-                    log("SKPING send: {} (OK after {:.0f}ms)".format(
-                        out, (time.time() - t0) * 1000))
-                    drain_deadline = time.time() + 3.0
-                    while time.time() < drain_deadline:
-                        ln = serial_readline(fd, timeout=0.5)
-                        if ln is None:
-                            continue
-                        log("SKPING drain[+{:.0f}ms]: {!r}".format(
-                            (time.time() - t0) * 1000, ln))
-                except Exception as e:
-                    log("SKPING send failed: {}".format(e))
+                # `SKPING 1 <ipv6>` is the working form. Fire 3 pings spaced
+                # 2 s apart and drain the serial after each one for 4 s to
+                # identify which EVENT (if any) carries the ICMPv6 echo
+                # reply on this firmware.
+                for attempt in range(3):
+                    try:
+                        ping_cmd = "SKPING 1 {}".format(ipv6)
+                        t0 = time.time()
+                        out = skcommand(fd, ping_cmd, timeout=2)
+                        log("SKPING#{} send: {} (OK after {:.0f}ms)".format(
+                            attempt + 1, out, (time.time() - t0) * 1000))
+                        drain_deadline = time.time() + 4.0
+                        while time.time() < drain_deadline:
+                            ln = serial_readline(fd, timeout=0.5)
+                            if ln is None:
+                                continue
+                            log("SKPING#{} drain[+{:.0f}ms]: {!r}".format(
+                                attempt + 1, (time.time() - t0) * 1000, ln))
+                    except Exception as e:
+                        log("SKPING#{} failed: {}".format(attempt + 1, e))
+                    time.sleep(2)
                 return ipv6
             if "EVENT 24" in line:
                 if LOGGER is not None:
