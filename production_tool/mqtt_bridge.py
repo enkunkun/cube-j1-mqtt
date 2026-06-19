@@ -1851,6 +1851,18 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
     except Exception as e:
         log("ROPT 1 not supported (this is expected on some firmwares): {}".format(e))
 
+    # Spec 008 follow-up: dump candidate registers to find any that carries
+    # a real signal-quality metric (RSSI/LQI). One-shot at startup; if a
+    # useful one is identified we'll wire periodic polling in a later commit.
+    for sreg in ("S02", "S03", "S07", "SA0", "SA1", "SA2", "SA9",
+                 "SD0", "SD1", "SD2", "SD3", "SD4", "SE0", "SE1",
+                 "SF0", "SFA", "SFB", "SFD", "SFE"):
+        try:
+            out = skcommand(fd, "SKSREG " + sreg, timeout=2)
+            log("SKSREG {}: {}".format(sreg, out))
+        except Exception as e:
+            log("SKSREG {} failed: {}".format(sreg, e))
+
     log("SKSCAN (may take up to 60s)")
     pan = skscan(fd, diag_state=diag_state)
     if not pan.get("Channel") or not pan.get("Pan ID") or not pan.get("Addr"):
