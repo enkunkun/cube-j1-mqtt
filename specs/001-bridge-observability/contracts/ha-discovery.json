@@ -1,0 +1,253 @@
+{
+  "_comment": "Home Assistant Auto-Discovery payloads. device_id = cubej1 を例示。実装時は device_id を config から取る。",
+  "_topic_prefix": "homeassistant/sensor/cubej1/",
+  "measurements": [
+    {
+      "_topic": "homeassistant/sensor/cubej1/power/config",
+      "payload": {
+        "name": "Instantaneous Power",
+        "unique_id": "cubej1_power",
+        "state_topic": "cubej/cubej1/power",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/energy_forward/config",
+      "payload": {
+        "name": "Cumulative Energy Fwd",
+        "unique_id": "cubej1_energy_forward",
+        "state_topic": "cubej/cubej1/energy_forward",
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/energy_reverse/config",
+      "payload": {
+        "name": "Cumulative Energy Rev",
+        "unique_id": "cubej1_energy_reverse",
+        "state_topic": "cubej/cubej1/energy_reverse",
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/current_r/config",
+      "payload": {
+        "name": "Current R Phase",
+        "unique_id": "cubej1_current_r",
+        "state_topic": "cubej/cubej1/current_r",
+        "unit_of_measurement": "A",
+        "device_class": "current",
+        "state_class": "measurement",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/current_t/config",
+      "payload": {
+        "name": "Current T Phase",
+        "unique_id": "cubej1_current_t",
+        "state_topic": "cubej/cubej1/current_t",
+        "unit_of_measurement": "A",
+        "device_class": "current",
+        "state_class": "measurement",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "_topic": "homeassistant/sensor/cubej1/last_poll_success_ts/config",
+      "payload": {
+        "name": "Last Poll Success",
+        "unique_id": "cubej1_last_poll_success_ts",
+        "state_topic": "cubej/cubej1/diag/last_poll_success_ts",
+        "device_class": "timestamp",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/last_poll_failure_ts/config",
+      "payload": {
+        "name": "Last Poll Failure",
+        "unique_id": "cubej1_last_poll_failure_ts",
+        "state_topic": "cubej/cubej1/diag/last_poll_failure_ts",
+        "device_class": "timestamp",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/lqi/config",
+      "payload": {
+        "name": "LQI",
+        "unique_id": "cubej1_lqi",
+        "state_topic": "cubej/cubej1/diag/lqi",
+        "state_class": "measurement",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/pan_channel/config",
+      "payload": {
+        "name": "PAN Channel",
+        "unique_id": "cubej1_pan_channel",
+        "state_topic": "cubej/cubej1/diag/pan_channel",
+        "state_class": "measurement",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/scan_retries_total/config",
+      "payload": {
+        "name": "Scan Retries",
+        "unique_id": "cubej1_scan_retries_total",
+        "state_topic": "cubej/cubej1/diag/scan_retries_total",
+        "state_class": "total_increasing",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/wisun_reconnects_total/config",
+      "payload": {
+        "name": "Wi-SUN Reconnects",
+        "unique_id": "cubej1_wisun_reconnects_total",
+        "state_topic": "cubej/cubej1/diag/wisun_reconnects_total",
+        "state_class": "total_increasing",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/mqtt_reconnects_total/config",
+      "payload": {
+        "name": "MQTT Reconnects",
+        "unique_id": "cubej1_mqtt_reconnects_total",
+        "state_topic": "cubej/cubej1/diag/mqtt_reconnects_total",
+        "state_class": "total_increasing",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/erxudp_timeouts_total/config",
+      "payload": {
+        "name": "ERXUDP Timeouts",
+        "unique_id": "cubej1_erxudp_timeouts_total",
+        "state_topic": "cubej/cubej1/diag/erxudp_timeouts_total",
+        "state_class": "total_increasing",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/uptime_seconds/config",
+      "payload": {
+        "name": "Uptime",
+        "unique_id": "cubej1_uptime_seconds",
+        "state_topic": "cubej/cubej1/diag/uptime_seconds",
+        "unit_of_measurement": "s",
+        "state_class": "measurement",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    },
+    {
+      "_topic": "homeassistant/sensor/cubej1/version/config",
+      "payload": {
+        "name": "Bridge Version",
+        "unique_id": "cubej1_version",
+        "state_topic": "cubej/cubej1/diag/version",
+        "entity_category": "diagnostic",
+        "device": {
+          "identifiers": ["cubej1"],
+          "name": "Cube J1 Smart Meter",
+          "model": "Cube J1",
+          "manufacturer": "NextDrive"
+        }
+      }
+    }
+  ]
+}
