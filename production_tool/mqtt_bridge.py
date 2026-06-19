@@ -353,7 +353,7 @@ pre { background: #f4f4f4; padding: .6rem; font-size: .8rem;
 </style>
 </head>
 <body>
-<h1>Cube J1 Admin</h1>
+<h1>Cube J1 Admin <a href="/wisun" style="font-size:14px;font-weight:normal;color:#5af">[ Wi-SUN Quality (real-time) ]</a></h1>
 <div id="status"></div>
 <fieldset><legend>Config</legend>
   <form id="config-form"></form>
@@ -616,6 +616,36 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 "raw": line,
                 "token_count": len(tokens),
                 "tokens": tokens,
+            })
+            return
+        if path == "/wisun":
+            self._send_text(200, WISUN_HTML,
+                            content_type="text/html; charset=utf-8")
+            return
+        if path == "/api/wisun_quality":
+            try:
+                ds = self.diag_state_provider()
+                samples = [float(v) for v in ds.erxudp_latency_ms_recent]
+                snap = ds.snapshot(time.time()) if hasattr(ds, "snapshot") else {}
+                last_raw = getattr(ds, "last_erxudp_raw_line", None)
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+                return
+            if samples:
+                ordered = sorted(samples)
+                p50 = round(_percentile(ordered, 50), 2)
+                p95 = round(_percentile(ordered, 95), 2)
+                mx = round(ordered[-1], 2)
+            else:
+                p50 = p95 = mx = None
+            self._send_json(200, {
+                "samples": samples,
+                "sample_count": len(samples),
+                "p50_ms": p50,
+                "p95_ms": p95,
+                "max_ms": mx,
+                "uptime_seconds": snap.get("uptime_seconds") if isinstance(snap, dict) else None,
+                "last_erxudp_raw": last_raw,
             })
             return
         self._send_json(404, {"error": "not found"})
@@ -1133,6 +1163,137 @@ def _percentile(sorted_samples, pct):
     hi = min(lo + 1, len(sorted_samples) - 1)
     frac = k - lo
     return sorted_samples[lo] + (sorted_samples[hi] - sorted_samples[lo]) * frac
+
+
+def render_sparkline(samples, width, height):
+    """Return an SVG path string sketching *samples* over a (width, height)
+    box. Min sample sits near y=height (bottom), max near y=0 (top). Returns
+    "" for empty input. For 1 sample returns 'M w/2 h/2' (a centered dot).
+
+    Used by the /wisun real-time quality page (spec 007)."""
+    if not samples:
+        return ""
+    if len(samples) == 1:
+        return "M {:.1f} {:.1f}".format(width / 2.0, height / 2.0)
+    lo = min(samples)
+    hi = max(samples)
+    rng = hi - lo if hi > lo else 1.0
+    n = len(samples)
+    step = width / float(n - 1)
+    parts = []
+    for i, v in enumerate(samples):
+        x = i * step
+        y = height - (v - lo) / rng * height
+        cmd = "M" if i == 0 else "L"
+        parts.append("{} {:.1f} {:.1f}".format(cmd, x, y))
+    return " ".join(parts)
+
+
+# spec 007: real-time Wi-SUN quality page. Lives on the admin UI so the
+# existing Basic Auth covers it. Vanilla JS only — Constitution II forbids
+# external assets.
+WISUN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wi-SUN Quality</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,sans-serif;
+background:#111;color:#eee;padding:16px}
+h1{font-size:18px;margin:0 0 12px;color:#aaa}
+.row{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.stat{flex:1;min-width:140px;padding:16px;border-radius:10px;
+text-align:center;background:#222}
+.stat .label{font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px}
+.stat .v{font-size:48px;font-weight:700;line-height:1.1;margin-top:4px}
+.stat .unit{font-size:14px;color:#888;margin-left:4px}
+.bg-ok{background:#0a5}.bg-warn{background:#a80}
+.bg-bad{background:#a40}.bg-crit{background:#902}
+.bg-na{background:#333}
+.sparkline{background:#181818;border-radius:10px;padding:10px;margin-bottom:16px}
+.meta{font-size:12px;color:#888}
+.meta code{background:#222;padding:2px 6px;border-radius:4px;color:#bbb;
+word-break:break-all;display:inline-block;max-width:100%}
+.offline{color:#f55}
+</style>
+</head>
+<body>
+<h1>Wi-SUN Quality (real-time)</h1>
+<div class="row">
+  <div class="stat" id="card_p50"><div class="label">p50 RTT</div>
+    <div class="v"><span id="p50">--</span><span class="unit">ms</span></div></div>
+  <div class="stat" id="card_p95"><div class="label">p95 RTT</div>
+    <div class="v"><span id="p95">--</span><span class="unit">ms</span></div></div>
+  <div class="stat" id="card_max"><div class="label">max RTT</div>
+    <div class="v"><span id="vmax">--</span><span class="unit">ms</span></div></div>
+</div>
+<div class="sparkline">
+  <svg id="spark" width="100%" height="80" viewBox="0 0 600 80"
+       preserveAspectRatio="none">
+    <path d="" stroke="#5af" stroke-width="2" fill="none" id="path"/>
+  </svg>
+</div>
+<div class="meta">
+  samples: <span id="n">0</span> /
+  uptime: <span id="up">--</span>s /
+  status: <span id="status">loading...</span><br><br>
+  last raw ERXUDP: <code id="raw">--</code>
+</div>
+<script>
+function cls(v){
+  if(v===null||v===undefined)return 'bg-na';
+  if(v<200)return 'bg-ok';
+  if(v<500)return 'bg-warn';
+  if(v<1000)return 'bg-bad';
+  return 'bg-crit';
+}
+function fmt(v){return v===null||v===undefined?'--':Math.round(v);}
+function spark(samples){
+  if(!samples.length)return '';
+  if(samples.length===1)return 'M 300 40';
+  var lo=Math.min.apply(null,samples), hi=Math.max.apply(null,samples);
+  var rng=hi>lo?hi-lo:1;
+  var step=600/(samples.length-1);
+  var d='';
+  for(var i=0;i<samples.length;i++){
+    var x=i*step;
+    var y=80-(samples[i]-lo)/rng*80;
+    d+=(i?' L ':'M ')+x.toFixed(1)+' '+y.toFixed(1);
+  }
+  return d;
+}
+function setCard(id,v){
+  var card=document.getElementById('card_'+id);
+  card.className='stat '+cls(v);
+}
+async function tick(){
+  try{
+    var r=await fetch('/api/wisun_quality',{cache:'no-store'});
+    if(!r.ok)throw new Error('http '+r.status);
+    var j=await r.json();
+    document.getElementById('p50').textContent=fmt(j.p50_ms);
+    document.getElementById('p95').textContent=fmt(j.p95_ms);
+    document.getElementById('vmax').textContent=fmt(j.max_ms);
+    setCard('p50',j.p50_ms);
+    setCard('p95',j.p95_ms);
+    setCard('max',j.max_ms);
+    document.getElementById('n').textContent=j.sample_count;
+    document.getElementById('up').textContent=j.uptime_seconds;
+    document.getElementById('raw').textContent=j.last_erxudp_raw||'--';
+    document.getElementById('status').textContent='ok';
+    document.getElementById('status').className='';
+    document.getElementById('path').setAttribute('d',spark(j.samples));
+  }catch(e){
+    document.getElementById('status').textContent='offline ('+e.message+')';
+    document.getElementById('status').className='offline';
+  }
+}
+tick();
+setInterval(tick,1500);
+</script>
+</body>
+</html>
+"""
 
 
 def classify_sk_line(line):

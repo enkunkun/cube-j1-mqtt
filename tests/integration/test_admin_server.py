@@ -63,6 +63,9 @@ def _basic(user, password):
 
 
 class _FakeDiag(object):
+    def __init__(self, latency_samples=None):
+        self.erxudp_latency_ms_recent = list(latency_samples or [])
+
     def snapshot(self, now):
         return {
             "uptime_seconds": 42,
@@ -242,6 +245,100 @@ def test_get_diag_returns_snapshot(admin_server, admin_creds):
     body = r.json()
     assert body["uptime_seconds"] == 42
     assert body["version"] == "1.0.0+test"
+
+
+# ---------------------------------------------------------------------------
+# GET /wisun page + /api/wisun_quality (spec 007)
+# ---------------------------------------------------------------------------
+
+def test_get_wisun_returns_html(admin_server, admin_creds):
+    base, _ = admin_server
+    r = requests.get(
+        base + "/wisun",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+        timeout=2,
+    )
+    assert r.status_code == 200
+    assert r.headers["Content-Type"].startswith("text/html")
+    assert "Wi-SUN Quality" in r.text
+
+
+def test_api_wisun_quality_returns_samples_and_percentiles(config_dir, admin_creds):
+    """Inject a fake diag with known samples and verify percentile shape."""
+    port = _free_port()
+    fake = _FakeDiag(latency_samples=[
+        10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0,
+    ])
+    server = mb.start_admin_server(
+        port=port,
+        user=admin_creds["user"],
+        password=admin_creds["password"],
+        diag_state_provider=lambda: fake,
+        config_path=str(config_dir / "config.json"),
+        bridge_path=str(config_dir / "mqtt_bridge.py"),
+        wpa_supplicant_path=str(config_dir / "wpa_supplicant.conf"),
+        log_path=str(config_dir / "bridge.log"),
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                break
+        except OSError:
+            time.sleep(0.02)
+    try:
+        r = requests.get(
+            "http://127.0.0.1:{}/api/wisun_quality".format(port),
+            headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+            timeout=2,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["sample_count"] == 10
+        assert body["samples"] == [10.0, 20.0, 30.0, 40.0, 50.0,
+                                   60.0, 70.0, 80.0, 90.0, 100.0]
+        assert 45 <= body["p50_ms"] <= 65
+        assert 85 <= body["p95_ms"] <= 100
+        assert body["max_ms"] == 100.0
+    finally:
+        server.stop()
+
+
+def test_api_wisun_quality_empty(config_dir, admin_creds):
+    port = _free_port()
+    fake = _FakeDiag(latency_samples=[])
+    server = mb.start_admin_server(
+        port=port,
+        user=admin_creds["user"],
+        password=admin_creds["password"],
+        diag_state_provider=lambda: fake,
+        config_path=str(config_dir / "config.json"),
+        bridge_path=str(config_dir / "mqtt_bridge.py"),
+        wpa_supplicant_path=str(config_dir / "wpa_supplicant.conf"),
+        log_path=str(config_dir / "bridge.log"),
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                break
+        except OSError:
+            time.sleep(0.02)
+    try:
+        r = requests.get(
+            "http://127.0.0.1:{}/api/wisun_quality".format(port),
+            headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+            timeout=2,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["sample_count"] == 0
+        assert body["samples"] == []
+        assert body["p50_ms"] is None
+        assert body["p95_ms"] is None
+        assert body["max_ms"] is None
+    finally:
+        server.stop()
 
 
 # ---------------------------------------------------------------------------
