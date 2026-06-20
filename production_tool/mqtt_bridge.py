@@ -2063,9 +2063,36 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
-                # SKPING probing (spec 008 follow-up) は、 ICMPv6 echo を
-                # メーターが返さないこと、 SK 内部処理時間が 80ms 固定で
-                # 信号品質を反映しないことが実機で確認できたので除去。
+                # BP35CX undocumented command sweep — one-shot at startup
+                # to surface any MAC-stat/RSSI hooks ROHM didn't document.
+                # Safe commands only (no SAVE/ERASE/DEBUG). Each is sent and
+                # the serial drained for 1.5 s so multi-line responses are
+                # captured intact.
+                for sk in (
+                    "SKHELP", "SKAPPVER", "SKVERS",
+                    "SKDETAIL", "SKSTAT", "SKMACINFO", "SKLINK", "SKDUMP",
+                    "SKINFO",
+                    "WSCAN", "WENERGY", "WLINK",
+                    "AT",
+                    "SKLN64 {}".format(ipv6),
+                    "SKADDNBR",
+                    # IEEE 802.15.4 mode 3 = energy detection scan. Channel
+                    # mask=ffffffff (all), duration=4 (short). If supported,
+                    # returns per-channel energy readings → 920MHz floor.
+                    "SKSCAN 3 FFFFFFFF 4",
+                ):
+                    try:
+                        serial_write(fd, sk + "\r\n")
+                        end = time.time() + 1.5
+                        chunk = []
+                        while time.time() < end:
+                            ln = serial_readline(fd, timeout=0.3)
+                            if ln is None:
+                                continue
+                            chunk.append(ln)
+                        log("SKPROBE [{}] -> {}".format(sk, chunk))
+                    except Exception as e:
+                        log("SKPROBE [{}] err: {}".format(sk, e))
                 return ipv6
             if "EVENT 24" in line:
                 if LOGGER is not None:
