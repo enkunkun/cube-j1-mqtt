@@ -137,6 +137,14 @@ def apply_defaults(cfg):
     out.setdefault("erxudp_timeout_sec", 30)
     out.setdefault("erxudp_intra_cycle_retries", 2)
     out.setdefault("erxudp_retry_backoff_sec", 2)
+    # spec 013: poll_interval default 60s + ARIB STD-T108 floor 30s.
+    # Faster polling risks exceeding the 360s/hour duty cycle once
+    # retries/reconnects are factored in.
+    out.setdefault("poll_interval", 60)
+    if int(out["poll_interval"]) < MIN_POLL_INTERVAL_SEC:
+        log("WARN: poll_interval={} below floor, clamping to {}".format(
+            out["poll_interval"], MIN_POLL_INTERVAL_SEC))
+        out["poll_interval"] = MIN_POLL_INTERVAL_SEC
     return out
 
 
@@ -379,8 +387,13 @@ class AtomicWriter(object):
 
 _VALID_LOG_LEVELS = ("debug", "info", "warn", "error")
 
+# spec 013: ARIB STD-T108 920MHz duty cycle (360s/hour) safety floor.
+# Polling faster than 30s risks exceeding the transmit-time limit once
+# retries/reconnects are factored in.
+MIN_POLL_INTERVAL_SEC = 30
+
 _POSITIVE_INT_KEYS = (
-    "mqtt_port", "poll_interval", "log_max_bytes", "log_backup_count",
+    "mqtt_port", "log_max_bytes", "log_backup_count",
     "admin_ui_port",
 )
 
@@ -396,6 +409,12 @@ def validate_config_patch(patch, current):
         if key in _POSITIVE_INT_KEYS:
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 return None, "{} must be a positive integer".format(key)
+        elif key == "poll_interval":
+            if (not isinstance(value, int) or isinstance(value, bool)
+                    or value < MIN_POLL_INTERVAL_SEC):
+                return None, ("poll_interval must be an integer >= {} seconds "
+                              "(ARIB STD-T108 920MHz duty cycle)"
+                              .format(MIN_POLL_INTERVAL_SEC))
         elif key == "log_level":
             if value not in _VALID_LOG_LEVELS:
                 return None, ("log_level must be one of {}"
