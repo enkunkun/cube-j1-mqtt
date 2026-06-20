@@ -127,6 +127,11 @@ def apply_defaults(cfg):
     # 切り戻し用の fallback として False で従来パスに戻せる。
     out.setdefault("mqtt_threading_enabled", True)
     out.setdefault("mqtt_send_queue_maxsize", 1000)
+    # spec 010: periodic EEDSCAN to track 920MHz noise floor. 5 min default
+    # is a balance between visibility and meter-poll interference (~12s
+    # sweep stops meter traffic for that cycle).
+    out.setdefault("eedscan_enabled", True)
+    out.setdefault("eedscan_interval_sec", 300)
     return out
 
 
@@ -170,6 +175,79 @@ class ProbeState(object):
             "deadline_ts": self.deadline_ts,
             "remaining_sec": remaining,
         }
+
+
+# ---------------------------------------------------------------------------
+# EEDSCAN: 920MHz Energy Detection Scan (spec 010)
+# ---------------------------------------------------------------------------
+
+def parse_eedscan(payload):
+    """Parse the EEDSCAN data line `0 <ch> <energy> <ch> <energy> ...` into a
+    `{channel: energy}` dict. Both channel and energy are 1-byte hex. The
+    leading 0 is a status byte; the first hex token is treated as that
+    status and skipped. A trailing dangling channel token (no paired
+    energy) is dropped. Non-hex garbage tokens are skipped silently."""
+    if not payload:
+        return {}
+    tokens = payload.split()
+    out = {}
+    i = 0
+    seen_status = False
+    while i < len(tokens):
+        t = tokens[i]
+        try:
+            int(t, 16)
+        except ValueError:
+            i += 1
+            continue
+        if not seen_status:
+            seen_status = True
+            i += 1
+            continue
+        if i + 1 >= len(tokens):
+            break
+        try:
+            ch = int(t, 16)
+            energy = int(tokens[i + 1], 16)
+            out[ch] = energy
+            i += 2
+        except ValueError:
+            i += 1
+    return out
+
+
+class EedScanState(object):
+    """Last EEDSCAN result + a short rolling history. The main loop polls
+    `should_run(now)` to decide when to fire another sweep; the diag
+    publisher reads `snapshot()` to emit 920MHz noise-floor metrics."""
+
+    HISTORY_MAX = 100
+
+    def __init__(self, interval_sec=300):
+        self.interval_sec = int(interval_sec)
+        self.last_run_ts = 0.0
+        self.last_result = {}
+        self.recent = collections.deque(maxlen=self.HISTORY_MAX)
+
+    def should_run(self, now):
+        return (now - self.last_run_ts) >= self.interval_sec
+
+    def record(self, result, ts):
+        self.last_run_ts = float(ts)
+        self.last_result = dict(result)
+        self.recent.append((float(ts), dict(result)))
+
+    def snapshot(self, pan_channel=None):
+        if not self.last_result:
+            return {}
+        energies = list(self.last_result.values())
+        out = {
+            "eedscan_max_energy": max(energies),
+            "eedscan_min_energy": min(energies),
+        }
+        if pan_channel is not None and pan_channel in self.last_result:
+            out["eedscan_pan_channel_energy"] = self.last_result[pan_channel]
+        return out
 
 
 def decide_cycle_kind(probe_active, last_normal_start, now, poll_interval):
@@ -2063,36 +2141,9 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
-                # BP35CX undocumented command sweep — one-shot at startup
-                # to surface any MAC-stat/RSSI hooks ROHM didn't document.
-                # Safe commands only (no SAVE/ERASE/DEBUG). Each is sent and
-                # the serial drained for 1.5 s so multi-line responses are
-                # captured intact.
-                for sk in (
-                    "SKHELP", "SKAPPVER", "SKVERS",
-                    "SKDETAIL", "SKSTAT", "SKMACINFO", "SKLINK", "SKDUMP",
-                    "SKINFO",
-                    "WSCAN", "WENERGY", "WLINK",
-                    "AT",
-                    "SKLN64 {}".format(ipv6),
-                    "SKADDNBR",
-                    # IEEE 802.15.4 mode 3 = energy detection scan. Channel
-                    # mask=ffffffff (all), duration=4 (short). If supported,
-                    # returns per-channel energy readings → 920MHz floor.
-                    "SKSCAN 3 FFFFFFFF 4",
-                ):
-                    try:
-                        serial_write(fd, sk + "\r\n")
-                        end = time.time() + 1.5
-                        chunk = []
-                        while time.time() < end:
-                            ln = serial_readline(fd, timeout=0.3)
-                            if ln is None:
-                                continue
-                            chunk.append(ln)
-                        log("SKPROBE [{}] -> {}".format(sk, chunk))
-                    except Exception as e:
-                        log("SKPROBE [{}] err: {}".format(sk, e))
+                # spec 010 で undocumented `SKSCAN 0 ... 0` (SIDE arg) が
+                # EEDSCAN を返すと確定したので、 起動時 sweep は外し、
+                # main loop で eedscan_state による定期実行に統一。
                 return ipv6
             if "EVENT 24" in line:
                 if LOGGER is not None:
@@ -2216,6 +2267,53 @@ def send_el_get(fd, ipv6, tid, epc_list=None):
     serial_write(fd, cmd)
     serial_write(fd, frame)
     serial_write(fd, b"\r\n")
+
+
+def _run_eedscan_sweep(fd, eedscan_state, diag_state):
+    """Fire one EEDSCAN (SKSCAN mode 0) sweep and parse the EEDSCAN line.
+
+    `SKSCAN 0 0FFFFFFF 4 0` covers BP35CX channels 33-60 (ch33 = bit 0 of
+    `0FFFFFFF`). Duration code 4 → ~12 s end-to-end. Records the result
+    onto *eedscan_state* on success."""
+    serial_write(fd, "SKSCAN 0 0FFFFFFF 4 0\r\n")
+    deadline = time.time() + 30.0
+    saw_ok = False
+    payload = None
+    while time.time() < deadline:
+        line = serial_readline(fd, timeout=2)
+        if line is None:
+            continue
+        # EVENT/FAIL go to the existing health counters where applicable.
+        kind = classify_sk_line(line)
+        if kind is not None and diag_state is not None:
+            try:
+                if kind[0] == "event":
+                    diag_state.on_sk_event(kind[1])
+                elif kind[0] == "error":
+                    diag_state.on_sk_error(kind[1])
+            except Exception:
+                pass
+        if line.startswith("OK"):
+            saw_ok = True
+            continue
+        if line.startswith("FAIL"):
+            log("EEDSCAN rejected: {}".format(line))
+            return
+        if line.startswith("EEDSCAN"):
+            # The data line follows; next readline holds the pairs.
+            next_line = serial_readline(fd, timeout=2)
+            payload = (next_line or "").strip()
+            break
+    if not saw_ok or payload is None:
+        log("EEDSCAN: no data line received")
+        return
+    result = parse_eedscan(payload)
+    if not result:
+        log("EEDSCAN: parse returned empty for {!r}".format(payload))
+        return
+    eedscan_state.record(result, time.time())
+    log("EEDSCAN OK: {} channels, max={:02X} min={:02X}".format(
+        len(result), max(result.values()), min(result.values())))
 
 
 # Lightweight EPC set used during probe mode. 0x80 (operation status) is
@@ -2700,6 +2798,10 @@ DIAG_SENSOR_DEFS = [
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
+    # Spec 010: EEDSCAN 920MHz noise floor.
+    ("eedscan_pan_channel_energy", "EEDSCAN energy (PAN ch)", None, None, "measurement", "diagnostic"),
+    ("eedscan_max_energy",     "EEDSCAN max energy",          None, None, "measurement", "diagnostic"),
+    ("eedscan_min_energy",     "EEDSCAN min energy",          None, None, "measurement", "diagnostic"),
 ]
 
 
@@ -2811,6 +2913,10 @@ def main():
 
     # spec 009: high-frequency RTT probe mode. In-memory; resets at restart.
     probe_state = ProbeState()
+
+    # spec 010: periodic EEDSCAN to track 920MHz noise floor.
+    eedscan_state = EedScanState(
+        interval_sec=int(cfg.get("eedscan_interval_sec", 300)))
 
     # Embedded admin UI (Constitution VI). Off by default; opted in via
     # config. Failure to start is logged but never aborts the bridge.
@@ -2942,7 +3048,15 @@ def main():
                 # best-effort: never let diag failure block the measurement
                 # path (Constitution IV / FR-005).
                 try:
-                    publish_diag(mqtt, device_id, diag_state.snapshot(now))
+                    snap = diag_state.snapshot(now)
+                    # spec 010: merge EEDSCAN metrics in for the same publish
+                    # cycle so Grafana plots line up.
+                    try:
+                        snap.update(eedscan_state.snapshot(
+                            pan_channel=diag_state.pan_channel))
+                    except Exception as e2:
+                        log("eedscan snapshot error: {}".format(e2))
+                    publish_diag(mqtt, device_id, snap)
                 except Exception as e:
                     log("publish_diag error: {}".format(e))
             finally:
@@ -2951,6 +3065,18 @@ def main():
             if time.time() - last_ping > 50:
                 mqtt.ping()
                 last_ping = time.time()
+
+            # spec 010: periodic EEDSCAN sweep. ~12 s blocking, so we only
+            # fire it when its deadline has passed AND we're not in probe
+            # mode (probe mode wants tight RTT samples and a 12 s gap
+            # would distort the sparkline). Failure is non-fatal.
+            if (cfg.get("eedscan_enabled", True)
+                    and not probing
+                    and eedscan_state.should_run(time.time())):
+                try:
+                    _run_eedscan_sweep(fd, eedscan_state, diag_state)
+                except Exception as e:
+                    log("EEDSCAN sweep error: {}".format(e))
 
             # Deadline-based pacing: keep ~cycle_interval between *poll starts*
             # rather than between cycle ends, so ERXUDP timeouts don't push
