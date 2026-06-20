@@ -2203,6 +2203,33 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
 
 EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
 
+# Spec 011 C: EPC tier rotation. Cycle-by-cycle EPC selection keeps each
+# SKSENDTO payload small (= faster meter response) and lets HA receive
+# what changes the most (power) at full rate while less-volatile data is
+# refreshed at a lower cadence.
+TIER1_EPCS = [0xE7, 0xE8]         # 瞬時電力、 瞬時電流 — real-time
+TIER2_EPCS = [0xE0, 0xE3]         # 積算電力量 (forward / reverse) — slow
+TIER3_EPCS = [0xD3, 0xE1]         # 係数 / 単位 — near-static
+
+
+def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60):
+    """Pick which EPC tier to query for cycle *cycle_number*. tier3 wins
+    over tier2 when both intervals align so the rarest data still refreshes
+    on schedule."""
+    if cycle_number % int(tier3_every) == 0:
+        return "tier3"
+    if cycle_number % int(tier2_every) == 0:
+        return "tier2"
+    return "tier1"
+
+
+def epcs_for_tier(tier):
+    if tier == "tier2":
+        return TIER2_EPCS
+    if tier == "tier3":
+        return TIER3_EPCS
+    return TIER1_EPCS
+
 def build_el_get(tid, epcs):
     frame = bytearray()
     frame += b"\x10\x81"                     # EHD1, EHD2
@@ -3027,6 +3054,9 @@ def main():
     # spec 009 mixed pattern: track the last normal-EPCS cycle so probe
     # mode can interleave fast probes without starving HA of power values.
     last_normal_poll_start = 0.0
+    # spec 011 C: count normal cycles to rotate EPC tier across the
+    # tier1 (per cycle), tier2 (5 cycles), tier3 (60 cycles) schedule.
+    normal_cycle_count = 0
 
     while True:
         try:
@@ -3034,8 +3064,15 @@ def main():
             probing = probe_state.is_active(last_poll_start)
             kind = decide_cycle_kind(probing, last_normal_poll_start,
                                      last_poll_start, poll_interval)
-            cycle_epcs = PROBE_EPCS if kind == "probe" else None
-            if kind == "normal":
+            if kind == "probe":
+                cycle_epcs = PROBE_EPCS
+            else:
+                # spec 011 C: tier rotation. Smaller per-cycle payload =
+                # faster meter response + less data starvation on the
+                # rare-but-needed tiers.
+                tier = decide_epc_tier(normal_cycle_count)
+                cycle_epcs = epcs_for_tier(tier)
+                normal_cycle_count += 1
                 last_normal_poll_start = last_poll_start
             # In probe mode, schedule the next cycle at the tight probe
             # interval; the normal mixed-in cycle uses the same interval so
