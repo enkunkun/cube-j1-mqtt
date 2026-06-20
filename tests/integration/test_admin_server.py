@@ -63,8 +63,9 @@ def _basic(user, password):
 
 
 class _FakeDiag(object):
-    def __init__(self, latency_samples=None):
+    def __init__(self, latency_samples=None, pan_channel=None):
         self.erxudp_latency_ms_recent = list(latency_samples or [])
+        self.pan_channel = pan_channel
 
     def snapshot(self, now):
         return {
@@ -75,6 +76,14 @@ class _FakeDiag(object):
             "wisun_reconnects_total": 0,
             "erxudp_timeouts_total": 0,
         }
+
+
+class _FakeEedScan(object):
+    def __init__(self, snapshot_value=None):
+        self._snap = snapshot_value or {}
+
+    def snapshot(self, pan_channel=None):
+        return dict(self._snap)
 
 
 @pytest.fixture
@@ -245,6 +254,48 @@ def test_get_diag_returns_snapshot(admin_server, admin_creds):
     body = r.json()
     assert body["uptime_seconds"] == 42
     assert body["version"] == "1.0.0+test"
+
+
+def test_get_diag_merges_eedscan_snapshot(config_dir, admin_creds):
+    """spec 010: admin /api/diag が eedscan_state.snapshot() を merge する."""
+    port = _free_port()
+    fake_diag = _FakeDiag(pan_channel=57)
+    fake_eed = _FakeEedScan(snapshot_value={
+        "eedscan_pan_channel_energy": 11,
+        "eedscan_max_energy": 46,
+        "eedscan_min_energy": 6,
+    })
+    server = mb.start_admin_server(
+        port=port,
+        user=admin_creds["user"],
+        password=admin_creds["password"],
+        diag_state_provider=lambda: fake_diag,
+        config_path=str(config_dir / "config.json"),
+        bridge_path=str(config_dir / "mqtt_bridge.py"),
+        wpa_supplicant_path=str(config_dir / "wpa_supplicant.conf"),
+        log_path=str(config_dir / "bridge.log"),
+        eedscan_state_provider=lambda: fake_eed,
+    )
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                break
+        except OSError:
+            time.sleep(0.02)
+    try:
+        r = requests.get(
+            "http://127.0.0.1:{}/api/diag".format(port),
+            headers=_auth(admin_creds), timeout=2)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["eedscan_pan_channel_energy"] == 11
+        assert body["eedscan_max_energy"] == 46
+        assert body["eedscan_min_energy"] == 6
+        # 元の diag フィールドも残る
+        assert body["uptime_seconds"] == 42
+    finally:
+        server.stop()
 
 
 # ---------------------------------------------------------------------------

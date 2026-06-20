@@ -777,7 +777,15 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             return
         if path == "/api/diag":
             try:
-                snap = self.diag_state_provider().snapshot(time.time())
+                ds = self.diag_state_provider()
+                snap = ds.snapshot(time.time())
+                # spec 010: merge EEDSCAN noise-floor metrics
+                try:
+                    eed = self.eedscan_state_provider()
+                    snap.update(eed.snapshot(
+                        pan_channel=getattr(ds, "pan_channel", None)))
+                except Exception:
+                    pass
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
                 return
@@ -1165,7 +1173,8 @@ def start_admin_server(port, user, password, diag_state_provider,
                        wpa_supplicant_path=ADMIN_WPA_PATH,
                        log_path=ADMIN_LOG_PATH,
                        ap_controller=None,
-                       probe_state_provider=None):
+                       probe_state_provider=None,
+                       eedscan_state_provider=None):
     """Construct and start an AdminServer with the given settings.
 
     Returns the running AdminServer.
@@ -1183,6 +1192,8 @@ def start_admin_server(port, user, password, diag_state_provider,
     AdminHandler.ap_controller = ap_controller or ApController()
     AdminHandler.probe_state_provider = staticmethod(
         probe_state_provider or (lambda: ProbeState()))
+    AdminHandler.eedscan_state_provider = staticmethod(
+        eedscan_state_provider or (lambda: EedScanState()))
     AdminHandler.lock = threading.Lock()
 
     httpd = _ReusingHTTPServer(("", port), AdminHandler)
@@ -2929,6 +2940,7 @@ def main():
                 diag_state_provider=lambda: diag_state,
                 ap_controller=ApController(),
                 probe_state_provider=lambda: probe_state,
+                eedscan_state_provider=lambda: eedscan_state,
             )
             LOGGER.info(event="admin_ui_started",
                         context={"port": int(cfg.get("admin_ui_port", 8080))})
