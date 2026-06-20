@@ -30,6 +30,9 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "wisun_reconnects_total": 0,
         "mqtt_reconnects_total": 0,
         "erxudp_timeouts_total": 0,
+        # spec 011 retry counters also baseline at 0
+        "erxudp_intra_cycle_retries_total": 0,
+        "erxudp_recovered_by_retry_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }

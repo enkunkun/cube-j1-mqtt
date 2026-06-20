@@ -132,7 +132,19 @@ def apply_defaults(cfg):
     # sweep stops meter traffic for that cycle).
     out.setdefault("eedscan_enabled", True)
     out.setdefault("eedscan_interval_sec", 300)
+    # spec 011: ERXUDP resilience. timeout 30s + 2 intra-cycle retries
+    # with 2s backoff covers the p95 5s tail and the rare 10-20s outliers.
+    out.setdefault("erxudp_timeout_sec", 30)
+    out.setdefault("erxudp_intra_cycle_retries", 2)
+    out.setdefault("erxudp_retry_backoff_sec", 2)
     return out
+
+
+def should_retry_in_cycle(attempt, max_retries):
+    """True while `attempt` (0-indexed try number) is inside the retry
+    budget. attempt=0 means the first SKSENDTO failed; we return True up to
+    and including `max_retries - 1`. Negative attempt is treated as 0."""
+    return int(attempt) < int(max_retries)
 
 
 # ---------------------------------------------------------------------------
@@ -1406,6 +1418,8 @@ _DIAG_SNAPSHOT_KEYS = (
     "wisun_reconnects_total",
     "mqtt_reconnects_total",
     "erxudp_timeouts_total",
+    "erxudp_intra_cycle_retries_total",
+    "erxudp_recovered_by_retry_total",
     "uptime_seconds",
     "version",
 )
@@ -1758,6 +1772,9 @@ class DiagState(object):
         # Consecutive (not total) ERXUDP timeouts since the last successful
         # poll. Drives auto-reconnect when the smart meter stops answering.
         self.consecutive_erxudp_timeouts = 0
+        # Spec 011: intra-cycle retry counters.
+        self.erxudp_intra_cycle_retries_total = 0
+        self.erxudp_recovered_by_retry_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -1785,6 +1802,14 @@ class DiagState(object):
     def on_erxudp_timeout(self):
         self.erxudp_timeouts_total += 1
         self.consecutive_erxudp_timeouts += 1
+
+    # Spec 011: intra-cycle retry counters.
+
+    def on_erxudp_intra_cycle_retry(self):
+        self.erxudp_intra_cycle_retries_total += 1
+
+    def on_erxudp_recovered_by_retry(self):
+        self.erxudp_recovered_by_retry_total += 1
 
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
@@ -1840,6 +1865,10 @@ class DiagState(object):
             "wisun_reconnects_total": self.wisun_reconnects_total,
             "mqtt_reconnects_total": self.mqtt_reconnects_total,
             "erxudp_timeouts_total": self.erxudp_timeouts_total,
+            "erxudp_intra_cycle_retries_total":
+                self.erxudp_intra_cycle_retries_total,
+            "erxudp_recovered_by_retry_total":
+                self.erxudp_recovered_by_retry_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2792,6 +2821,8 @@ DIAG_SENSOR_DEFS = [
     ("wisun_reconnects_total", "Wi-SUN Reconnects",   None, None,        "total_increasing", "diagnostic"),
     ("mqtt_reconnects_total",  "MQTT Reconnects",     None, None,        "total_increasing", "diagnostic"),
     ("erxudp_timeouts_total",  "ERXUDP Timeouts",     None, None,        "total_increasing", "diagnostic"),
+    ("erxudp_intra_cycle_retries_total", "ERXUDP Intra-Cycle Retries", None, None, "total_increasing", "diagnostic"),
+    ("erxudp_recovered_by_retry_total",  "ERXUDP Recovered by Retry",  None, None, "total_increasing", "diagnostic"),
     ("uptime_seconds",         "Uptime",              "s",  None,        "measurement",      "diagnostic"),
     ("version",                "Bridge Version",      None, None,        None,               "diagnostic"),
     # Spec 006: Wi-SUN health observability — RTT distribution + EVENT/FAIL.
@@ -3013,10 +3044,35 @@ def main():
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
+                # spec 011: ERXUDP resilience — extend timeout to handle
+                # the p95 tail and add intra-cycle retries to mask single-
+                # cycle drops from HA's perspective.
+                _erxudp_timeout = int(cfg.get("erxudp_timeout_sec", 30))
+                _max_retries = int(cfg.get("erxudp_intra_cycle_retries", 2))
+                _backoff = float(cfg.get("erxudp_retry_backoff_sec", 2))
                 send_el_get(fd, ipv6, tid, epc_list=cycle_epcs)
                 tid = (tid + 1) & 0xFFFF
                 t_send = time.time()
-                data = read_erxudp(fd, timeout=15, diag_state=diag_state)
+                data = read_erxudp(fd, timeout=_erxudp_timeout,
+                                   diag_state=diag_state)
+                attempt = 0
+                while data is None and should_retry_in_cycle(attempt, _max_retries):
+                    try:
+                        diag_state.on_erxudp_intra_cycle_retry()
+                    except Exception as e:
+                        log("diag on_erxudp_intra_cycle_retry error: {}".format(e))
+                    time.sleep(_backoff)
+                    send_el_get(fd, ipv6, tid, epc_list=cycle_epcs)
+                    tid = (tid + 1) & 0xFFFF
+                    t_send = time.time()
+                    data = read_erxudp(fd, timeout=_erxudp_timeout,
+                                       diag_state=diag_state)
+                    attempt += 1
+                if data is not None and attempt > 0:
+                    try:
+                        diag_state.on_erxudp_recovered_by_retry()
+                    except Exception as e:
+                        log("diag on_erxudp_recovered_by_retry error: {}".format(e))
                 now = time.time()
                 if data:
                     try:
