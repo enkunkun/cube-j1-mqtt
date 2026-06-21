@@ -134,12 +134,14 @@ def apply_defaults(cfg):
     # spec 012: shorten EEDSCAN interval so noise judgements stay fresh.
     out.setdefault("eedscan_interval_sec", 120)
     # spec 011: ERXUDP resilience. timeout 30s + 2s backoff covers the p95
-    # 5s tail and the rare 10-20s outliers. Retries cut from 2 to 1 after
-    # 34h of telemetry showed recovery rate of just 3% (23/745) while TID
-    # mismatches (delayed replies stacking up in the meter's ECHONET queue)
-    # confirmed the meter was getting overwhelmed.
+    # 5s tail. Retry default further cut from 1 to 0 after a second 24h
+    # observation showed retry rate ~0.92/min (≒ every cycle) and recovery
+    # stayed at 2%, confirming retries were not winning — they were just
+    # piling up replies in the meter's ECHONET queue. With retries off,
+    # the queue gets a chance to drain; retry can be opted back in via
+    # config when the queue clears.
     out.setdefault("erxudp_timeout_sec", 30)
-    out.setdefault("erxudp_intra_cycle_retries", 1)
+    out.setdefault("erxudp_intra_cycle_retries", 0)
     out.setdefault("erxudp_retry_backoff_sec", 2)
     # spec 012: noise-adaptive poll skip — skip normal poll when the last
     # EEDSCAN shows the PAN channel is noisy (>= threshold). Avoids the
@@ -1821,6 +1823,9 @@ class DiagState(object):
         # Spec 012: noise-adaptive skip + ERXUDP TID mismatch observability.
         self.noise_adaptive_skips_total = 0
         self.erxudp_tid_mismatch_total = 0
+        # Spec 011 follow-up 2: how many request frames each delayed reply
+        # was behind by — i.e. the meter's ECHONET queue depth.
+        self.erxudp_tid_mismatch_lags_recent = collections.deque(maxlen=100)
         # Spec 016: HA discovery auto-republish state.
         self.last_discovery_publish_ts = None
         self.pending_discovery_republish = False
@@ -1885,8 +1890,11 @@ class DiagState(object):
         self.last_discovery_publish_ts = float(now)
         self.pending_discovery_republish = False
 
-    def on_erxudp_tid_mismatch(self):
+    def on_erxudp_tid_mismatch(self, expected=None, got=None):
         self.erxudp_tid_mismatch_total += 1
+        lag = compute_tid_lag(expected, got)
+        if lag is not None:
+            self.erxudp_tid_mismatch_lags_recent.append(lag)
 
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
@@ -1971,6 +1979,17 @@ class DiagState(object):
             out["erxudp_latency_p50_ms"] = round(_percentile(ordered, 50), 2)
             out["erxudp_latency_p95_ms"] = round(_percentile(ordered, 95), 2)
             out["erxudp_latency_max_ms"] = round(ordered[-1], 2)
+
+        # Spec 011 follow-up 2: TID mismatch lag percentiles. Omit when no
+        # mismatch has ever been observed.
+        lags = list(self.erxudp_tid_mismatch_lags_recent)
+        if lags:
+            ordered_lags = sorted(lags)
+            out["erxudp_tid_mismatch_lag_p50"] = int(round(
+                _percentile(ordered_lags, 50)))
+            out["erxudp_tid_mismatch_lag_p95"] = int(round(
+                _percentile(ordered_lags, 95)))
+            out["erxudp_tid_mismatch_lag_max"] = ordered_lags[-1]
 
         # Spec 006: named EVENT / ER counters. Omit zero-count entries
         # so HA discovery does not advertise sensors that have never fired.
@@ -2358,6 +2377,18 @@ def extract_el_tid(payload):
         return None
     return struct.unpack(">H", bytes(payload[2:4]))[0]
 
+
+def compute_tid_lag(expected, got, modulo=0x10000):
+    """How many ECHONET Lite request frames the late reply is behind.
+
+    spec 011 follow-up 2: when a delayed reply arrives, `(expected - got) %
+    modulo` is the number of request cycles it lagged by — i.e. how deep
+    the meter's ECHONET queue is. Returns None when either side is None
+    (the read_erxudp caller did not have a real TID yet)."""
+    if expected is None or got is None:
+        return None
+    return (int(expected) - int(got)) % int(modulo)
+
 def parse_el_response(data):
     """Returns dict {epc_int: bytearray}."""
     if len(data) < 12:
@@ -2562,7 +2593,8 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                 if got_tid != expected_tid:
                     if diag_state is not None:
                         try:
-                            diag_state.on_erxudp_tid_mismatch()
+                            diag_state.on_erxudp_tid_mismatch(
+                                expected=expected_tid, got=got_tid)
                         except Exception as e:
                             log("diag on_erxudp_tid_mismatch error: {}"
                                 .format(e))
@@ -2996,6 +3028,9 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_intra_cycle_retries_total", "ERXUDP Intra-Cycle Retries", None, None, "total_increasing", "diagnostic"),
     ("erxudp_recovered_by_retry_total",  "ERXUDP Recovered by Retry",  None, None, "total_increasing", "diagnostic"),
     ("erxudp_tid_mismatch_total",        "ERXUDP TID Mismatch",        None, None, "total_increasing", "diagnostic"),
+    ("erxudp_tid_mismatch_lag_p50",      "TID Mismatch Lag p50",       None, None, "measurement",      "diagnostic"),
+    ("erxudp_tid_mismatch_lag_p95",      "TID Mismatch Lag p95",       None, None, "measurement",      "diagnostic"),
+    ("erxudp_tid_mismatch_lag_max",      "TID Mismatch Lag Max",       None, None, "measurement",      "diagnostic"),
     ("noise_adaptive_skips_total",       "Noise-Adaptive Skips",       None, None, "total_increasing", "diagnostic"),
     ("uptime_seconds",         "Uptime",              "s",  None,        "measurement",      "diagnostic"),
     ("version",                "Bridge Version",      None, None,        None,               "diagnostic"),
