@@ -133,3 +133,93 @@ def test_ap_controller_disable_returns_observed_state():
     ctrl = mb.ApController(interface="p2p-wlan0-0", runner=runner.run)
     result = ctrl.disable()
     assert result == {"enabled": False, "interface": "p2p-wlan0-0"}
+
+
+# ---------------------------------------------------------------------------
+# spec 019: ApController + ApStateStore wiring
+# ---------------------------------------------------------------------------
+
+
+class _FakeStateStore(object):
+    def __init__(self, write_raises=None):
+        self.writes = []
+        self._write_raises = write_raises
+
+    def write(self, state):
+        if self._write_raises is not None:
+            raise self._write_raises
+        self.writes.append(state)
+
+
+def test_ap_controller_without_state_store_still_works():
+    """既存挙動互換: state_store 未指定で従来通り動く。"""
+    runner = _FakeRunner(getprop_returns="created\n")
+    ctrl = mb.ApController(interface="p2p-wlan0-0", runner=runner.run)
+    ctrl.enable()
+    assert any(c[0] == "wpa_cli" for c in runner.calls)
+
+
+def test_enable_writes_enabled_to_state_store_when_provided():
+    runner = _FakeRunner(getprop_returns="created\n")
+    store = _FakeStateStore()
+    ctrl = mb.ApController(interface="p2p-wlan0-0",
+                            runner=runner.run, state_store=store)
+    ctrl.enable()
+    assert store.writes == ["enabled"]
+
+
+def test_disable_writes_disabled_to_state_store_when_provided():
+    runner = _FakeRunner(getprop_returns="disabled\n")
+    store = _FakeStateStore()
+    ctrl = mb.ApController(interface="p2p-wlan0-0",
+                            runner=runner.run, state_store=store)
+    ctrl.disable()
+    assert store.writes == ["disabled"]
+
+
+def test_state_store_write_failure_does_not_break_toggle():
+    """store.write が IOError 等で爆発しても toggle 自体は成功扱い。"""
+    runner = _FakeRunner(getprop_returns="disabled\n")
+    store = _FakeStateStore(write_raises=IOError("disk full"))
+    ctrl = mb.ApController(interface="p2p-wlan0-0",
+                            runner=runner.run, state_store=store)
+    # 例外を上に飛ばさない
+    result = ctrl.disable()
+    assert result == {"enabled": False, "interface": "p2p-wlan0-0"}
+
+
+# ---------------------------------------------------------------------------
+# spec 019: apply_ap_state_restore pure helper
+# ---------------------------------------------------------------------------
+
+
+class _RecordingController(object):
+    def __init__(self):
+        self.calls = []
+
+    def enable(self):
+        self.calls.append("enable")
+
+    def disable(self):
+        self.calls.append("disable")
+
+
+def test_apply_ap_state_restore_calls_enable_when_stored_enabled():
+    ctrl = _RecordingController()
+    result = mb.apply_ap_state_restore("enabled", ctrl)
+    assert ctrl.calls == ["enable"]
+    assert result == "enabled"
+
+
+def test_apply_ap_state_restore_calls_disable_when_stored_disabled():
+    ctrl = _RecordingController()
+    result = mb.apply_ap_state_restore("disabled", ctrl)
+    assert ctrl.calls == ["disable"]
+    assert result == "disabled"
+
+
+def test_apply_ap_state_restore_noop_when_none():
+    ctrl = _RecordingController()
+    result = mb.apply_ap_state_restore(None, ctrl)
+    assert ctrl.calls == []
+    assert result is None

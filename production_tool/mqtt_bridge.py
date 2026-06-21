@@ -157,6 +157,11 @@ def apply_defaults(cfg):
         log("WARN: poll_interval={} below floor, clamping to {}".format(
             out["poll_interval"], MIN_POLL_INTERVAL_SEC))
         out["poll_interval"] = MIN_POLL_INTERVAL_SEC
+    # spec 019: persist Wi-Fi AP toggle state across reboots.
+    # Setting ap_state_persist_enabled=False disables both restore (on
+    # startup) and write (on toggle) — a clean kill switch.
+    out.setdefault("ap_state_file_path", "/data/local/cube_j1_ap_state")
+    out.setdefault("ap_state_persist_enabled", True)
     return out
 
 
@@ -1545,9 +1550,12 @@ class ApController(object):
     default subprocess runner.
     """
 
-    def __init__(self, interface=None, runner=None):
+    def __init__(self, interface=None, runner=None, state_store=None):
         self._interface = interface
         self._runner = runner or _default_subprocess_runner
+        # spec 019: optional persistence. None = legacy behaviour
+        # (toggle does not survive reboot).
+        self._state_store = state_store
 
     def _resolve_interface(self):
         if self._interface:
@@ -1555,6 +1563,14 @@ class ApController(object):
         out = self._runner(["getprop", "net.wifi.ap.interface"], timeout=2)
         iface = (out or "").strip()
         return iface or "p2p-wlan0-0"
+
+    def _persist(self, desired):
+        if self._state_store is None:
+            return
+        try:
+            self._state_store.write(desired)
+        except Exception as e:
+            log("ERROR: ApStateStore write failed: {}".format(e))
 
     def get(self):
         iface = self._resolve_interface()
@@ -1564,12 +1580,63 @@ class ApController(object):
     def disable(self):
         iface = self._resolve_interface()
         self._runner(build_wpa_cli_cmd(iface, "disable"), timeout=5)
+        self._persist("disabled")
         return self.get()
 
     def enable(self):
         iface = self._resolve_interface()
         self._runner(build_wpa_cli_cmd(iface, "enable"), timeout=5)
+        self._persist("enabled")
         return self.get()
+
+
+class ApStateStore(object):
+    """spec 019: persist desired AP toggle state across reboots.
+
+    1-line plain text file containing "enabled" or "disabled". Missing /
+    malformed / unreadable → read() returns None; caller leaves OS
+    default alone. `opener` is injectable for tests (read path); write
+    always goes through AtomicWriter.
+    """
+    VALID_STATES = ("enabled", "disabled")
+
+    def __init__(self, path, opener=None):
+        self._path = path
+        self._opener = opener or open
+
+    def read(self):
+        try:
+            with self._opener(self._path, "rb") as f:
+                raw = f.read().decode("ascii", errors="replace").strip()
+        except IOError:
+            return None
+        if raw in self.VALID_STATES:
+            return raw
+        if raw:
+            log("WARN: ApStateStore invalid value {!r} in {}".format(
+                raw, self._path))
+        return None
+
+    def write(self, state):
+        if state not in self.VALID_STATES:
+            raise ValueError("state must be one of {}".format(
+                self.VALID_STATES))
+        AtomicWriter.write_bytes(self._path, state.encode("ascii"))
+
+
+def apply_ap_state_restore(stored_state, ap_controller):
+    """spec 019: dispatch restore based on previously stored state.
+
+    Returns the action taken ("enabled" / "disabled") or None when no
+    persisted state was found and the OS default is left alone.
+    """
+    if stored_state == "enabled":
+        ap_controller.enable()
+        return "enabled"
+    if stored_state == "disabled":
+        ap_controller.disable()
+        return "disabled"
+    return None
 
 
 def render_sparkline(samples, width, height):
@@ -3169,6 +3236,16 @@ def main():
     eedscan_state = EedScanState(
         interval_sec=int(cfg.get("eedscan_interval_sec", 300)))
 
+    # spec 019: persist Wi-Fi AP toggle state across reboots. The store
+    # is shared with the admin handler's ApController so toggles via
+    # admin UI write to the same file the startup restore will read.
+    # ap_state_persist_enabled=False yields state_store=None → both
+    # restore and write are skipped (clean kill switch).
+    _ap_store = (ApStateStore(cfg.get("ap_state_file_path",
+                              "/data/local/cube_j1_ap_state"))
+                 if cfg.get("ap_state_persist_enabled", True) else None)
+    _ap_controller = ApController(state_store=_ap_store)
+
     # Embedded admin UI (Constitution VI). Off by default; opted in via
     # config. Failure to start is logged but never aborts the bridge.
     if cfg.get("admin_ui_enabled") and cfg.get("admin_user") and cfg.get("admin_password"):
@@ -3178,7 +3255,7 @@ def main():
                 user=cfg["admin_user"],
                 password=cfg["admin_password"],
                 diag_state_provider=lambda: diag_state,
-                ap_controller=ApController(),
+                ap_controller=_ap_controller,
                 probe_state_provider=lambda: probe_state,
                 eedscan_state_provider=lambda: eedscan_state,
             )
@@ -3208,6 +3285,17 @@ def main():
     # spec 016: seed last-publish ts so the periodic re-publish check
     # doesn't fire on the first main-loop tick. counter stays at 0.
     diag_state.mark_initial_discovery_publish(time.time())
+
+    # spec 019: restore Wi-Fi AP toggle state from the last session.
+    # _ap_store is None when persist is disabled → skip the restore
+    # entirely (kill switch).
+    if _ap_store is not None:
+        try:
+            _restored = apply_ap_state_restore(_ap_store.read(), _ap_controller)
+            if _restored is not None:
+                log("AP restored: {}".format(_restored))
+        except Exception as e:
+            log("WARN: AP state restore failed: {}".format(e))
 
     # Open serial port
     log("Opening serial {}".format(serial_port))
