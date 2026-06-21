@@ -43,6 +43,12 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # (consecutive_wisun_connect_failures / pending_wisun_rejoin are
         # internal-only and intentionally not in the snapshot schema).
         "serial_reopen_total": 0,
+        # spec 022: realtime burst mode counters + mode gauge.
+        # realtime_effective_interval_seconds is None at boot so omitted.
+        "realtime_burst_started_total": 0,
+        "realtime_burst_completed_total": 0,
+        "realtime_burst_aborted_total": 0,
+        "realtime_mode_current": "off",
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -329,3 +335,22 @@ def test_total_erxudp_counter_continues_to_grow_after_reset():
     snap = state.snapshot(now=state.start_time)
     assert snap["erxudp_timeouts_total"] == 3
     assert state.consecutive_erxudp_timeouts == 1
+
+
+# ---------------------------------------------------------------------------
+# spec 022: realtime burst mode
+# ---------------------------------------------------------------------------
+
+def test_on_realtime_burst_started_increments():
+    state = make_state()
+    state.on_realtime_burst_started()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["realtime_burst_started_total"] == 1
+
+
+def test_set_realtime_state_updates_mode_and_interval_gauge():
+    state = make_state()
+    state.set_realtime_state("burst", 5)
+    snap = state.snapshot(now=state.start_time)
+    assert snap["realtime_mode_current"] == "burst"
+    assert snap["realtime_effective_interval_seconds"] == 5

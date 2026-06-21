@@ -174,6 +174,14 @@ def apply_defaults(cfg):
     # Default every=30 cycles ≈ 30 min at poll_interval=60s. Set 0 to
     # disable tier4 entirely (kill switch).
     out.setdefault("epc_tier4_every", 30)
+    # spec 022: realtime burst mode defaults. Burst is triggered by Admin
+    # API (off by default at boot, no auto-start). interval floor 5 sec
+    # protects against pathological config; duration cap 3600 sec is a soft
+    # bound (BP35CX physically gates ARIB STD-T108 duty cycle anyway).
+    out.setdefault("realtime_burst_default_duration_sec",
+                   REALTIME_BURST_DEFAULT_DURATION_SEC)
+    out.setdefault("realtime_burst_default_interval_sec",
+                   REALTIME_BURST_DEFAULT_INTERVAL_SEC)
     return out
 
 
@@ -431,6 +439,15 @@ _VALID_LOG_LEVELS = ("debug", "info", "warn", "error")
 # retries/reconnects are factored in.
 MIN_POLL_INTERVAL_SEC = 30
 
+# spec 022: realtime burst mode bounds. 5 s floor matches Nature Remo E
+# Lite cadence; below that the BP35CX physically gates ARIB STD-T108 duty
+# cycle and the host-side risk becomes mooting BP35CX retries. Default
+# duration 5 min, soft cap 60 min.
+REALTIME_BURST_DEFAULT_DURATION_SEC = 300
+REALTIME_BURST_DEFAULT_INTERVAL_SEC = 5
+REALTIME_BURST_MIN_INTERVAL_SEC = 5
+REALTIME_BURST_MAX_DURATION_SEC = 3600
+
 _POSITIVE_INT_KEYS = (
     "mqtt_port", "log_max_bytes", "log_backup_count",
     "admin_ui_port",
@@ -583,6 +600,13 @@ pre { background: #f4f4f4; padding: .6rem; font-size: .8rem;
   <button id="ap_toggle" type="button" disabled>--</button>
   <span id="ap_msg" style="font-size:.85rem;color:#888;margin-left:.6rem"></span>
 </fieldset>
+<fieldset><legend>Realtime Power (Burst Mode)</legend>
+  <p class="notice">瞬時電力 (0xE7) を 5 秒間隔で更新するモード。5 分経過で自動的に通常 (60 秒) に戻る。ARIB STD-T108 duty cycle は BP35CX が物理層で保護.</p>
+  <p>mode: <strong id="rt_mode">...</strong>
+     <span id="rt_remaining" style="font-family:monospace;font-size:.85rem;color:#888"></span></p>
+  <button id="rt_start" type="button">5 分間 burst 開始</button>
+  <button id="rt_stop" type="button">停止</button>
+</fieldset>
 <fieldset><legend>Bridge Update</legend>
   <form id="update-form" enctype="multipart/form-data">
     <label><input type="file" name="update_file" accept=".py" required></label>
@@ -709,6 +733,37 @@ document.getElementById('ap_toggle').addEventListener('click', function() {
 });
 apRefresh();
 setInterval(apRefresh, 10000);
+
+// spec 022: realtime burst mode toggle + status polling.
+function rtRender(j) {
+  document.getElementById('rt_mode').textContent = j.mode || '?';
+  var rem = j.remaining_sec;
+  var eff = j.effective_interval_seconds;
+  var msg = '';
+  if (rem != null && rem > 0) {
+    msg = '(残 ' + Math.ceil(rem) + 's / ' + (eff || '?') + 's 周期)';
+  } else if (eff != null) {
+    msg = '(' + eff + 's 周期)';
+  }
+  document.getElementById('rt_remaining').textContent = msg;
+}
+function rtRefresh() {
+  fetch('/api/realtime/status').then(function(r){return r.json();}).then(rtRender)
+    .catch(function(){});
+}
+document.getElementById('rt_start').addEventListener('click', function(){
+  fetch('/api/realtime/start',
+    {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(function(r){return r.json();}).then(rtRender)
+    .catch(function(){});
+});
+document.getElementById('rt_stop').addEventListener('click', function(){
+  fetch('/api/realtime/stop', {method:'POST'})
+    .then(function(r){return r.json();}).then(rtRender)
+    .catch(function(){});
+});
+rtRefresh();
+setInterval(rtRefresh, 3000);
 </script>
 </body>
 </html>"""
@@ -886,6 +941,14 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 "tokens": tokens,
             })
             return
+        if path == "/api/realtime/status":
+            # spec 022: burst mode current state. effective_interval_seconds
+            # comes from DiagState gauge (set by main loop after tick) so
+            # catch-up phase is reflected accurately (dig 決定 H).
+            state = self.realtime_state_provider()
+            ds = self.diag_state_provider()
+            self._send_json(200, self._realtime_status_payload(state, ds))
+            return
         if path == "/wisun":
             self._send_text(200, WISUN_HTML,
                             content_type="text/html; charset=utf-8")
@@ -1046,6 +1109,12 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if path == "/api/update":
             self._handle_update()
             return
+        if path == "/api/realtime/start":
+            self._handle_realtime_start()
+            return
+        if path == "/api/realtime/stop":
+            self._handle_realtime_stop()
+            return
         self._send_json(404, {"error": "not found"})
 
     def _handle_update(self):
@@ -1100,6 +1169,66 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 except OSError:
                     pass
         self._send_json(200, {"status": "ok", "restarting": True})
+
+    # ------------------------------------------------------------------
+    # spec 022: realtime burst mode endpoints
+    # ------------------------------------------------------------------
+
+    def _realtime_status_payload(self, state, ds):
+        snap = state.snapshot()
+        now = time.time()
+        remaining = None
+        if (snap.get("mode") == "burst"
+                and snap.get("expires_at") is not None):
+            remaining = max(0.0, snap["expires_at"] - now)
+        return {
+            "mode": snap.get("mode"),
+            "expires_at": snap.get("expires_at"),
+            "remaining_sec": remaining,
+            "burst_interval": snap.get("burst_interval"),
+            "effective_interval_seconds":
+                ds.realtime_effective_interval_seconds,
+        }
+
+    def _handle_realtime_start(self):
+        body = self._read_json_body() or {}
+        duration = body.get("duration_sec",
+                            REALTIME_BURST_DEFAULT_DURATION_SEC)
+        interval = body.get("interval_sec",
+                            REALTIME_BURST_DEFAULT_INTERVAL_SEC)
+        try:
+            duration = int(duration)
+            interval = int(interval)
+        except (TypeError, ValueError):
+            self._send_json(400, {
+                "error": "duration_sec / interval_sec must be int"})
+            return
+        if duration < 1:
+            self._send_json(400, {"error": "duration_sec must be > 0"})
+            return
+        if interval < REALTIME_BURST_MIN_INTERVAL_SEC:
+            self._send_json(400, {"error":
+                "interval_sec must be >= {}".format(
+                    REALTIME_BURST_MIN_INTERVAL_SEC)})
+            return
+        if duration > REALTIME_BURST_MAX_DURATION_SEC:
+            self._send_json(400, {"error":
+                "duration_sec must be <= {}".format(
+                    REALTIME_BURST_MAX_DURATION_SEC)})
+            return
+        state = self.realtime_state_provider()
+        state.start_burst(time.time(), duration, interval)
+        ds = self.diag_state_provider()
+        ds.on_realtime_burst_started()
+        self._send_json(200, self._realtime_status_payload(state, ds))
+
+    def _handle_realtime_stop(self):
+        state = self.realtime_state_provider()
+        was_active = state.stop_burst()
+        ds = self.diag_state_provider()
+        if was_active:
+            ds.on_realtime_burst_aborted()
+        self._send_json(200, self._realtime_status_payload(state, ds))
         try:
             self.wfile.flush()
         except Exception:
@@ -1244,7 +1373,8 @@ def start_admin_server(port, user, password, diag_state_provider,
                        log_path=ADMIN_LOG_PATH,
                        ap_controller=None,
                        probe_state_provider=None,
-                       eedscan_state_provider=None):
+                       eedscan_state_provider=None,
+                       realtime_state_provider=None):
     """Construct and start an AdminServer with the given settings.
 
     Returns the running AdminServer.
@@ -1264,6 +1394,10 @@ def start_admin_server(port, user, password, diag_state_provider,
         probe_state_provider or (lambda: ProbeState()))
     AdminHandler.eedscan_state_provider = staticmethod(
         eedscan_state_provider or (lambda: EedScanState()))
+    # spec 022: realtime burst mode — admin endpoints mutate this state
+    # while the main loop ticks it; lock lives inside RealtimeModeState.
+    AdminHandler.realtime_state_provider = staticmethod(
+        realtime_state_provider or (lambda: RealtimeModeState()))
     AdminHandler.lock = threading.Lock()
 
     httpd = _ReusingHTTPServer(("", port), AdminHandler)
@@ -1490,6 +1624,12 @@ _DIAG_SNAPSHOT_KEYS = (
     "last_discovery_publish_ts",
     "discovery_republish_total",
     "serial_reopen_total",
+    # spec 022: realtime burst mode counters + gauges.
+    "realtime_burst_started_total",
+    "realtime_burst_completed_total",
+    "realtime_burst_aborted_total",
+    "realtime_mode_current",
+    "realtime_effective_interval_seconds",
     "uptime_seconds",
     "version",
 )
@@ -1887,6 +2027,72 @@ def classify_sk_line(line):
     return None
 
 
+def compute_effective_poll_interval(now, base_interval, mode_state):
+    """spec 022: burst active なら burst_interval、 expired/off なら base_interval.
+
+    state mutation はしない (caller の RealtimeModeState.tick が担う)。
+    burst かつ expires_at が未来 のみ burst_interval 採用、 それ以外は base。"""
+    if mode_state.get("mode") == "burst":
+        exp = mode_state.get("expires_at")
+        if exp is not None and now < exp:
+            return int(mode_state.get("burst_interval", base_interval))
+    return int(base_interval)
+
+
+class RealtimeModeState(object):
+    """spec 022: realtime polling mode の thread-safe holder.
+
+    admin API thread と main loop thread の境界。 tick() 戻り値の transition で
+    main loop が catch-up trigger / counter 更新を判断する。
+
+    dig 決定 B: tick = (mode, transition) で transition ∈ {None, 'expired', 'aborted'}
+    dig 決定 D: start_burst 重複 = expires_at 上書き + _pending_abort クリア
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._mode = "off"
+        self._expires_at = None
+        self._burst_interval = 5
+        self._pending_abort = False
+
+    def start_burst(self, now, duration_sec, interval_sec):
+        with self._lock:
+            self._mode = "burst"
+            self._expires_at = float(now) + float(duration_sec)
+            self._burst_interval = int(interval_sec)
+            self._pending_abort = False
+
+    def stop_burst(self):
+        with self._lock:
+            was_active = self._mode == "burst"
+            if was_active:
+                self._pending_abort = True
+            return was_active
+
+    def tick(self, now):
+        with self._lock:
+            if self._mode == "burst" and self._pending_abort:
+                self._mode = "off"
+                self._expires_at = None
+                self._pending_abort = False
+                return ("off", "aborted")
+            if (self._mode == "burst" and self._expires_at is not None
+                    and now >= self._expires_at):
+                self._mode = "off"
+                self._expires_at = None
+                return ("off", "expired")
+            return (self._mode, None)
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "mode": self._mode,
+                "expires_at": self._expires_at,
+                "burst_interval": self._burst_interval,
+            }
+
+
 class DiagState(object):
     """Single-thread mutable diagnostics aggregator (main loop only)."""
 
@@ -1921,6 +2127,15 @@ class DiagState(object):
         self.serial_reopen_total = 0
         self.consecutive_wisun_connect_failures = 0
         self.pending_wisun_rejoin = False
+        # Spec 022: realtime burst mode — counters track start/expire/abort,
+        # mode_current is a string gauge published every snapshot, eff_int
+        # is set by main loop after first tick (None at boot → omitted from
+        # snapshot until first iteration).
+        self.realtime_burst_started_total = 0
+        self.realtime_burst_completed_total = 0
+        self.realtime_burst_aborted_total = 0
+        self.realtime_mode_current = "off"
+        self.realtime_effective_interval_seconds = None
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -1999,6 +2214,21 @@ class DiagState(object):
         if lag is not None:
             self.erxudp_tid_mismatch_lags_recent.append(lag)
 
+    # Spec 022: realtime burst mode counters + mode/interval gauges.
+
+    def on_realtime_burst_started(self):
+        self.realtime_burst_started_total += 1
+
+    def on_realtime_burst_completed(self):
+        self.realtime_burst_completed_total += 1
+
+    def on_realtime_burst_aborted(self):
+        self.realtime_burst_aborted_total += 1
+
+    def set_realtime_state(self, mode, effective_interval_seconds):
+        self.realtime_mode_current = mode
+        self.realtime_effective_interval_seconds = effective_interval_seconds
+
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
     def on_erxudp_latency(self, ms):
@@ -2064,6 +2294,15 @@ class DiagState(object):
                 if self.last_discovery_publish_ts is not None else None,
             "discovery_republish_total": self.discovery_republish_total,
             "serial_reopen_total": self.serial_reopen_total,
+            "realtime_burst_started_total":
+                self.realtime_burst_started_total,
+            "realtime_burst_completed_total":
+                self.realtime_burst_completed_total,
+            "realtime_burst_aborted_total":
+                self.realtime_burst_aborted_total,
+            "realtime_mode_current": self.realtime_mode_current,
+            "realtime_effective_interval_seconds":
+                self.realtime_effective_interval_seconds,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -3375,6 +3614,10 @@ def main():
     eedscan_state = EedScanState(
         interval_sec=int(cfg.get("eedscan_interval_sec", 300)))
 
+    # spec 022: realtime burst mode holder. Admin UI / API mutates via
+    # start_burst/stop_burst, main loop reads via tick()/snapshot().
+    realtime_state = RealtimeModeState()
+
     # spec 019: persist Wi-Fi AP toggle state across reboots. The store
     # is shared with the admin handler's ApController so toggles via
     # admin UI write to the same file the startup restore will read.
@@ -3397,6 +3640,7 @@ def main():
                 ap_controller=_ap_controller,
                 probe_state_provider=lambda: probe_state,
                 eedscan_state_provider=lambda: eedscan_state,
+                realtime_state_provider=lambda: realtime_state,
             )
             LOGGER.info(event="admin_ui_started",
                         context={"port": int(cfg.get("admin_ui_port", 8080))})
@@ -3471,6 +3715,11 @@ def main():
     normal_cycle_count = 0
     # spec 012: track consecutive noise-skip count for the fail-safe.
     noise_skip_streak = 0
+    # spec 022: catch-up state after burst expires/aborts. catchup_interval
+    # captures the burst_interval that was active so the catch-up runs at
+    # the same fast cadence (dig 決定 A: burst_interval 引き継ぎ).
+    catchup_remaining = 0
+    catchup_interval = poll_interval
 
     while True:
         try:
@@ -3489,6 +3738,32 @@ def main():
                 except Exception as e:
                     log("WARN: HA discovery republish failed: {}".format(e))
             probing = probe_state.is_active(last_poll_start)
+
+            # spec 022: realtime burst mode tick. transition='expired'/'aborted'
+            # triggers a 4-iter catch-up (tier4 → tier3 → tier2 → tier1) at
+            # the previous burst_interval. Re-start during catch-up clears
+            # it so the new burst takes over (dig 決定 D).
+            _rt_mode, _rt_trans = realtime_state.tick(last_poll_start)
+            if _rt_trans == "expired":
+                diag_state.on_realtime_burst_completed()
+                catchup_remaining = 4
+                catchup_interval = int(realtime_state.snapshot().get(
+                    "burst_interval", REALTIME_BURST_DEFAULT_INTERVAL_SEC))
+            elif _rt_trans == "aborted":
+                # diag.on_realtime_burst_aborted() was emitted in the
+                # admin thread already; here we just trigger the catch-up.
+                catchup_remaining = 4
+                catchup_interval = int(realtime_state.snapshot().get(
+                    "burst_interval", REALTIME_BURST_DEFAULT_INTERVAL_SEC))
+            if _rt_mode == "burst" and catchup_remaining > 0:
+                catchup_remaining = 0
+            if catchup_remaining > 0:
+                _eff_interval = catchup_interval
+            else:
+                _eff_interval = compute_effective_poll_interval(
+                    last_poll_start, poll_interval,
+                    realtime_state.snapshot())
+            diag_state.set_realtime_state(_rt_mode, _eff_interval)
             kind = decide_cycle_kind(probing, last_normal_poll_start,
                                      last_poll_start, poll_interval)
             # spec 012: skip normal poll while the PAN channel is noisy,
@@ -3505,12 +3780,29 @@ def main():
                     except Exception as e:
                         log("diag on_noise_adaptive_skip error: {}".format(e))
                     noise_skip_streak += 1
+                    # spec 022: 起床周期も _eff_interval に統一して
+                    # burst 中の noise skip でも 5s 周期を維持。
                     time.sleep(compute_next_poll_sleep(
-                        last_poll_start, time.time(), poll_interval))
+                        last_poll_start, time.time(), _eff_interval))
                     continue
                 noise_skip_streak = 0
             if kind == "probe":
                 cycle_epcs = PROBE_EPCS
+            elif catchup_remaining > 0:
+                # spec 022: catch-up sequence after burst (dig 決定 A) —
+                # 4 iter で tier4 → tier3 → tier2 → tier1 を消費して
+                # 累積値などの skip 分を補完。 cycle counter は進めない。
+                _catchup_tiers = ["tier4", "tier3", "tier2", "tier1"]
+                tier = _catchup_tiers[4 - catchup_remaining]
+                cycle_epcs = epcs_for_tier(tier)
+                catchup_remaining -= 1
+                last_normal_poll_start = last_poll_start
+            elif _rt_mode == "burst":
+                # spec 022: burst 中は tier1 (0xE7 瞬時電力) 固定で 5s 周期。
+                # normal_cycle_count は進めず、 burst 終了時に既存 tier
+                # rotation を妨げない (cycle counter 連続性保持)。
+                cycle_epcs = TIER1_EPCS
+                last_normal_poll_start = last_poll_start
             else:
                 # spec 011 C: tier rotation. Smaller per-cycle payload =
                 # faster meter response + less data starvation on the
@@ -3524,9 +3816,10 @@ def main():
                 normal_cycle_count += 1
                 last_normal_poll_start = last_poll_start
             # In probe mode, schedule the next cycle at the tight probe
-            # interval; the normal mixed-in cycle uses the same interval so
-            # we don't oversleep into the next probe slot.
-            cycle_interval = probe_state.interval_sec if probing else poll_interval
+            # interval; otherwise spec 022 _eff_interval drives the gap
+            # (burst → burst_interval, catch-up → catchup_interval, off →
+            # base poll_interval).
+            cycle_interval = probe_state.interval_sec if probing else _eff_interval
             orig_led = led_read()
             led_rgb(0, 0, 255)
             try:
@@ -3639,8 +3932,12 @@ def main():
             # fire it when its deadline has passed AND we're not in probe
             # mode (probe mode wants tight RTT samples and a 12 s gap
             # would distort the sparkline). Failure is non-fatal.
+            # spec 022 (dig 決定 E): also skip while burst is active — the
+            # 12 s scan would shatter the 5 s realtime cadence. catch-up
+            # itself is short enough (~20 s) to tolerate one EEDSCAN.
             if (cfg.get("eedscan_enabled", True)
                     and not probing
+                    and _rt_mode != "burst"
                     and eedscan_state.should_run(time.time())):
                 try:
                     _run_eedscan_sweep(fd, eedscan_state, diag_state)
