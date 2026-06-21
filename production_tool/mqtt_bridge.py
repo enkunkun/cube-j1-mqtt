@@ -2297,7 +2297,7 @@ def build_el_get(tid, epcs):
 def extract_el_tid(payload):
     """Return the big-endian TID from an ECHONET Lite payload, or None.
 
-    spec 012: used to reject ERXUDP frames whose TID doesn't match the one
+    spec 014: used to reject ERXUDP frames whose TID doesn't match the one
     we just sent. Payload bytes 2-3 are the TID (after EHD1/EHD2 at 0-1).
     Returns None for payloads shorter than 4 bytes; the caller treats that
     as a mismatch and discards the frame.
@@ -2453,15 +2453,25 @@ def _run_eedscan_sweep(fd, eedscan_state, diag_state):
 # requires the meter to take a fresh measurement).
 PROBE_EPCS = [0x80]
 
-def read_erxudp(fd, timeout=15, diag_state=None):
+def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
+                readline=None):
     """Wait for ERXUDP and return payload as bytearray, or None.
 
     When *diag_state* is supplied, EVENT/FAIL lines observed before the
     ERXUDP are dispatched into Wi-SUN health counters (spec 006).
+
+    spec 014: when *expected_tid* is given, frames whose ECHONET Lite TID
+    does not match are discarded (the bridge keeps waiting). This prevents
+    a delayed reply from the previous cycle (or a stale frame after a
+    Wi-SUN re-join) being mistaken for the response to the current
+    request. *readline* is the line-reader callable, defaulting to the
+    module-level `serial_readline`; tests inject a fake.
     """
+    if readline is None:
+        readline = serial_readline
     deadline = time.time() + timeout
     while time.time() < deadline:
-        line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
+        line = readline(fd, timeout=max(0.5, deadline - time.time()))
         if line is None:
             continue
         classified = classify_sk_line(line)
@@ -2491,9 +2501,28 @@ def read_erxudp(fd, timeout=15, diag_state=None):
             if not value.startswith("1081"):
                 continue
             try:
-                return bytearray(binascii.unhexlify(value))
+                payload = bytearray(binascii.unhexlify(value))
             except Exception as e:
                 log("ERXUDP hex decode error: {}".format(e))
+                continue
+            if expected_tid is not None:
+                got_tid = extract_el_tid(payload)
+                if got_tid != expected_tid:
+                    if diag_state is not None:
+                        try:
+                            diag_state.on_erxudp_tid_mismatch()
+                        except Exception as e:
+                            log("diag on_erxudp_tid_mismatch error: {}"
+                                .format(e))
+                    if got_tid is None:
+                        log("WARN: ERXUDP payload too short ({} bytes), "
+                            "discarding".format(len(payload)))
+                    else:
+                        log("WARN: ERXUDP TID mismatch expected={:04X} "
+                            "got={:04X}, discarding".format(
+                                expected_tid, got_tid))
+                    continue
+            return payload
     return None
 
 # ---------------------------------------------------------------------------
@@ -3173,11 +3202,16 @@ def main():
                 _erxudp_timeout = int(cfg.get("erxudp_timeout_sec", 30))
                 _max_retries = int(cfg.get("erxudp_intra_cycle_retries", 2))
                 _backoff = float(cfg.get("erxudp_retry_backoff_sec", 2))
-                send_el_get(fd, ipv6, tid, epc_list=cycle_epcs)
+                # spec 014: capture the TID actually sent so read_erxudp can
+                # discard frames whose TID doesn't match (delayed reply from
+                # the previous cycle or a stale frame after Wi-SUN re-join).
+                sent_tid = tid
+                send_el_get(fd, ipv6, sent_tid, epc_list=cycle_epcs)
                 tid = (tid + 1) & 0xFFFF
                 t_send = time.time()
                 data = read_erxudp(fd, timeout=_erxudp_timeout,
-                                   diag_state=diag_state)
+                                   diag_state=diag_state,
+                                   expected_tid=sent_tid)
                 attempt = 0
                 while data is None and should_retry_in_cycle(attempt, _max_retries):
                     try:
@@ -3185,11 +3219,13 @@ def main():
                     except Exception as e:
                         log("diag on_erxudp_intra_cycle_retry error: {}".format(e))
                     time.sleep(_backoff)
-                    send_el_get(fd, ipv6, tid, epc_list=cycle_epcs)
+                    sent_tid = tid
+                    send_el_get(fd, ipv6, sent_tid, epc_list=cycle_epcs)
                     tid = (tid + 1) & 0xFFFF
                     t_send = time.time()
                     data = read_erxudp(fd, timeout=_erxudp_timeout,
-                                       diag_state=diag_state)
+                                       diag_state=diag_state,
+                                       expected_tid=sent_tid)
                     attempt += 1
                 if data is not None and attempt > 0:
                     try:
