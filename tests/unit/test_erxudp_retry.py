@@ -13,9 +13,12 @@ def test_apply_defaults_erxudp_timeout_sec_default_30():
     assert cfg["erxudp_timeout_sec"] == 30
 
 
-def test_apply_defaults_intra_cycle_retries_default_2():
+def test_apply_defaults_intra_cycle_retries_default_1():
+    """spec 011 follow-up: 34h field data showed recovery rate 3% only and
+    the meter started replying late (TID mismatch), so we drop the default
+    from 2 to 1 to ease pressure on the meter's ECHONET queue."""
     cfg = mb.apply_defaults({})
-    assert cfg["erxudp_intra_cycle_retries"] == 2
+    assert cfg["erxudp_intra_cycle_retries"] == 1
 
 
 def test_apply_defaults_retry_backoff_sec_default_2():

@@ -133,10 +133,13 @@ def apply_defaults(cfg):
     out.setdefault("eedscan_enabled", True)
     # spec 012: shorten EEDSCAN interval so noise judgements stay fresh.
     out.setdefault("eedscan_interval_sec", 120)
-    # spec 011: ERXUDP resilience. timeout 30s + 2 intra-cycle retries
-    # with 2s backoff covers the p95 5s tail and the rare 10-20s outliers.
+    # spec 011: ERXUDP resilience. timeout 30s + 2s backoff covers the p95
+    # 5s tail and the rare 10-20s outliers. Retries cut from 2 to 1 after
+    # 34h of telemetry showed recovery rate of just 3% (23/745) while TID
+    # mismatches (delayed replies stacking up in the meter's ECHONET queue)
+    # confirmed the meter was getting overwhelmed.
     out.setdefault("erxudp_timeout_sec", 30)
-    out.setdefault("erxudp_intra_cycle_retries", 2)
+    out.setdefault("erxudp_intra_cycle_retries", 1)
     out.setdefault("erxudp_retry_backoff_sec", 2)
     # spec 012: noise-adaptive poll skip — skip normal poll when the last
     # EEDSCAN shows the PAN channel is noisy (>= threshold). Avoids the
