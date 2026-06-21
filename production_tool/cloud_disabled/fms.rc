@@ -1,0 +1,5 @@
+service fms /usr/sbin/fms
+    class late_start
+    disabled
+    group root system readproc
+    seclabel u:r:shell:s0

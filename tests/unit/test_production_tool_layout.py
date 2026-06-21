@@ -18,6 +18,11 @@ EXPECTED_FILES = {
     "production_tool",       # Android shell launcher script
     "wisund_disabled.rc",
     "wpa_supplicant.conf",
+    # spec 015: redirect tlsdated to a public HTTPS host (NextDrive
+    # default is decommissioned). cloud_disabled/ subdirectory holds
+    # the 7 NextDrive cloud daemon .rc replacements and is ignored by
+    # this test (subdirectories are not enumerated as files).
+    "tlsdated_timesync.rc",
 }
 
 

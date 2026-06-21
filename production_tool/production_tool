@@ -33,12 +33,52 @@ cp $PT/wisund_disabled.rc /system/etc/init/wisund.rc
 # disable ndeclite_agent (depends on wisund socket, not needed)
 cp $PT/ndeclite_disabled.rc /system/etc/init/ndeclite_agent.rc
 
+# spec 015: disable NextDrive cloud daemons (NDCloudDaemon/fms/.../transman).
+# Their cloud endpoints are decommissioned, so they were just generating
+# DNS-resolution storms and CPU jitter in the background. Each replaced
+# .rc has `disabled` added; on-property restart/stop handlers are removed
+# for safety against Android init's `restart <disabled>` behaviour.
+if [ "${DISABLE_CLOUD:-1}" = "1" ]; then
+    for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
+        if [ -f "$PT/cloud_disabled/${d}.rc" ]; then
+            cp "$PT/cloud_disabled/${d}.rc" "/system/etc/init/${d}.rc"
+        fi
+    done
+fi
+
+# spec 015: repoint tlsdate to a public HTTPS host. The default host
+# points at NextDrive infrastructure that is no longer reachable, so
+# the daemon could not sync the clock anymore. www.google.com is
+# broadly reachable and the local /etc/ssl/certs bundle includes the
+# necessary root CAs.
+if [ "${REPOINT_TLSDATE:-1}" = "1" ]; then
+    if [ -f "$PT/tlsdated_timesync.rc" ]; then
+        cp "$PT/tlsdated_timesync.rc" /system/etc/init/tlsdated.rc
+    fi
+fi
+
 # install our MQTT bridge as an init service (auto-start on next boot)
 cp $PT/mqtt_ha_bridge.rc /system/etc/init/mqtt_ha_bridge.rc
 
 # ── Stop conflicting services immediately ──────────────────────────────────────
 stop wisund
 stop NDEcLiteAgent
+
+# spec 015: stop cloud daemons immediately. They will stay stopped after
+# reboot via the `disabled` keyword in the replaced .rc files above.
+if [ "${DISABLE_CLOUD:-1}" = "1" ]; then
+    for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
+        stop "$d" 2>/dev/null || true
+    done
+fi
+
+# spec 015: restart tlsdated so the new -H www.google.com argument
+# takes effect without waiting for a reboot.
+if [ "${REPOINT_TLSDATE:-1}" = "1" ]; then
+    stop tlsdated 2>/dev/null || true
+    sleep 1
+    start tlsdated
+fi
 sleep 2
 
 # ── Start MQTT bridge immediately via init (survives USB removal and reboot) ───

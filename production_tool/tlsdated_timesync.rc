@@ -1,0 +1,12 @@
+# Init file for starting tlsdated on Android. spec 015: repointed to
+# www.google.com so the daemon keeps working after the NextDrive cloud
+# (the original default host) was decommissioned.
+
+on post-fs-data
+    mkdir /data/misc/tlsdated 0755 root system
+
+service tlsdated /usr/sbin/tlsdated -v -a 3600 -c /data/misc/tlsdated -G dbus,inet -- /usr/sbin/tlsdate -H www.google.com -C /etc/ssl/certs -l -v
+    class late_start
+    user root
+    group system
+    seclabel u:r:shell:s0

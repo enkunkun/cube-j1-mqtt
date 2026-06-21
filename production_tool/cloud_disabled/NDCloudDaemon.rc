@@ -1,0 +1,5 @@
+service NDCloudDaemon /usr/sbin/NDCloudDaemon
+    class late_start
+    disabled
+    group root system readproc
+    seclabel u:r:shell:s0

@@ -1,195 +1,174 @@
-# Plan: spec 019 Wi-Fi AP Toggle State Persistence
+# Plan: spec 015 NextDrive Cloud Daemon Quiesce + tlsdate Repoint
 
 ## Context
 
-spec 008 で admin UI から Wi-Fi AP (P2P GO mode) を enable/disable できるが、 状態は `getprop net.wifi.ap.state` のみに乗っていて **bridge / Cube J1 を reboot すると OS デフォルトに戻る**。 ユーザが「AP OFF」にしても電源を抜き差ししたら ON に復帰する。
+Cube J1 上で NextDrive クラウド連携の 7 デーモン (`NDCloudDaemon` / `fms` / `fmssecman` / `iijschedule` / `rds` / `sessiond` / `transman`) が `running` 状態で稼働し続けている (実機 ps 確認済)。 NextDrive クラウドはサービス終了済 → 到達不能 host への DNS query を継続的に撃っている可能性大、 spec 010 で観測している EEDSCAN ch57 ノイズ bimodal の **間接寄与源** の可能性もある。
 
-hals5412 fork `9b327a3` は「常時 OFF 固定」だが当方は spec 008 のトグル機能を維持したいので、 **「toggle した状態を /data/local/cube_j1_ap_state に保存」 + 「bridge 起動時に読んで復元」** の設計で永続化する。
+加えて `tlsdated.rc` も実機に存在し NextDrive の同期 host (引数なしのデフォルト) を使っている。 hals5412 fork `9477ec3` + `3b97f5e` の発想を取り込み、 **クラウドデーモン 7 つを永続的に disabled 化** + **tlsdate を公開 host に向け直し** をインストーラに追加する。
+
+実装は Python ではなく **shell + Android init `.rc` 中心** (TDD スキップ可、 spec 013/014/016/019 の Python TDD パターンとは性質が違う)。
 
 ## Approach
 
-- 新クラス `ApStateStore` (path + opener inject 可能) で 1 行プレーンテキスト read/write
-- `ApController` に `state_store=None` 引数追加。 enable()/disable() 成功後に store.write
-- bridge `main()` の publish_ha_discovery / `mark_initial_discovery_publish` の **直後** に restore 呼び出し (kill switch あり)
-- config: `ap_state_file_path` (default `/data/local/cube_j1_ap_state`), `ap_state_persist_enabled` (default `True`)
-- main() で ApController を 1 つ作って `start_admin_server(... ap_controller=...)` に渡す → admin handler と同じ ApController を共有し、 toggle/restore が同じ state_store を見る整合性
+- `production_tool/cloud_disabled/` ディレクトリ新設、 7 デーモン分の `.rc` 配置 (実機 original に `disabled` keyword を 1 行足したもの)
+- `production_tool/tlsdated_timesync.rc` 新設 (tlsdate コマンド引数に `-H www.google.com` を渡す形に置換)
+- `production_tool/production_tool` インストーラを拡張 (既存 wisund/NDEcLiteAgent 無効化と同じ idiom):
+  - 環境変数 `DISABLE_CLOUD=1` (default 1) のとき 7 .rc を `/system/etc/init/` にコピー + stop
+  - 環境変数 `REPOINT_TLSDATE=1` (default 1) のとき tlsdated_timesync.rc を `/system/etc/init/tlsdated.rc` にコピー
+  - 失敗時の rollback は scope 外 (既存インストーラも rollback なし、 一貫性維持)
+- README に新環境変数を 1 節追記
 
-### Round 1 決定の反映 (重要)
+## Files
 
-1. **kill switch 完全 OFF**: `ap_state_persist_enabled=false` のとき、 restore はもちろん **write も skip**。 実装: main() で `state_store = ApStateStore(path) if cfg["ap_state_persist_enabled"] else None` とし、 ApController/admin handler に渡る state_store がそもそも None
-2. **DiagState counter 不要**: 起動時 1 回しか動かないので Grafana 価値薄、 ログ `AP restored: enabled` で十分。 spec.md からも該当項目 (Key Entities + SC) を削除する
-3. **`_FakeOpener` 設計**: dict ベース (`{path: bytes}`、 欠落 → IOError)、 context manager 風の closure ヘルパーで wrap
-4. **restore タイミング**: `mark_initial_discovery_publish` 直後 → discovery 発行が安定した状態で AP 復元 → 失敗してもログだけで serial open へ進める
+### `production_tool/cloud_disabled/` (新規ディレクトリ、 7 ファイル)
 
-## Files to modify
-
-### `production_tool/mqtt_bridge.py`
-
-1. **`ApStateStore` クラス** (line 1571 直後、 ApController の隣):
-   ```python
-   class ApStateStore(object):
-       """spec 019: persist desired AP toggle state across reboots.
-
-       1-line plain text file containing "enabled" or "disabled".
-       Missing / malformed / unreadable → read() returns None; caller
-       leaves OS default alone. `opener` is injectable for tests."""
-       VALID_STATES = ("enabled", "disabled")
-
-       def __init__(self, path, opener=None):
-           self._path = path
-           self._opener = opener or open
-
-       def read(self):
-           try:
-               with self._opener(self._path, "rb") as f:
-                   raw = f.read().decode("ascii", errors="replace").strip()
-           except IOError:
-               return None
-           if raw in self.VALID_STATES:
-               return raw
-           if raw:
-               log("WARN: ApStateStore invalid value {!r} in {}".format(
-                   raw, self._path))
-           return None
-
-       def write(self, state):
-           if state not in self.VALID_STATES:
-               raise ValueError("state must be one of {}".format(
-                   self.VALID_STATES))
-           AtomicWriter.write_bytes(self._path, state.encode("ascii"))
-   ```
-   (Atomic write 経由 で partial-write 事故を防ぐ)
-
-2. **`ApController.__init__` 拡張**:
-   ```python
-   def __init__(self, interface=None, runner=None, state_store=None):
-       self._interface = interface
-       self._runner = runner or _default_subprocess_runner
-       self._state_store = state_store
-   ```
-
-3. **`ApController.enable()` / `disable()` 拡張**:
-   ```python
-   def disable(self):
-       iface = self._resolve_interface()
-       self._runner(build_wpa_cli_cmd(iface, "disable"), timeout=5)
-       if self._state_store is not None:
-           try:
-               self._state_store.write("disabled")
-           except Exception as e:
-               log("ERROR: ApStateStore write failed: {}".format(e))
-       return self.get()
-   ```
-   enable() 側も同様 (write("enabled"))。
-
-4. **`apply_defaults`** (line 153 付近、 spec 013 poll_interval ブロック直後):
-   ```python
-   # spec 019: persist Wi-Fi AP toggle state across reboots.
-   out.setdefault("ap_state_file_path", "/data/local/cube_j1_ap_state")
-   out.setdefault("ap_state_persist_enabled", True)
-   ```
-
-5. **admin handler の wire-up** (line 1243 `AdminHandler.ap_controller = ap_controller or ApController()`): ApController は class-level singleton で、 main() から `start_admin_server(... ap_controller=...)` 経由で渡せる。 main() で 1 つ生成して渡すよう改修 (admin handler 側のコードは現状維持で OK)。 main() の改修:
-   ```python
-   _ap_store = (ApStateStore(cfg.get("ap_state_file_path",
-                "/data/local/cube_j1_ap_state"))
-                if cfg.get("ap_state_persist_enabled", True) else None)
-   _ap_controller = ApController(state_store=_ap_store)
-   # ...
-   start_admin_server(... ap_controller=_ap_controller, ...)
-   ```
-
-6. **bridge `main()` 起動時の restore** (line 3173 `mark_initial_discovery_publish` の **直後**、 serial open の前):
-   ```python
-   # spec 019: restore Wi-Fi AP toggle state from last session.
-   # _ap_store is None when persist is disabled → apply_ap_state_restore
-   # naturally short-circuits via stored_state=None.
-   if _ap_store is not None:
-       try:
-           result = apply_ap_state_restore(_ap_store.read(), _ap_controller)
-           if result is not None:
-               log("AP restored: {}".format(result))
-       except Exception as e:
-           log("WARN: AP state restore failed: {}".format(e))
-   ```
-   注: `_ap_store` と `_ap_controller` は admin handler 用に既に生成済 (上の #5)、 同じインスタンスを再利用。
-
-### `tests/unit/test_ap_state_store.py` (新規)
-
-`_FakeRunner` パターンを踏襲、 fixture 不使用。 (dig Round 2 決定 7)
-
-- **read 系テスト** (`_FakeOpener` で in-memory file 模倣、 dict ベース `{path: bytes}`、 欠落 → IOError):
-  - `test_read_returns_none_when_file_missing`
-  - `test_read_returns_none_when_file_empty`
-  - `test_read_returns_none_when_file_invalid_value`
-  - `test_read_strips_whitespace_and_newline`
-- **write 系テスト** (`tempfile.mkstemp` で実 file system に書ける path を作って AtomicWriter 経由の write を実行、 既存 `test_admin_atomic_write.py` の先例を踏襲):
-  - `test_write_then_read_round_trip_enabled`
-  - `test_write_then_read_round_trip_disabled`
-  - `test_write_rejects_invalid_value` (ValueError、 file system 触れず raise 確認のみ)
-
-### `tests/unit/test_ap_controller.py` (拡張)
-
-既存 15 tests に追加:
-
-- `test_enable_writes_enabled_to_state_store_when_provided`
-- `test_disable_writes_disabled_to_state_store_when_provided`
-- `test_state_store_write_failure_does_not_break_toggle` (defensive)
-- `test_ap_controller_without_state_store_still_works` (既存挙動互換)
-
-### 起動時 restore のテスト
-
-main() の restore ロジックは pure に出しづらい (config + ApController + ApStateStore の wire-up)。 unit test には pure helper `apply_ap_state_restore(stored, ap_controller)` を抽出して、 そちらをテスト:
-- `test_apply_ap_state_restore_calls_enable_when_stored_enabled`
-- `test_apply_ap_state_restore_calls_disable_when_stored_disabled`
-- `test_apply_ap_state_restore_noop_when_none`
-
-main() 内では `apply_ap_state_restore(store.read(), ApController(state_store=store))` を call。
-
-## Pure helper
-
-```python
-def apply_ap_state_restore(stored_state, ap_controller):
-    """spec 019: dispatch restore based on previously stored state."""
-    if stored_state == "enabled":
-        ap_controller.enable()
-        return "enabled"
-    if stored_state == "disabled":
-        ap_controller.disable()
-        return "disabled"
-    return None  # leave OS default alone
+各ファイルは実機の original .rc に **`    disabled`** を `class late_start` の次行に追加したもの。 例 `cloud_disabled/sessiond.rc`:
+```
+service sessiond /usr/sbin/sessiond
+    class late_start
+    disabled
+    group root system readproc
+    seclabel u:r:shell:s0
 ```
 
-## Test list (TDD 順)
+7 ファイル: `NDCloudDaemon.rc`, `fms.rc`, `fmssecman.rc`, `iijschedule.rc`, `rds.rc`, `sessiond.rc`, `transman.rc`
 
-1. **Red**: `test_write_then_read_round_trip_enabled` → ApStateStore 未実装で AttributeError
-2. (stub: ApStateStore class with empty body)
-3. **Red**: `test_write_rejects_invalid_value` (ValueError)
-4. **Red**: `test_read_returns_none_when_file_missing`
-5. **Red**: `test_read_returns_none_when_file_empty`
-6. **Red**: `test_read_returns_none_when_file_invalid_value`
-7. **Red**: `test_read_strips_whitespace_and_newline`
-8. **Red**: `test_write_then_read_round_trip_disabled`
-9. **Red**: `test_apply_ap_state_restore_calls_enable_when_stored_enabled` (pure helper)
-10. **Red**: `test_apply_ap_state_restore_calls_disable_when_stored_disabled`
-11. **Red**: `test_apply_ap_state_restore_noop_when_none`
-12. **Red**: `test_enable_writes_enabled_to_state_store_when_provided` (ApController)
-13. **Red**: `test_disable_writes_disabled_to_state_store_when_provided`
-14. **Red**: `test_state_store_write_failure_does_not_break_toggle`
-15. **Red**: `test_ap_controller_without_state_store_still_works` (互換)
-16. main() restore integration はテストせず (config + wire-up、 実機検証)
+**dig Round 1 決定 2: `on property:` ハンドラブロックは削除する**。 理由: Android init の `restart <disabled-service>` 挙動が実装依存で disabled を上書きで起動する可能性をゼロにできない、 安全側で完全除去。
+
+実機確認で `on property:` ブロックを持つのは **NDCloudDaemon.rc と fms.rc の 2 ファイルだけ** (dig Round 2 決定 6)。 残り 5 ファイルは service 定義のみで handler 無し、 そのまま `disabled` 追加で済む。
+- NDCloudDaemon.rc: 元 `on property:persist.cloud.connection.delay=* → restart NDCloudDaemon` と `on property:persist.cloud.fms.new=* → stop NDCloudDaemon` 両方削除
+- fms.rc: 元 `on property:persist.cloud.connection.delay=* → restart fms` 削除
+
+### `production_tool/tlsdated_timesync.rc` (新規)
+
+実機 original を base に、 tlsdate コマンドに `-H www.google.com` を追加:
+```
+# Init file for starting tlsdated on Android. spec 015: repointed to
+# www.google.com since the NextDrive default host is no longer reachable.
+
+on post-fs-data
+    mkdir /data/misc/tlsdated 0755 root system
+
+service tlsdated /usr/sbin/tlsdated -v -a 3600 -c /data/misc/tlsdated -G dbus,inet -- /usr/sbin/tlsdate -H www.google.com -C /etc/ssl/certs -l -v
+    class late_start
+    user root
+    group system
+    seclabel u:r:shell:s0
+```
+
+### `production_tool/production_tool` (拡張)
+
+既存の `# disable wisund` ブロックの下に追加:
+```sh
+# ── spec 015: disable NextDrive cloud daemons ─────────────────────────────────
+if [ "${DISABLE_CLOUD:-1}" = "1" ]; then
+    for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
+        if [ -f "$PT/cloud_disabled/${d}.rc" ]; then
+            cp "$PT/cloud_disabled/${d}.rc" "/system/etc/init/${d}.rc"
+        fi
+    done
+fi
+
+# ── spec 015: repoint tlsdate to a public HTTPS host ─────────────────────────
+if [ "${REPOINT_TLSDATE:-1}" = "1" ]; then
+    if [ -f "$PT/tlsdated_timesync.rc" ]; then
+        cp "$PT/tlsdated_timesync.rc" /system/etc/init/tlsdated.rc
+    fi
+fi
+```
+
+既存の `stop wisund` ブロックの下に追加 (即時停止):
+```sh
+# spec 015: stop cloud daemons immediately (will stay stopped after reboot
+# via the disabled keyword in the replaced .rc files).
+if [ "${DISABLE_CLOUD:-1}" = "1" ]; then
+    for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
+        stop "$d" 2>/dev/null || true
+    done
+fi
+```
+
+注: 既存スクリプトに rollback はない。 `cp` 失敗 = init service が見つからない致命的状態だが、 USB media 経由 install なので運用上で発生しない前提 (既存 wisund/NDEcLiteAgent と同等)。
+
+### `readme.md` (1 節追記)
+
+「インストール環境変数」セクションに 2 行追加:
+- `DISABLE_CLOUD=0`: NextDrive クラウドデーモン無効化を skip (default `1`)
+- `REPOINT_TLSDATE=0`: tlsdate 同期先付け替えを skip (default `1`)
+
+## Pure helper / tests
+
+なし。 shell script + .rc 静的ファイルなので Python unit test 対象外 (CLAUDE.md `/tdd` skill: 「リファクタリング・設定/CI/CD はスキップ可」)。
 
 ## Verification
 
-1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 (334) + 新規 ~14 = ~348 件 pass
-2. ruff check 新規エラー無し
-3. lab-ub01 経由 deploy で `/data/local/mqtt_bridge.py` 更新
-4. 実機で admin UI から AP OFF クリック → `/data/local/cube_j1_ap_state` に "disabled" が書かれている (adb shell cat で確認)
-5. Cube J1 reboot → bridge 自動起動 → 起動直後 `getprop net.wifi.ap.state` が disabled (OS default に上書きで restore 効いている)
-6. admin UI で再度 ON クリック → state file が "enabled" に → reboot → ON のまま起動
+1. 実装後 `pytest -q --ignore=tests/benchmark` で **既存 361 件 pass** (回帰なし)
+2. lab-ub01 経由で 8 .rc ファイル + 改修済 `production_tool` インストーラを Cube J1 にコピー (運用上は USB 経由 install だが、 deploy 簡略化のため adb push で対応)
+3. 実機で確認 (lab-ub01 経由 adb shell):
+   - `getprop | grep init.svc.sessiond` → `stopped` (or `disabled`)
+   - 同様に `fms` / `NDCloudDaemon` / etc. すべて `stopped`
+   - `ps | grep -E "(sessiond|fms|NDCloud|rds|iijschedule|transman)"` → 0 件
+   - tlsdate のログで Google 同期成功 (`/data/log/...` あるいは logcat)
+4. **reboot 後** に同様確認 (永続化検証):
+   - `getprop init.svc.<name>` → `stopped` のまま (`disabled` キーワードで起動しない)
+5. 長期効果 (1 週間程度):
+   - Grafana の `eedscan_pan_channel_energy` ヒストグラムを baseline と比較
+   - bimodal うるさい側 (>= 190) の出現割合が baseline から **30% 以上減少** すれば SC-003 達成
+   - 減少しない場合は DNS storm はノイズ寄与源ではなかったと結論、 spec 012 noise-adaptive-skip が正しい対策の証拠
+
+## Deploy 戦略
+
+**dig Round 1 決定 1: 直接 push + syntax check** (フルインストーラ実行は副作用が大きいので不採用)。
+
+具体的手順:
+
+1. **syntax check** (script の最低限担保):
+   ```sh
+   sh -n production_tool/production_tool
+   ```
+   ローカルで実行、 エラー無いことを commit 前に確認。
+
+2. **scp で lab-ub01 に転送**:
+   ```sh
+   ssh lab-ub01 'mkdir -p /tmp/spec015-deploy/cloud_disabled'
+   scp -q production_tool/cloud_disabled/*.rc lab-ub01:/tmp/spec015-deploy/cloud_disabled/
+   scp -q production_tool/tlsdated_timesync.rc lab-ub01:/tmp/spec015-deploy/
+   ```
+
+3. **lab-ub01 から adb で実機の /system/etc/init/ に書き込み** (一部 stop 失敗でも他は続ける、 `|| true` で contain — dig Round 2 決定 5):
+   ```sh
+   ssh lab-ub01 'set -e
+     adb kill-server >/dev/null 2>&1; sleep 1; adb start-server >/dev/null 2>&1
+     adb connect cube-j1.home.arpa:5555 >/dev/null 2>&1; sleep 1
+     adb shell "mount -o rw,remount /"
+     for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
+       adb push /tmp/spec015-deploy/cloud_disabled/${d}.rc /system/etc/init/${d}.rc
+       adb shell "stop $d" || true
+     done
+     adb push /tmp/spec015-deploy/tlsdated_timesync.rc /system/etc/init/tlsdated.rc
+     adb shell "stop tlsdated" || true
+     adb shell "start tlsdated" || true
+     adb disconnect cube-j1.home.arpa:5555 >/dev/null 2>&1'
+   ```
+
+4. **即時確認**:
+   - `getprop init.svc.sessiond` 等 → `stopped`
+   - `ps | grep -E "(sessiond|fms|NDCloud|rds|iijschedule|transman)"` → 0 件
+
+5. **reboot 検証 (永続化確認)**: ユーザ判断で `adb reboot` 実施。 復活待機後 (約 1-2 分)、 同じ確認コマンドで `stopped` が維持されていることを確認。 cube-j1.home.arpa への adb 経路は reboot 後自動復活 (前 spec 014 等で実証済み)。
+
+   reboot は本セッションでは ユーザに伺ってから実施。 mqtt_bridge.py の deploy と違って /system 変更の検証が reboot を要求するため、 これは spec 015 の必須ステップ。
+
+## Commit 戦略
+
+前 3 回踏襲 (spec 014/016/019):
+- 017/018 spec.md を /tmp に stash
+- spec 015 関連 + spec.md + plan + redact-plans 適用で commit
+- 017/018 spec.md を restore して @ に戻す
+- 並行セッションが私の作業を巻き込んでいた場合は `jj edit` で cleanup
 
 ## Commit
 
-`feat(bridge,admin): Wi-Fi AP toggle 状態を /data/local に永続化 (spec 019)`
+`feat(install): NextDrive クラウドデーモン無効化 + tlsdate 公開 host へ向け直し (spec 015)`
 
-spec.md は impl と同 commit に同梱 (spec 013/014/016 と一貫)。 plan ファイル (本ファイル) も同梱。
+8 .rc ファイル + production_tool 改修 + spec.md + plan を 1 commit。
