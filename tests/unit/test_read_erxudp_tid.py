@@ -78,3 +78,58 @@ def test_read_erxudp_expected_tid_mismatch_increments_diag_counter():
     mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
                    expected_tid=0x0011, readline=readline)
     assert diag.erxudp_tid_mismatch_total == 1
+
+
+# ---------------------------------------------------------------------------
+# spec 017: EVENT 24/29 dispatch to on_wisun_pana_fail
+# ---------------------------------------------------------------------------
+
+
+class _FakeDiagState(object):
+    """Records dispatch calls for spec 017 EVENT 24/29 routing tests."""
+
+    def __init__(self):
+        self.sk_event_calls = []
+        self.pana_fail_calls = []
+
+    def on_sk_event(self, value):
+        self.sk_event_calls.append(value)
+
+    def on_wisun_pana_fail(self, value):
+        self.pana_fail_calls.append(value)
+
+    # Stubs for other paths read_erxudp may touch.
+    def on_sk_error(self, value):
+        pass
+
+    def on_erxudp_raw(self, line):
+        pass
+
+    def on_erxudp_tid_mismatch(self):
+        pass
+
+
+def test_read_erxudp_event_24_calls_on_wisun_pana_fail():
+    """spec 017: PANA fail → pending flag via on_wisun_pana_fail, NOT on_sk_event."""
+    fake = _FakeDiagState()
+    readline = _make_readline(["EVENT 24 FE80:0000:0000:0000:0000:0000:0000:0001"])
+    mb.read_erxudp(fd=None, timeout=1, diag_state=fake, readline=readline)
+    assert fake.pana_fail_calls == ["24"]
+    assert fake.sk_event_calls == []
+
+
+def test_read_erxudp_event_29_calls_on_wisun_pana_fail():
+    fake = _FakeDiagState()
+    readline = _make_readline(["EVENT 29 FE80:0000:0000:0000:0000:0000:0000:0001"])
+    mb.read_erxudp(fd=None, timeout=1, diag_state=fake, readline=readline)
+    assert fake.pana_fail_calls == ["29"]
+    assert fake.sk_event_calls == []
+
+
+def test_read_erxudp_event_22_still_calls_on_sk_event():
+    """spec 017 互換: non-PANA EVENT goes through the existing path."""
+    fake = _FakeDiagState()
+    readline = _make_readline(["EVENT 22 FE80:0000:0000:0000:0000:0000:0000:0001"])
+    mb.read_erxudp(fd=None, timeout=1, diag_state=fake, readline=readline)
+    assert fake.sk_event_calls == ["22"]
+    assert fake.pana_fail_calls == []

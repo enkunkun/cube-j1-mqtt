@@ -39,6 +39,10 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 016 discovery counter also baselines at 0; last_ts is None
         # so the snapshot omits it (verified separately).
         "discovery_republish_total": 0,
+        # spec 017 serial reopen counter also baselines at 0
+        # (consecutive_wisun_connect_failures / pending_wisun_rejoin are
+        # internal-only and intentionally not in the snapshot schema).
+        "serial_reopen_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -134,6 +138,43 @@ def test_snapshot_omits_last_discovery_publish_ts_when_none():
     snap = state.snapshot(now=state.start_time)
     assert "last_discovery_publish_ts" not in snap
     assert snap["discovery_republish_total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# spec 017: Wi-SUN rejoin observability
+# ---------------------------------------------------------------------------
+
+
+def test_consecutive_wisun_connect_failures_starts_at_zero():
+    state = make_state()
+    assert state.consecutive_wisun_connect_failures == 0
+
+
+def test_pending_wisun_rejoin_starts_false():
+    state = make_state()
+    assert state.pending_wisun_rejoin is False
+
+
+def test_on_serial_reopen_increments_counter():
+    state = make_state()
+    state.on_serial_reopen()
+    state.on_serial_reopen()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["serial_reopen_total"] == 2
+
+
+def test_on_wisun_pana_fail_sets_pending_flag_and_increments_sk_event_counter():
+    state = make_state()
+    state.on_wisun_pana_fail("24")
+    assert state.pending_wisun_rejoin is True
+    # on_sk_event "24" should also bump the SK EVENT counter for 24
+    assert state.sk_event_counts.get("24") == 1
+
+
+def test_snapshot_includes_serial_reopen_total_at_zero():
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["serial_reopen_total"] == 0
 
 
 def test_counters_are_monotonically_non_decreasing():

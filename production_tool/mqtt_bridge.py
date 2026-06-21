@@ -162,6 +162,13 @@ def apply_defaults(cfg):
     # startup) and write (on toggle) — a clean kill switch.
     out.setdefault("ap_state_file_path", "/data/local/cube_j1_ap_state")
     out.setdefault("ap_state_persist_enabled", True)
+    # spec 017: Wi-SUN rejoin exponential backoff + serial port reopen
+    # after N consecutive wisun_connect failures, recovering from long
+    # outages without hammering the meter every 30s.
+    out.setdefault("wisun_rejoin_backoff_initial_sec", 30)
+    out.setdefault("wisun_rejoin_backoff_max_sec", 300)
+    out.setdefault("wisun_rejoin_backoff_multiplier", 2.0)
+    out.setdefault("wisun_serial_reopen_after_rejoin_failures", 5)
     return out
 
 
@@ -1277,12 +1284,19 @@ def bridge_version():
     return "{}+{}".format(BRIDGE_SEMVER, BRIDGE_GIT_HASH)
 
 
-def should_force_wisun_reconnect(consecutive, threshold):
+def should_force_wisun_reconnect(consecutive, threshold, pending=False):
     """Decide whether to force a Wi-SUN re-join after consecutive ERXUDP timeouts.
 
     `threshold <= 0` opts out of the safety net (legacy behaviour where the
     bridge only reconnects on uncaught exceptions in the main loop).
+
+    spec 017: when *pending* is True (set by EVENT 24/29 PANA failure
+    detection in read_erxudp), this overrides the threshold check and
+    returns True immediately so the bridge can rejoin without waiting
+    for ERXUDP timeouts to accumulate.
     """
+    if pending:
+        return True
     if not isinstance(threshold, int) or threshold <= 0:
         return False
     return consecutive >= threshold
@@ -1470,6 +1484,7 @@ _DIAG_SNAPSHOT_KEYS = (
     "noise_adaptive_skips_total",
     "last_discovery_publish_ts",
     "discovery_republish_total",
+    "serial_reopen_total",
     "uptime_seconds",
     "version",
 )
@@ -1897,6 +1912,10 @@ class DiagState(object):
         self.last_discovery_publish_ts = None
         self.pending_discovery_republish = False
         self.discovery_republish_total = 0
+        # Spec 017: Wi-SUN rejoin observability + EVENT 24/29 trigger.
+        self.serial_reopen_total = 0
+        self.consecutive_wisun_connect_failures = 0
+        self.pending_wisun_rejoin = False
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -1956,6 +1975,18 @@ class DiagState(object):
         self.discovery_republish_total += 1
         self.last_discovery_publish_ts = float(now)
         self.pending_discovery_republish = False
+
+    # Spec 017: Wi-SUN rejoin observability + EVENT 24/29 immediate trigger.
+
+    def on_serial_reopen(self):
+        self.serial_reopen_total += 1
+
+    def on_wisun_pana_fail(self, event_id):
+        """spec 017: PANA fail (EVENT 24/29) — signal force-rejoin to the
+        main loop, also bump the SK event counter (existing observability
+        path so the EVENT id still shows up in /api/diag)."""
+        self.on_sk_event(event_id)
+        self.pending_wisun_rejoin = True
 
     def on_erxudp_tid_mismatch(self, expected=None, got=None):
         self.erxudp_tid_mismatch_total += 1
@@ -2027,6 +2058,7 @@ class DiagState(object):
                 format_iso8601_utc(self.last_discovery_publish_ts)
                 if self.last_discovery_publish_ts is not None else None,
             "discovery_republish_total": self.discovery_republish_total,
+            "serial_reopen_total": self.serial_reopen_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2419,6 +2451,18 @@ def should_republish_discovery(now, last_publish_ts, pending, interval_sec):
     return (now - last_publish_ts) >= interval_sec
 
 
+def compute_rejoin_backoff(attempt, initial_sec, multiplier, max_sec):
+    """spec 017: exponential backoff for wisun_connect retries.
+
+    attempt 0 → initial, 1 → initial*mult, ..., clamped at max_sec.
+    Negative attempt is treated as 0. multiplier <= 1 → linear at initial.
+    initial >= max → always max.
+    """
+    a = max(0, int(attempt))
+    backoff = float(initial_sec) * (float(multiplier) ** a)
+    return int(min(backoff, float(max_sec)))
+
+
 def build_el_get(tid, epcs):
     frame = bytearray()
     frame += b"\x10\x81"                     # EHD1, EHD2
@@ -2631,7 +2675,16 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
         if kind == "event":
             if diag_state is not None:
                 try:
-                    diag_state.on_sk_event(value)
+                    # spec 017: EVENT 24 (PANA authentication failure) and
+                    # EVENT 29 (PANA expired) are routed to on_wisun_pana_fail
+                    # which sets pending_wisun_rejoin so the main loop can
+                    # trigger a rejoin without waiting for ERXUDP timeouts.
+                    # on_wisun_pana_fail itself also bumps the SK event
+                    # counter (it delegates to on_sk_event internally).
+                    if value in ("24", "29"):
+                        diag_state.on_wisun_pana_fail(value)
+                    else:
+                        diag_state.on_sk_event(value)
                 except Exception as e:
                     log("diag on_sk_event error: {}".format(e))
             continue
@@ -3455,13 +3508,21 @@ def main():
                     # Safety net: if the meter has stopped replying while the
                     # Wi-SUN session still looks alive, bail out of the main
                     # loop so the outer except runs wisun_connect again.
+                    # spec 017: pending_wisun_rejoin (set by EVENT 24/29)
+                    # overrides the threshold for immediate rejoin. Signal
+                    # is consumed (cleared) right before raise; if reconnect
+                    # fails the next EVENT 24/29 will re-set the flag.
                     if should_force_wisun_reconnect(
                         diag_state.consecutive_erxudp_timeouts,
                         int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
+                        pending=diag_state.pending_wisun_rejoin,
                     ):
+                        _was_pending = diag_state.pending_wisun_rejoin
+                        diag_state.pending_wisun_rejoin = False
                         raise RuntimeError(
-                            "erxudp timeout {} times in a row, forcing wisun reconnect"
-                            .format(diag_state.consecutive_erxudp_timeouts))
+                            "wisun reconnect forced: consecutive_erxudp_timeouts={}, "
+                            "pending={}".format(
+                                diag_state.consecutive_erxudp_timeouts, _was_pending))
                 # Publish diag snapshot once per poll cycle (FR-004).
                 # best-effort: never let diag failure block the measurement
                 # path (Constitution IV / FR-005).
@@ -3503,17 +3564,43 @@ def main():
             time.sleep(compute_next_poll_sleep(last_poll_start, time.time(), cycle_interval))
 
         except Exception as e:
-            log("Main loop error: {} - reconnecting Wi-SUN in 30s".format(e))
-            time.sleep(30)
+            # spec 017: exponential backoff for repeated wisun_connect failures
+            # (30 → 60 → 120 → 240 → 300 clamp by default), plus serial port
+            # reopen after N consecutive failures so a BP35CX UART hang can
+            # also recover.
+            attempt = diag_state.consecutive_wisun_connect_failures
+            _backoff = compute_rejoin_backoff(
+                attempt,
+                int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
+                float(cfg.get("wisun_rejoin_backoff_multiplier", 2.0)),
+                int(cfg.get("wisun_rejoin_backoff_max_sec", 300)))
+            log("Main loop error (attempt {}): {} - reconnecting Wi-SUN in {}s"
+                .format(attempt + 1, e, _backoff))
+            time.sleep(_backoff)
+            _reopen_after = int(cfg.get(
+                "wisun_serial_reopen_after_rejoin_failures", 5))
+            if _reopen_after > 0 and attempt + 1 >= _reopen_after:
+                try:
+                    os.close(fd)
+                    fd = open_serial(serial_port)
+                    diag_state.on_serial_reopen()
+                    log("Serial port reopened after {} failures".format(
+                        attempt + 1))
+                except Exception as re:
+                    log("WARN: serial reopen failed (continuing with original fd): {}"
+                        .format(re))
             try:
                 ipv6 = wisun_connect(fd, br_id, br_pwd, diag_state=diag_state)
                 log("Wi-SUN reconnected at {}".format(ipv6))
+                diag_state.consecutive_wisun_connect_failures = 0
                 try:
                     diag_state.on_wisun_reconnect()
                 except Exception as e3:
                     log("diag on_wisun_reconnect error: {}".format(e3))
             except Exception as e2:
-                log("Wi-SUN reconnect failed: {}".format(e2))
+                diag_state.consecutive_wisun_connect_failures += 1
+                log("Wi-SUN reconnect failed (will retry next cycle): {}"
+                    .format(e2))
 
 
 if __name__ == "__main__":

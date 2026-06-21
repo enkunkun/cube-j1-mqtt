@@ -1,174 +1,246 @@
-# Plan: spec 015 NextDrive Cloud Daemon Quiesce + tlsdate Repoint
+# Plan: spec 017 Wi-SUN Rejoin Exponential Backoff + Serial Reopen + EVENT 24/29 Trigger
 
 ## Context
 
-Cube J1 上で NextDrive クラウド連携の 7 デーモン (`NDCloudDaemon` / `fms` / `fmssecman` / `iijschedule` / `rds` / `sessiond` / `transman`) が `running` 状態で稼働し続けている (実機 ps 確認済)。 NextDrive クラウドはサービス終了済 → 到達不能 host への DNS query を継続的に撃っている可能性大、 spec 010 で観測している EEDSCAN ch57 ノイズ bimodal の **間接寄与源** の可能性もある。
+spec 011 (`erxudp_timeout_force_reconnect_threshold = 5`) で「連続 ERXUDP timeout 5 回で wisun_connect やり直し」までは実装済。 ただし再接続の中身は **固定 30 秒 sleep** (`production_tool/mqtt_bridge.py:3506`) で、 長時間障害シナリオで以下が課題:
 
-加えて `tlsdated.rc` も実機に存在し NextDrive の同期 host (引数なしのデフォルト) を使っている。 hals5412 fork `9477ec3` + `3b97f5e` の発想を取り込み、 **クラウドデーモン 7 つを永続的に disabled 化** + **tlsdate を公開 host に向け直し** をインストーラに追加する。
+1. **指数 backoff なし** — 30 秒で永遠リトライ、 メーターに無駄な SKJOIN 負荷
+2. **シリアル port reopen なし** — BP35CX 側 UART ハングから永遠に復帰しない
+3. **EVENT 24/29 (PANA 失敗) 即時トリガなし** — timeout 待ちの 30+ 秒を浪費
 
-実装は Python ではなく **shell + Android init `.rc` 中心** (TDD スキップ可、 spec 013/014/016/019 の Python TDD パターンとは性質が違う)。
+hals5412 fork `2779679` (production_tool_v2) の発想 (initial=30 / max=300 / multiplier=2.0、 N=5 で serial reopen、 EVENT 24 即時 trigger) を取り込む。
 
 ## Approach
 
-- `production_tool/cloud_disabled/` ディレクトリ新設、 7 デーモン分の `.rc` 配置 (実機 original に `disabled` keyword を 1 行足したもの)
-- `production_tool/tlsdated_timesync.rc` 新設 (tlsdate コマンド引数に `-H www.google.com` を渡す形に置換)
-- `production_tool/production_tool` インストーラを拡張 (既存 wisund/NDEcLiteAgent 無効化と同じ idiom):
-  - 環境変数 `DISABLE_CLOUD=1` (default 1) のとき 7 .rc を `/system/etc/init/` にコピー + stop
-  - 環境変数 `REPOINT_TLSDATE=1` (default 1) のとき tlsdated_timesync.rc を `/system/etc/init/tlsdated.rc` にコピー
-  - 失敗時の rollback は scope 外 (既存インストーラも rollback なし、 一貫性維持)
-- README に新環境変数を 1 節追記
+- pure helper `compute_rejoin_backoff(attempt, initial, multiplier, max_sec)` を抽出 (testable な核)
+- main loop の外側 except 経路は **既存の soft-retry-loop 構造を維持** (dig Round 1 決定 1): `time.sleep(30)` を `time.sleep(compute_rejoin_backoff(counter, ...))` に置換、 counter は DiagState `consecutive_wisun_connect_failures` で永続化 (1 outer except = 1 try)
+- 連続 N 回失敗で `os.close(fd)` + `open_serial(...)` で UART reopen (失敗時 WARN ログ + 元 fd 保持、 致命的扱いせず)
+- `read_erxudp` に EVENT 24/29 検出を入れ、 DiagState の `pending_wisun_rejoin` flag を立てて即時 rejoin
+- DiagState に `serial_reopen_total` counter (publish) + `consecutive_wisun_connect_failures` counter (内部) + `pending_wisun_rejoin` bool (内部) + 対応メソッド
+- `pending_wisun_rejoin` クリアは **raise 直前** (signal consume パターン、 dig Round 1 決定 2)
+- snapshot 公開は `serial_reopen_total` のみ (dig Round 1 決定 3: minimal schema 維持、 consecutive は transient state で長期観測価値が低い)
 
-## Files
+## Files to modify
 
-### `production_tool/cloud_disabled/` (新規ディレクトリ、 7 ファイル)
+### `production_tool/mqtt_bridge.py`
 
-各ファイルは実機の original .rc に **`    disabled`** を `class late_start` の次行に追加したもの。 例 `cloud_disabled/sessiond.rc`:
-```
-service sessiond /usr/sbin/sessiond
-    class late_start
-    disabled
-    group root system readproc
-    seclabel u:r:shell:s0
-```
+1. **pure helper** (line 2200 付近、 `decide_epc_tier` の隣):
+   ```python
+   def compute_rejoin_backoff(attempt, initial_sec, multiplier, max_sec):
+       """spec 017: exponential backoff for wisun_connect retries.
 
-7 ファイル: `NDCloudDaemon.rc`, `fms.rc`, `fmssecman.rc`, `iijschedule.rc`, `rds.rc`, `sessiond.rc`, `transman.rc`
+       attempt 0 → initial, 1 → initial*mult, ..., clamped at max_sec.
+       Negative attempt is treated as 0. multiplier <= 1 → linear at
+       initial. initial >= max → always max."""
+       a = max(0, int(attempt))
+       backoff = float(initial_sec) * (float(multiplier) ** a)
+       return int(min(backoff, float(max_sec)))
+   ```
 
-**dig Round 1 決定 2: `on property:` ハンドラブロックは削除する**。 理由: Android init の `restart <disabled-service>` 挙動が実装依存で disabled を上書きで起動する可能性をゼロにできない、 安全側で完全除去。
+2. **`apply_defaults`** (line 153 付近、 spec 019 ブロックの直後):
+   ```python
+   # spec 017: Wi-SUN rejoin exponential backoff + serial port reopen.
+   out.setdefault("wisun_rejoin_backoff_initial_sec", 30)
+   out.setdefault("wisun_rejoin_backoff_max_sec", 300)
+   out.setdefault("wisun_rejoin_backoff_multiplier", 2.0)
+   out.setdefault("wisun_serial_reopen_after_rejoin_failures", 5)
+   ```
 
-実機確認で `on property:` ブロックを持つのは **NDCloudDaemon.rc と fms.rc の 2 ファイルだけ** (dig Round 2 決定 6)。 残り 5 ファイルは service 定義のみで handler 無し、 そのまま `disabled` 追加で済む。
-- NDCloudDaemon.rc: 元 `on property:persist.cloud.connection.delay=* → restart NDCloudDaemon` と `on property:persist.cloud.fms.new=* → stop NDCloudDaemon` 両方削除
-- fms.rc: 元 `on property:persist.cloud.connection.delay=* → restart fms` 削除
+3. **`DiagState.__init__`** (line 1820 付近、 spec 016 ブロックの隣):
+   ```python
+   # spec 017: Wi-SUN rejoin observability.
+   self.serial_reopen_total = 0
+   self.consecutive_wisun_connect_failures = 0
+   self.pending_wisun_rejoin = False
+   ```
 
-### `production_tool/tlsdated_timesync.rc` (新規)
+4. **`DiagState` 新メソッド 2 本** (既存 on_wisun_reconnect の隣):
+   ```python
+   def on_serial_reopen(self):
+       self.serial_reopen_total += 1
 
-実機 original を base に、 tlsdate コマンドに `-H www.google.com` を追加:
-```
-# Init file for starting tlsdated on Android. spec 015: repointed to
-# www.google.com since the NextDrive default host is no longer reachable.
+   def on_wisun_pana_fail(self, event_id):
+       """spec 017: PANA fail (EVENT 24/29) — signal force-rejoin to
+       the main loop, also bump the SK event counter (existing path)."""
+       self.on_sk_event(event_id)
+       self.pending_wisun_rejoin = True
+   ```
 
-on post-fs-data
-    mkdir /data/misc/tlsdated 0755 root system
+5. **`should_force_wisun_reconnect`** (line 1234 付近、 pure helper を拡張):
+   ```python
+   def should_force_wisun_reconnect(consecutive, threshold, pending=False):
+       """spec 017: pending overrides the threshold check (immediate
+       rejoin signal from EVENT 24/29)."""
+       if pending:
+           return True
+       if int(threshold) <= 0:
+           return False
+       return int(consecutive) >= int(threshold)
+   ```
+   (default 引数 pending=False で既存 callers 互換)
 
-service tlsdated /usr/sbin/tlsdated -v -a 3600 -c /data/misc/tlsdated -G dbus,inet -- /usr/sbin/tlsdate -H www.google.com -C /etc/ssl/certs -l -v
-    class late_start
-    user root
-    group system
-    seclabel u:r:shell:s0
-```
+6. **`_DIAG_SNAPSHOT_KEYS`** (line 1451 付近) に追加:
+   ```python
+   "serial_reopen_total",
+   ```
+   `pending_wisun_rejoin` は内部状態なので公開しない (spec 016 と同じ minimal schema 判断)
 
-### `production_tool/production_tool` (拡張)
+7. **snapshot raw dict** (line 1949 付近):
+   ```python
+   "serial_reopen_total": self.serial_reopen_total,
+   ```
 
-既存の `# disable wisund` ブロックの下に追加:
-```sh
-# ── spec 015: disable NextDrive cloud daemons ─────────────────────────────────
-if [ "${DISABLE_CLOUD:-1}" = "1" ]; then
-    for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
-        if [ -f "$PT/cloud_disabled/${d}.rc" ]; then
-            cp "$PT/cloud_disabled/${d}.rc" "/system/etc/init/${d}.rc"
-        fi
-    done
-fi
+8. **`read_erxudp`** (line 2627 付近、 `kind == "event"` 分岐):
+   既存:
+   ```python
+   if kind == "event":
+       if diag_state is not None:
+           try:
+               diag_state.on_sk_event(value)
+           except Exception as e:
+               log("diag on_sk_event error: {}".format(e))
+       continue
+   ```
+   差し替え (spec 017 で EVENT 24/29 を special handling、 他 event は従来通り):
+   ```python
+   if kind == "event":
+       if diag_state is not None:
+           try:
+               if value in ("24", "29"):
+                   diag_state.on_wisun_pana_fail(value)
+               else:
+                   diag_state.on_sk_event(value)
+           except Exception as e:
+               log("diag on_sk_event error: {}".format(e))
+       continue
+   ```
 
-# ── spec 015: repoint tlsdate to a public HTTPS host ─────────────────────────
-if [ "${REPOINT_TLSDATE:-1}" = "1" ]; then
-    if [ -f "$PT/tlsdated_timesync.rc" ]; then
-        cp "$PT/tlsdated_timesync.rc" /system/etc/init/tlsdated.rc
-    fi
-fi
-```
+9. **main loop の `should_force_wisun_reconnect` 呼び出し** (line 3458-3464 付近):
+   ```python
+   if should_force_wisun_reconnect(
+           diag_state.consecutive_erxudp_timeouts,
+           int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
+           pending=diag_state.pending_wisun_rejoin):
+       # dig Round 1 決定 2: signal consume — clear before raise.
+       # If reconnect fails, EVENT 24/29 re-firing will re-set the flag,
+       # and ERXUDP timeout threshold also provides a safety net.
+       _was_pending = diag_state.pending_wisun_rejoin
+       diag_state.pending_wisun_rejoin = False
+       raise RuntimeError(
+           "wisun reconnect forced: consecutive_erxudp_timeouts={}, "
+           "pending={}".format(
+               diag_state.consecutive_erxudp_timeouts, _was_pending))
+   ```
 
-既存の `stop wisund` ブロックの下に追加 (即時停止):
-```sh
-# spec 015: stop cloud daemons immediately (will stay stopped after reboot
-# via the disabled keyword in the replaced .rc files).
-if [ "${DISABLE_CLOUD:-1}" = "1" ]; then
-    for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
-        stop "$d" 2>/dev/null || true
-    done
-fi
-```
+10. **main loop 外側 except 経路** (line 3505-3516 付近、 既存型を保ったまま sleep を backoff に置換 + serial reopen 分岐追加、 dig Round 1 決定 1):
+   ```python
+   except Exception as e:
+       attempt = diag_state.consecutive_wisun_connect_failures
+       _backoff = compute_rejoin_backoff(
+           attempt,
+           int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
+           float(cfg.get("wisun_rejoin_backoff_multiplier", 2.0)),
+           int(cfg.get("wisun_rejoin_backoff_max_sec", 300)))
+       log("Main loop error (attempt {}): {} - reconnecting Wi-SUN in {}s"
+           .format(attempt + 1, e, _backoff))
+       time.sleep(_backoff)
+       # spec 017: after N consecutive failures, reopen the serial port
+       # to recover from BP35CX UART hangs.
+       _reopen_after = int(cfg.get(
+           "wisun_serial_reopen_after_rejoin_failures", 5))
+       if _reopen_after > 0 and attempt + 1 >= _reopen_after:
+           try:
+               os.close(fd)
+               fd = open_serial(serial_port)
+               diag_state.on_serial_reopen()
+               log("Serial port reopened after {} failures".format(
+                   attempt + 1))
+           except Exception as re:
+               log("WARN: serial reopen failed (continuing with original fd): {}"
+                   .format(re))
+       try:
+           ipv6 = wisun_connect(fd, br_id, br_pwd, diag_state=diag_state)
+           log("Wi-SUN reconnected at {}".format(ipv6))
+           diag_state.consecutive_wisun_connect_failures = 0
+           try:
+               diag_state.on_wisun_reconnect()
+           except Exception as e3:
+               log("diag on_wisun_reconnect error: {}".format(e3))
+       except Exception as e2:
+           diag_state.consecutive_wisun_connect_failures += 1
+           log("Wi-SUN reconnect failed (will retry next cycle): {}".format(e2))
+   ```
 
-注: 既存スクリプトに rollback はない。 `cp` 失敗 = init service が見つからない致命的状態だが、 USB media 経由 install なので運用上で発生しない前提 (既存 wisund/NDEcLiteAgent と同等)。
+   注: serial_port は line 3220 で `cfg.get("serial_port", "/dev/ttyS1")` から派生し main() スコープに保持されている、 outer except から参照可能 (実コード確認済)。
 
-### `readme.md` (1 節追記)
+### `tests/unit/test_compute_rejoin_backoff.py` (新規)
 
-「インストール環境変数」セクションに 2 行追加:
-- `DISABLE_CLOUD=0`: NextDrive クラウドデーモン無効化を skip (default `1`)
-- `REPOINT_TLSDATE=0`: tlsdate 同期先付け替えを skip (default `1`)
+pure helper の TDD:
+- `test_returns_initial_at_attempt_zero`
+- `test_doubles_each_attempt_with_default_multiplier`
+- `test_clamps_at_max_sec`
+- `test_negative_attempt_treated_as_zero`
+- `test_multiplier_one_returns_initial`
+- `test_initial_greater_than_max_returns_max`
 
-## Pure helper / tests
+### `tests/unit/test_diag_state.py` (拡張)
 
-なし。 shell script + .rc 静的ファイルなので Python unit test 対象外 (CLAUDE.md `/tdd` skill: 「リファクタリング・設定/CI/CD はスキップ可」)。
+baseline `test_initial_snapshot_includes_zero_counters_uptime_and_version` 更新:
+- `"serial_reopen_total": 0` 追加 (`consecutive_wisun_connect_failures` は publish しないので expected dict には含めない、 dig Round 1 決定 3)
+
+新規:
+- `test_on_serial_reopen_increments_counter`
+- `test_on_wisun_pana_fail_sets_pending_flag_and_increments_sk_event_counter`
+- `test_pending_wisun_rejoin_starts_false`
+- `test_consecutive_wisun_connect_failures_starts_at_zero`
+- `test_snapshot_includes_serial_reopen_total_at_zero`
+
+### `tests/unit/test_should_force_reconnect.py` (拡張)
+
+既存テスト群に追加:
+- `test_pending_overrides_threshold_check` (pending=True で threshold 未到達でも True 返却)
+- `test_pending_false_keeps_existing_behaviour`
+
+### `tests/unit/test_read_erxudp_tid.py` (拡張) — EVENT 24/29 検出のテスト
+
+dig Round 2 注記: テスト用 `_FakeDiagState` を導入 (既存 read_erxudp テストは DiagState 渡していなかったので新規)。 `on_wisun_pana_fail` / `on_sk_event` の call 履歴を記録するシンプルな fake。
+
+- `test_read_erxudp_event_24_calls_on_wisun_pana_fail` (EVENT 24 line → on_wisun_pana_fail("24") のみ呼ばれ、 on_sk_event は呼ばれない)
+- `test_read_erxudp_event_29_calls_on_wisun_pana_fail` (同上)
+- `test_read_erxudp_event_22_still_calls_on_sk_event` (既存 path 互換、 PANA 系以外の EVENT は従来通り)
+
+## Pure helper のテスト先行 (TDD 順)
+
+1. **Red**: `test_returns_initial_at_attempt_zero` → AttributeError on compute_rejoin_backoff
+2. (stub: return initial_sec)
+3. **Red**: `test_doubles_each_attempt_with_default_multiplier` → stub では fail
+4. **Red**: `test_clamps_at_max_sec`
+5. **Red**: `test_negative_attempt_treated_as_zero`
+6. **Red**: `test_multiplier_one_returns_initial`
+7. **Red**: `test_initial_greater_than_max_returns_max`
+8-15. DiagState 拡張 (5 件) + should_force_wisun_reconnect 拡張 (2 件) + read_erxudp EVENT (2 件)
+16. main loop integration: テストせず実機検証 (spec 016/019 と同じ判断、 mock 過大)
 
 ## Verification
 
-1. 実装後 `pytest -q --ignore=tests/benchmark` で **既存 361 件 pass** (回帰なし)
-2. lab-ub01 経由で 8 .rc ファイル + 改修済 `production_tool` インストーラを Cube J1 にコピー (運用上は USB 経由 install だが、 deploy 簡略化のため adb push で対応)
-3. 実機で確認 (lab-ub01 経由 adb shell):
-   - `getprop | grep init.svc.sessiond` → `stopped` (or `disabled`)
-   - 同様に `fms` / `NDCloudDaemon` / etc. すべて `stopped`
-   - `ps | grep -E "(sessiond|fms|NDCloud|rds|iijschedule|transman)"` → 0 件
-   - tlsdate のログで Google 同期成功 (`/data/log/...` あるいは logcat)
-4. **reboot 後** に同様確認 (永続化検証):
-   - `getprop init.svc.<name>` → `stopped` のまま (`disabled` キーワードで起動しない)
-5. 長期効果 (1 週間程度):
-   - Grafana の `eedscan_pan_channel_energy` ヒストグラムを baseline と比較
-   - bimodal うるさい側 (>= 190) の出現割合が baseline から **30% 以上減少** すれば SC-003 達成
-   - 減少しない場合は DNS storm はノイズ寄与源ではなかったと結論、 spec 012 noise-adaptive-skip が正しい対策の証拠
-
-## Deploy 戦略
-
-**dig Round 1 決定 1: 直接 push + syntax check** (フルインストーラ実行は副作用が大きいので不採用)。
-
-具体的手順:
-
-1. **syntax check** (script の最低限担保):
-   ```sh
-   sh -n production_tool/production_tool
-   ```
-   ローカルで実行、 エラー無いことを commit 前に確認。
-
-2. **scp で lab-ub01 に転送**:
-   ```sh
-   ssh lab-ub01 'mkdir -p /tmp/spec015-deploy/cloud_disabled'
-   scp -q production_tool/cloud_disabled/*.rc lab-ub01:/tmp/spec015-deploy/cloud_disabled/
-   scp -q production_tool/tlsdated_timesync.rc lab-ub01:/tmp/spec015-deploy/
-   ```
-
-3. **lab-ub01 から adb で実機の /system/etc/init/ に書き込み** (一部 stop 失敗でも他は続ける、 `|| true` で contain — dig Round 2 決定 5):
-   ```sh
-   ssh lab-ub01 'set -e
-     adb kill-server >/dev/null 2>&1; sleep 1; adb start-server >/dev/null 2>&1
-     adb connect cube-j1.home.arpa:5555 >/dev/null 2>&1; sleep 1
-     adb shell "mount -o rw,remount /"
-     for d in NDCloudDaemon fms fmssecman iijschedule rds sessiond transman; do
-       adb push /tmp/spec015-deploy/cloud_disabled/${d}.rc /system/etc/init/${d}.rc
-       adb shell "stop $d" || true
-     done
-     adb push /tmp/spec015-deploy/tlsdated_timesync.rc /system/etc/init/tlsdated.rc
-     adb shell "stop tlsdated" || true
-     adb shell "start tlsdated" || true
-     adb disconnect cube-j1.home.arpa:5555 >/dev/null 2>&1'
-   ```
-
-4. **即時確認**:
-   - `getprop init.svc.sessiond` 等 → `stopped`
-   - `ps | grep -E "(sessiond|fms|NDCloud|rds|iijschedule|transman)"` → 0 件
-
-5. **reboot 検証 (永続化確認)**: ユーザ判断で `adb reboot` 実施。 復活待機後 (約 1-2 分)、 同じ確認コマンドで `stopped` が維持されていることを確認。 cube-j1.home.arpa への adb 経路は reboot 後自動復活 (前 spec 014 等で実証済み)。
-
-   reboot は本セッションでは ユーザに伺ってから実施。 mqtt_bridge.py の deploy と違って /system 変更の検証が reboot を要求するため、 これは spec 015 の必須ステップ。
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で **既存 361 + 新規 ~15 = ~376 件 pass**
+2. ruff check 新規エラー 0
+3. lab-ub01 経由 deploy
+4. 実機で:
+   - `/api/diag` (admin auth 経由) に `serial_reopen_total: 0` が見える
+   - logcat / mqtt_bridge.log で WISUN 障害シナリオ発生時に「WARN: wisun_connect failed (attempt N): ... - sleep Ms」が出る
+   - serial reopen も 5 回連続失敗で発火するはず (実機長期観測)
+5. 長期効果: spec 011 の `wisun_reconnects_total` の伸びが緩やかになる (= 障害復帰が指数 backoff で抑制)
 
 ## Commit 戦略
 
-前 3 回踏襲 (spec 014/016/019):
-- 017/018 spec.md を /tmp に stash
-- spec 015 関連 + spec.md + plan + redact-plans 適用で commit
-- 017/018 spec.md を restore して @ に戻す
-- 並行セッションが私の作業を巻き込んでいた場合は `jj edit` で cleanup
+前 4 回踏襲 (spec 014/015/016/019):
+- 018 spec.md を /tmp に stash
+- spec 017 関連 + spec.md + plan + redact-plans 適用で commit
+- 018 spec.md を restore して @ に戻す
+- 並行衝突あれば jj edit で cleanup
+- push は forward only (新ルール遵守)
 
-## Commit
+## Commit message
 
-`feat(install): NextDrive クラウドデーモン無効化 + tlsdate 公開 host へ向け直し (spec 015)`
-
-8 .rc ファイル + production_tool 改修 + spec.md + plan を 1 commit。
+`feat(bridge): Wi-SUN rejoin 指数 backoff + serial reopen + EVENT 24/29 即時 trigger (spec 017)`

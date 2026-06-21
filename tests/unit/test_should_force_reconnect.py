@@ -31,3 +31,25 @@ def test_threshold_zero_disables_force_reconnect():
 
 def test_negative_threshold_treated_as_disabled():
     assert mb.should_force_wisun_reconnect(consecutive=10, threshold=-1) is False
+
+
+# ---------------------------------------------------------------------------
+# spec 017: EVENT 24/29 pending signal overrides threshold
+# ---------------------------------------------------------------------------
+
+
+def test_pending_overrides_threshold_check():
+    """spec 017: PANA fail (EVENT 24/29) raised pending=True → immediate
+    rejoin even if consecutive timeouts haven't hit the threshold yet."""
+    assert mb.should_force_wisun_reconnect(
+        consecutive=0, threshold=5, pending=True) is True
+    assert mb.should_force_wisun_reconnect(
+        consecutive=100, threshold=0, pending=True) is True
+
+
+def test_pending_false_keeps_existing_behaviour():
+    """Default pending=False preserves spec 011 thresholding."""
+    assert mb.should_force_wisun_reconnect(
+        consecutive=4, threshold=5, pending=False) is False
+    assert mb.should_force_wisun_reconnect(
+        consecutive=5, threshold=5, pending=False) is True
