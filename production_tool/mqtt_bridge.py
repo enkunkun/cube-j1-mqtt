@@ -1461,6 +1461,8 @@ _DIAG_SNAPSHOT_KEYS = (
     "erxudp_recovered_by_retry_total",
     "erxudp_tid_mismatch_total",
     "noise_adaptive_skips_total",
+    "last_discovery_publish_ts",
+    "discovery_republish_total",
     "uptime_seconds",
     "version",
 )
@@ -1819,6 +1821,10 @@ class DiagState(object):
         # Spec 012: noise-adaptive skip + ERXUDP TID mismatch observability.
         self.noise_adaptive_skips_total = 0
         self.erxudp_tid_mismatch_total = 0
+        # Spec 016: HA discovery auto-republish state.
+        self.last_discovery_publish_ts = None
+        self.pending_discovery_republish = False
+        self.discovery_republish_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -1842,6 +1848,10 @@ class DiagState(object):
 
     def on_mqtt_reconnect(self):
         self.mqtt_reconnects_total += 1
+        # spec 016: broker reconnect drops retained discovery (or worse, the
+        # broker was rebuilt). Flag so the next main-loop tick re-publishes
+        # HA discovery and sensors come back without a bridge restart.
+        self.pending_discovery_republish = True
 
     def on_erxudp_timeout(self):
         self.erxudp_timeouts_total += 1
@@ -1859,6 +1869,21 @@ class DiagState(object):
 
     def on_noise_adaptive_skip(self):
         self.noise_adaptive_skips_total += 1
+
+    # Spec 016: HA discovery auto-republish tracking.
+
+    def mark_initial_discovery_publish(self, now):
+        """Startup publish — seed last_ts so the periodic check doesn't
+        fire on the first main-loop tick. counter is NOT touched (counter
+        only counts actual re-publishes, so SC-002 stays meaningful)."""
+        self.last_discovery_publish_ts = float(now)
+        self.pending_discovery_republish = False
+
+    def on_discovery_republish(self, now):
+        """An actual re-publish ran (reconnect or interval)."""
+        self.discovery_republish_total += 1
+        self.last_discovery_publish_ts = float(now)
+        self.pending_discovery_republish = False
 
     def on_erxudp_tid_mismatch(self):
         self.erxudp_tid_mismatch_total += 1
@@ -1923,6 +1948,10 @@ class DiagState(object):
                 self.erxudp_recovered_by_retry_total,
             "erxudp_tid_mismatch_total": self.erxudp_tid_mismatch_total,
             "noise_adaptive_skips_total": self.noise_adaptive_skips_total,
+            "last_discovery_publish_ts":
+                format_iso8601_utc(self.last_discovery_publish_ts)
+                if self.last_discovery_publish_ts is not None else None,
+            "discovery_republish_total": self.discovery_republish_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2283,6 +2312,26 @@ def epcs_for_tier(tier):
     if tier == "tier3":
         return TIER3_EPCS
     return TIER1_EPCS
+
+
+def should_republish_discovery(now, last_publish_ts, pending, interval_sec):
+    """spec 016: True iff a reconnect is pending, the interval has elapsed,
+    or no publish has ever been recorded.
+
+    interval_sec <= 0 disables periodic republish (reconnect / first
+    publish still trigger). last_publish_ts=None is treated as "never
+    published" → True so callers without an initialised ts get a publish
+    on the first tick (defensive; main loop seeds the ts at startup so
+    this path normally does not fire).
+    """
+    if pending:
+        return True
+    if last_publish_ts is None:
+        return True
+    if interval_sec <= 0:
+        return False
+    return (now - last_publish_ts) >= interval_sec
+
 
 def build_el_get(tid, epcs):
     frame = bytearray()
@@ -3121,6 +3170,9 @@ def main():
             time.sleep(15)
 
     publish_ha_discovery(mqtt, device_id)
+    # spec 016: seed last-publish ts so the periodic re-publish check
+    # doesn't fire on the first main-loop tick. counter stays at 0.
+    diag_state.mark_initial_discovery_publish(time.time())
 
     # Open serial port
     log("Opening serial {}".format(serial_port))
@@ -3161,6 +3213,19 @@ def main():
     while True:
         try:
             last_poll_start = time.time()
+            # spec 016: HA discovery auto-republish on MQTT reconnect
+            # (pending flag) or every discovery_republish_interval_sec.
+            # Localized try/except so a republish failure can't kill the
+            # main loop; pending stays True so the next tick retries.
+            if should_republish_discovery(
+                    last_poll_start, diag_state.last_discovery_publish_ts,
+                    diag_state.pending_discovery_republish,
+                    int(cfg.get("discovery_republish_interval_sec", 86400))):
+                try:
+                    publish_ha_discovery(mqtt, device_id)
+                    diag_state.on_discovery_republish(last_poll_start)
+                except Exception as e:
+                    log("WARN: HA discovery republish failed: {}".format(e))
             probing = probe_state.is_active(last_poll_start)
             kind = decide_cycle_kind(probing, last_normal_poll_start,
                                      last_poll_start, poll_interval)

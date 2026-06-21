@@ -1,191 +1,178 @@
-# Plan: spec 012 + 013 並行実装（fork 取り込み）
+# Plan: spec 016 HA Discovery Auto-Republish
 
 ## Context
 
-GitHub Insights で取り込み可能な fork (nanamitm/cube-j1-mqtt) を調べた結果、当方の spec 011 までの実装ですでに大半カバー済みだが、 以下 2 件は取り込み価値ありと判定した:
+HA の MQTT discovery は broker の retained store に依存する。 当方 bridge は起動時に `publish_ha_discovery()` を 1 度しか呼ばないため、 Mosquitto を `docker compose down -v && up -d` 等で再構築すると retained が消えて HA からセンサーが消失する。 復旧には bridge プロセスの手動再起動が要る。 hals5412 fork `a3c3637` の発想を取り込み、 **MQTT 再接続時 + 24h 周期** で自動再 publish する。
 
-- **spec 012 (ERXUDP TID 検証)**: spec 011 の intra-cycle retry / 再 join 直後にメーター遅延応答が次サイクルの結果に混入する穴を塞ぐ。 nanamitm `77fc027` の発想を採用
-- **spec 013 (poll_interval 30s 下限)**: ARIB STD-T108 920MHz 帯 duty cycle (360s/hour) 違反を未然に防ぐ config validation。 nanamitm `c2c7c0a` の発想を採用
+新規スレッドは増やさない (main loop tick で十分な精度) ことで運用追跡コストを抑える。
 
-両者は独立で互いに干渉しない。 spec 013 を先に入れて運用設定を保護してから、 spec 012 で本丸の Wi-SUN 信頼性を強化する順序。
+## Approach
 
-## Affected files
+- pure helper `should_republish_discovery(now, last_ts, pending, interval_sec)` を抽出して timer 判定を test 可能化
+- DiagState に「pending flag」「last publish ts」「republish counter」を追加
+- 既存 `on_mqtt_reconnect()` を minimal 拡張: counter inc に加えて pending flag セット
+- main loop の cycle 入口で helper を call、 true なら `publish_ha_discovery()` + `on_discovery_republish()`
+- config キー `discovery_republish_interval_sec` (default 86400、 0 で周期無効化) を追加
 
-- `production_tool/mqtt_bridge.py` (両 spec とも)
-- `tests/unit/test_diag_state.py` (spec 012 用拡張)
-- `tests/unit/test_read_erxudp.py` (spec 012 新規 or 既存があれば追記)
-- `tests/unit/test_config_defaults.py` または新規 `test_config_validation.py` (spec 013)
-- 新規 `tests/unit/test_extract_el_tid.py` (spec 012 pure helper 用)
-- `specs/012-erxudp-tid-validation/spec.md` / `specs/013-poll-interval-floor/spec.md` (作成済み、 実装コミットに同梱)
+### Thread safety (Round 2 注記)
 
-## spec 013 実装 (先に着手、 risk 極小)
+`pending_discovery_republish` (bool) は `on_mqtt_reconnect()` (MQTTClient sender/keepalive スレッド) と main loop スレッドの両方から触る。 GIL 下で bool への単純な代入は atomic で、 spec 011 の `consecutive_erxudp_timeouts` (int) も同じ構造で Lock なし運用しているため踏襲する。 確実な mutex は不要、 「次 cycle までに値が反映される」程度の semantics で問題ない設計。
 
-### 設計修正点（plan 中の発見）
+### `on_mqtt_reconnect` の発火タイミング (Round 2 注記)
 
-spec.md FR-003 は「`load_config` で floor 適用」と書いたが、 実装の `load_config` (96-98 行) は `json.load` 1 発で defaults は別経路 (`apply_defaults`、 ~110 行台) で当たる。 floor は `apply_defaults` 側で当てるのが正しい。
+Explore 結果では `MQTTClient._reconnect_socket_unlocked()` から呼ばれる。 initial connect 時にも呼ばれるかは曖昧だが、 `mark_initial_discovery_publish()` が pending を **強制クリア** するため、 「初回 connect で pending=True がセット → mark_initial でクリア → main loop tick で publish 不要」「あるいは初回 connect では呼ばれない → pending=False のまま、 同じく publish 不要」のどちらの挙動でも plan は正しく動く。 defensive design で挙動分岐を吸収。
 
-spec.md FR-004 の HTML `min="30"` 属性は、 admin UI フィールドが JS で動的生成されている (個別属性なし、 571 行付近で regex validation) ため適用面が小さい。 サーバ側検証 (FR-001) で十分担保できるので、 FR-004 は **削除** する (spec.md も update する)。
+## Files to modify
 
-### 変更内容
+### `production_tool/mqtt_bridge.py`
 
-`production_tool/mqtt_bridge.py`:
-
-1. モジュール冒頭 (定数定義領域) に追加:
+1. **pure helper** (line 2200 付近、 `decide_epc_tier` の隣):
    ```python
-   MIN_POLL_INTERVAL_SEC = 30
-   ```
+   def should_republish_discovery(now, last_publish_ts, pending, interval_sec):
+       """spec 016: True iff a reconnect is pending, the interval has
+       elapsed, or no publish has ever been recorded.
 
-2. `apply_defaults()` (101 行〜) で setdefault + floor clamp を **両方** 追加 (Round 2 決定 5)。 現状 `poll_interval` の setdefault は無く、 default 60 は read 側 (line 2972 `cfg.get("poll_interval", 60)`) で当たっている。 default と floor を 1 箇所に集約する:
-   ```python
-   out.setdefault("poll_interval", 60)
-   if int(out["poll_interval"]) < MIN_POLL_INTERVAL_SEC:
-       log("WARN: poll_interval={} below floor, clamping to {}".format(
-           out["poll_interval"], MIN_POLL_INTERVAL_SEC))
-       out["poll_interval"] = MIN_POLL_INTERVAL_SEC
-   ```
-   read 側の `cfg.get("poll_interval", 60)` は互換のため残す (実質 dead default になるが防御の意味で温存)
-
-3. `validate_config_patch()` (388 行) に `poll_interval` 専用ブランチ追加:
-   ```python
-   elif key == "poll_interval":
-       if (not isinstance(value, int) or isinstance(value, bool)
-               or value < MIN_POLL_INTERVAL_SEC):
-           return None, ("poll_interval must be an integer >= {} seconds "
-                         "(ARIB STD-T108 920MHz duty cycle)"
-                         .format(MIN_POLL_INTERVAL_SEC))
-   ```
-   `_POSITIVE_INT_KEYS` から `poll_interval` を除外して二重判定回避
-
-### テスト (TDD Red → Green → Refactor)
-
-新規 `tests/unit/test_config_validation.py`:
-
-1. **Red**: `test_validate_config_patch_rejects_poll_interval_below_floor` — `{"poll_interval": 10}` を patch すると error_message に "30" を含むエラー返却
-2. **Red**: `test_validate_config_patch_accepts_poll_interval_at_floor` — `{"poll_interval": 30}` で成功
-3. **Red**: `test_validate_config_patch_accepts_poll_interval_above_floor` — `{"poll_interval": 300}` で成功
-4. **Red**: `test_apply_defaults_clamps_low_poll_interval` — `{"poll_interval": 5}` を渡すと結果が 30
-5. **Red**: `test_apply_defaults_preserves_normal_poll_interval` — `{"poll_interval": 60}` は 60 のまま
-6. **Red**: `test_validate_config_patch_other_keys_unaffected` — poll_interval を含まない patch は影響なし (既存ふるまい保護)
-
-順に **Green** にしながら実装。
-
-## spec 012 実装
-
-### 変更内容
-
-`production_tool/mqtt_bridge.py`:
-
-1. ECHONET Lite helper 領域 (`build_el_get` の隣、 2245 行付近) に pure helper:
-   ```python
-   def extract_el_tid(payload):
-       """Return ECHONET Lite TID from a Get-response payload.
-
-       payload[2:4] is the big-endian TID. Returns None for payloads
-       shorter than 4 bytes (caller treats as 'cannot validate, accept').
+       interval_sec <= 0 disables periodic republish (reconnect / first
+       publish still trigger). last_publish_ts=None is treated as "never
+       published" → True so callers without an initialised ts get a publish
+       on the first tick (defensive; main loop seeds the ts at startup so
+       this path normally does not fire).
        """
-       if len(payload) < 4:
-           return None
-       return struct.unpack(">H", bytes(payload[2:4]))[0]
+       if pending:
+           return True
+       if last_publish_ts is None:
+           return True
+       if interval_sec <= 0:
+           return False
+       return (now - last_publish_ts) >= interval_sec
    ```
+   (Round 1 決定 1: None ガード defensive。 main loop 経路では実発生させない)
 
-2. `DiagState.__init__` (1758-) で counter 追加:
+2. **`apply_defaults`** (line 101 付近、 mqtt_* セクション):
    ```python
-   self.erxudp_tid_mismatch_total = 0
+   out.setdefault("discovery_republish_interval_sec", 86400)
    ```
-   `on_erxudp_intra_cycle_retry` (1808) の隣に method 追加:
+
+3. **`DiagState.__init__`** (line 1810 付近):
    ```python
-   def on_erxudp_tid_mismatch(self):
-       self.erxudp_tid_mismatch_total += 1
+   # spec 016: HA discovery auto-republish state.
+   self.last_discovery_publish_ts = None
+   self.pending_discovery_republish = False
+   self.discovery_republish_total = 0
    ```
-   metrics 公開には **2 箇所** 編集が必要 (whitelist パターン):
-   - `_DIAG_SNAPSHOT_KEYS` tuple (1412-1425 行) に `"erxudp_tid_mismatch_total",` を追加 (順序は erxudp 関連カウンタの隣、 1422 行直後が自然)
-   - DiagState の snapshot 関数内 `raw` dict (1855-1874 行) に `"erxudp_tid_mismatch_total": self.erxudp_tid_mismatch_total,` を追加
 
-3. `read_erxudp` (2392 行) シグネチャ拡張 + テスタビリティ向上の refactor:
+4. **`DiagState.on_mqtt_reconnect`** (line 1843 付近、 既存メソッドを拡張):
    ```python
-   def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
-                   readline=None):
-       """`readline` defaults to module-level `serial_readline`; tests inject
-       a fake. Both old (no-kw) and new call sites work unchanged."""
-       if readline is None:
-           readline = serial_readline
+   def on_mqtt_reconnect(self):
+       self.mqtt_reconnects_total += 1
+       self.pending_discovery_republish = True   # spec 016: trigger republish
    ```
-   内部の `serial_readline(fd, timeout=...)` 呼び出しを `readline(fd, timeout=...)` に置換。 payload を返す前の `if not value.startswith("1081"):` 判定の **直後** に (Round 2 決定 7、 既存の try/except 保護を維持):
+
+5. **新メソッド 2 本** (line 1858 付近) (Round 1 決定 2: counter は再 publish のみ計上、 startup は ts だけ更新する):
    ```python
-   try:
-       payload = bytearray(binascii.unhexlify(value))
-   except Exception as e:
-       log("ERXUDP hex decode error: {}".format(e))
-       continue
-   if expected_tid is not None:
-       got_tid = extract_el_tid(payload)
-       if got_tid != expected_tid:
-           if diag_state is not None:
-               diag_state.on_erxudp_tid_mismatch()
-           if got_tid is None:
-               log("WARN: ERXUDP payload too short ({} bytes), "
-                   "discarding".format(len(payload)))
-           else:
-               log("WARN: ERXUDP TID mismatch expected={:04X} got={:04X}, "
-                   "discarding".format(expected_tid, got_tid))
-           continue
-   return payload
+   def mark_initial_discovery_publish(self, now):
+       """spec 016: startup publish — seed last_ts so the periodic check
+       doesn't fire on the first main-loop tick. counter is NOT touched
+       (counter only counts actual re-publishes, so SC-002 stays
+       meaningful)."""
+       self.last_discovery_publish_ts = float(now)
+       self.pending_discovery_republish = False
+
+   def on_discovery_republish(self, now):
+       """spec 016: an actual re-publish ran (reconnect or interval)."""
+       self.discovery_republish_total += 1
+       self.last_discovery_publish_ts = float(now)
+       self.pending_discovery_republish = False
    ```
-   既存の hex decode 二重走行を排除、 short payload と TID mismatch を別ログに分岐 (Round 1 決定 1)。
 
-4. main loop の `read_erxudp` 呼び出し 2 箇所 (3093, 3105 行) に `expected_tid=sent_tid` 引数追加。
-
-   **重要な実装注意**: 既存コードは `send_el_get(fd, ipv6, tid, ...)` の **直後** (line 3091, 3103) で `tid = (tid + 1) & 0xFFFF` を実行しており、 `read_erxudp` 到達時点では tid がすでに 1 増えた値になっている。 そのまま `expected_tid=tid` を渡すと検証先がズレる。
-
-   修正パターン: `send_el_get` の **直前** に `sent_tid = tid` でキャプチャし、 `expected_tid=sent_tid` を read_erxudp に渡す。 2 箇所 (通常 send と retry send) 両方で同じ対応が必要:
+6. **`_DIAG_SNAPSHOT_KEYS`** (line 1431 付近) に追加:
    ```python
-   sent_tid = tid
-   send_el_get(fd, ipv6, sent_tid, epc_list=cycle_epcs)
-   tid = (tid + 1) & 0xFFFF
-   t_send = time.time()
-   data = read_erxudp(fd, timeout=_erxudp_timeout,
-                      diag_state=diag_state, expected_tid=sent_tid)
+   "last_discovery_publish_ts",
+   "discovery_republish_total",
    ```
-   tier rotation の `epc_list` も sent_tid と対応する EPC リストで渡す (既存挙動維持)。
+   (Round 1 決定 4: `pending_discovery_republish` は出さない — 内部実装詳細、 HA 側に不要な sensor を増やさない)
 
-### テスト (TDD Red → Green → Refactor)
+7. **snapshot `raw` dict** (line 1888 付近):
+   ```python
+   "last_discovery_publish_ts":
+       format_iso8601_utc(self.last_discovery_publish_ts)
+       if self.last_discovery_publish_ts is not None else None,
+   "discovery_republish_total": self.discovery_republish_total,
+   ```
 
-新規 `tests/unit/test_extract_el_tid.py`:
-1. **Red**: `test_extract_el_tid_normal` — `bytearray(b"\x10\x81\x12\x34\x05\xff...")` → `0x1234`
-2. **Red**: `test_extract_el_tid_short_payload` — 3 byte → `None`
-3. **Red**: `test_extract_el_tid_zero_tid` — `bytearray(b"\x10\x81\x00\x00\x05\xff...")` → `0`
+8. **main loop** (line 3123 startup publish の直後 + 毎 cycle 入口):
+   - 起動時の既存 `publish_ha_discovery(mqtt, device_id)` の直後に `diag_state.mark_initial_discovery_publish(time.time())` を呼ぶ (Round 1 決定 2: counter はインクリせず ts のみ初期化)
+   - main loop の cycle 入口 (3128 行付近、 normal/probe 分岐の前) で:
+     ```python
+     # spec 016: HA discovery auto-republish on MQTT reconnect or every
+     # discovery_republish_interval_sec.
+     _now = time.time()
+     if should_republish_discovery(
+             _now, diag_state.last_discovery_publish_ts,
+             diag_state.pending_discovery_republish,
+             int(cfg.get("discovery_republish_interval_sec", 86400))):
+         try:
+             publish_ha_discovery(mqtt, device_id)
+             diag_state.on_discovery_republish(_now)
+         except Exception as e:
+             # Round 1 決定 3: シンプル WARN のみ、 backoff なし。
+             # publish は spec 005 の queue 経由なので broker 切断中も
+             # fail-fast せず、 復旧時に flush される。 即 fail は queue
+             # overflow 等の稀ケース、 次 cycle で自然リトライ
+             log("WARN: HA discovery republish failed: {}".format(e))
+             # pending は意図的にクリアしない → 次 cycle で再試行
+     ```
+   - 注: `_now` を 1 度キャプチャして helper と `on_discovery_republish` で共用 (sub-second 差防止 + 可読性)
 
-新規 `tests/unit/test_read_erxudp.py` (既存があれば追記):
-4. **Red**: `test_read_erxudp_no_expected_tid_accepts_any` — 後方互換
-5. **Red**: `test_read_erxudp_expected_tid_match_returns_payload`
-6. **Red**: `test_read_erxudp_expected_tid_mismatch_discards_then_waits` — 不一致 frame の後に一致 frame が来たら一致のほうを返す。 fake `serial_readline` を渡せる構造に
-7. **Red**: `test_read_erxudp_expected_tid_mismatch_increments_diag_counter`
+### `tests/unit/test_discovery_republish.py` (新規)
 
-既存 `tests/unit/test_diag_state.py` に追記:
-8. **Red**: `test_diag_state_on_erxudp_tid_mismatch_increments_counter`
-9. **Red**: `test_diag_state_to_metrics_dict_includes_tid_mismatch_total`
+pure helper の TDD:
+- `test_returns_true_when_pending_flag_set`
+- `test_returns_true_when_interval_elapsed`
+- `test_returns_false_when_interval_not_elapsed_and_no_pending`
+- `test_returns_false_when_interval_zero_disables_periodic`
+- `test_pending_overrides_zero_interval_disable` (pending=True, interval=0 で True 返却)
+- `test_none_last_ts_returns_true_as_first_publish` (Round 1 決定 1: None ガード)
+- `test_pending_overrides_none_last_ts` (両条件 True なら True)
 
-fake `readline` は `read_erxudp(... , readline=fake)` で注入する (Round 1 決定 3)。 fake は `list.pop(0)` 形式の closure で 1 行ずつ返す。 既存テストの patterns を踏襲 (Python 2.7 stdlib 縛り、 pytest fixture 不使用、 直接テスト関数の方針)。
+### `tests/unit/test_diag_state.py` (拡張)
 
-## 既存テストの非回帰確認
+baseline `test_initial_snapshot_includes_zero_counters_uptime_and_version` (現在は noise_adaptive_skips_total と erxudp_tid_mismatch_total を含む dict 比較) に追加:
+- `"discovery_republish_total": 0` の expectation 行
 
-`cd src && pytest && ruff check .` (CLAUDE.md の指定コマンド) を全件 pass で確認。 spec 011 関連の `test_should_force_wisun_reconnect` 等が壊れないことを最終チェック。
+新規テスト:
+- `test_on_mqtt_reconnect_also_sets_pending_discovery_republish`
+- `test_on_discovery_republish_increments_counter_clears_pending_updates_ts`
+- `test_mark_initial_discovery_publish_seeds_ts_without_incrementing_counter` (Round 1 決定 2)
+- `test_snapshot_includes_last_discovery_publish_ts_as_iso_when_set`
+- `test_snapshot_omits_last_discovery_publish_ts_when_none`
 
-## コミット戦略
+## Test list (TDD 順)
 
-CLAUDE.md ルール「プランファイルは実装コミットに同梱、 単独の更新コミットを作らない」「spec 011 と同様 spec ごとに分割」に従う:
-
-1. **コミット 1**: `feat(admin): poll_interval >= 30s floor (spec 013)` — spec 013 spec.md + 実装 + tests + 本プランファイル の半分相当を同梱
-2. **コミット 2**: `feat(bridge): ERXUDP TID validation (spec 012)` — spec 012 spec.md + 実装 + tests を同梱
-
-プランファイルは 1 つで両 spec をカバーするため、 コミット 1 に同梱（コミット 2 では削除しない、 spec 012 にも有効）。
+1. **Red**: `test_returns_false_when_interval_not_elapsed_and_no_pending` → helper 未実装で AttributeError
+2. (Green) helper を追加
+3. **Red**: `test_returns_true_when_pending_flag_set`
+4. **Red**: `test_returns_true_when_interval_elapsed`
+5. **Red**: `test_returns_false_when_interval_zero_disables_periodic`
+6. **Red**: `test_pending_overrides_zero_interval_disable`
+7. **Red**: `test_on_mqtt_reconnect_also_sets_pending_discovery_republish` → DiagState 拡張
+8. **Red**: `test_on_discovery_republish_increments_counter_clears_pending_updates_ts`
+9. **Red**: `test_snapshot_includes_last_discovery_publish_ts_as_iso_when_set`
+10. **Red**: `test_snapshot_omits_last_discovery_publish_ts_when_none`
+11. **Red** (baseline update): `test_initial_snapshot_includes_zero_counters_uptime_and_version` に新キー追加
+12. main loop integration はテストせず (mock 過大、 実機で確認)
 
 ## Verification
 
-実装後の確認手順:
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 (現在 322) + 新規 ~7 = ~329 件すべて pass
+2. ruff check で新ファイル + 改修ファイルが既存以上のエラー無し
+3. 実機デプロイ (lab-ub01 経由) で `production_tool/mqtt_bridge.py` を更新
+4. Cube J1 上 で `/api/diag` を curl して `discovery_republish_total: 0` と `last_discovery_publish_ts: "<ISO8601>"` が新しく見える
+5. Mosquitto を `docker compose restart mosquitto` (or down/up) で再構築、 60 秒以内 (= 1 main loop tick) に HA からセンサーが復活、 `discovery_republish_total` が +1
+6. 24h 連続稼働で `discovery_republish_total >= 1` (周期再 publish の証跡)
 
-1. `cd src && pytest -xvs tests/unit/test_config_validation.py tests/unit/test_extract_el_tid.py tests/unit/test_read_erxudp.py tests/unit/test_diag_state.py` — 新規テスト個別 pass
-2. `pytest && ruff check .` — 既存テスト全件 pass、 lint クリーン
-3. 実機 (Cube J1) にデプロイ後、 `/api/metrics` に `erxudp_tid_mismatch_total` が出ることを確認
-4. admin UI から `poll_interval=10` 保存試行 → 400 エラーが返ることを実測
-5. 1 週間の Grafana 観測で `erxudp_tid_mismatch_total > 0` が記録されるか (= 実際に混入が起きていたかの evidence)
+## Commit
+
+`feat(bridge): HA discovery を MQTT 再接続+24h 周期で自動再 publish (spec 016)`
+
+spec.md は impl と同じ commit に同梱 (既存 spec 013/014 と同じ運用)。 plan ファイル (本ファイル) も同梱。

@@ -36,6 +36,9 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 012 counters also baseline at 0
         "erxudp_tid_mismatch_total": 0,
         "noise_adaptive_skips_total": 0,
+        # spec 016 discovery counter also baselines at 0; last_ts is None
+        # so the snapshot omits it (verified separately).
+        "discovery_republish_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -86,6 +89,51 @@ def test_on_erxudp_tid_mismatch_increments_counter():
     state.on_erxudp_tid_mismatch()
     snap = state.snapshot(now=state.start_time)
     assert snap["erxudp_tid_mismatch_total"] == 2
+
+
+# ---------------------------------------------------------------------------
+# spec 016: HA discovery auto-republish
+# ---------------------------------------------------------------------------
+
+def test_on_mqtt_reconnect_also_sets_pending_discovery_republish():
+    state = make_state()
+    assert state.pending_discovery_republish is False
+    state.on_mqtt_reconnect()
+    assert state.pending_discovery_republish is True
+
+
+def test_on_discovery_republish_increments_counter_clears_pending_updates_ts():
+    state = make_state()
+    state.on_mqtt_reconnect()  # set pending
+    state.on_discovery_republish(now=1_700_000_000.0)
+    assert state.discovery_republish_total == 1
+    assert state.pending_discovery_republish is False
+    assert state.last_discovery_publish_ts == 1_700_000_000.0
+
+
+def test_mark_initial_discovery_publish_seeds_ts_without_incrementing_counter():
+    """spec 016 Round 1 決定 2: startup publish は ts だけ初期化、 counter は 0 のまま。"""
+    state = make_state()
+    state.on_mqtt_reconnect()  # would set pending=True
+    state.mark_initial_discovery_publish(now=1_700_000_000.0)
+    assert state.discovery_republish_total == 0
+    assert state.pending_discovery_republish is False
+    assert state.last_discovery_publish_ts == 1_700_000_000.0
+
+
+def test_snapshot_includes_last_discovery_publish_ts_as_iso_when_set():
+    state = make_state()
+    state.on_discovery_republish(now=1_700_000_000.0)
+    snap = state.snapshot(now=1_700_000_000.0)
+    assert snap["last_discovery_publish_ts"] == "2023-11-14T22:13:20Z"
+    assert snap["discovery_republish_total"] == 1
+
+
+def test_snapshot_omits_last_discovery_publish_ts_when_none():
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert "last_discovery_publish_ts" not in snap
+    assert snap["discovery_republish_total"] == 0
 
 
 def test_counters_are_monotonically_non_decreasing():
