@@ -169,6 +169,11 @@ def apply_defaults(cfg):
     out.setdefault("wisun_rejoin_backoff_max_sec", 300)
     out.setdefault("wisun_rejoin_backoff_multiplier", 2.0)
     out.setdefault("wisun_serial_reopen_after_rejoin_failures", 5)
+    # spec 018: cumulative energy fixed (EPC 0xEA/0xEB) tier4. Meter
+    # records 30-min-boundary values with internal timestamp (JST).
+    # Default every=30 cycles ≈ 30 min at poll_interval=60s. Set 0 to
+    # disable tier4 entirely (kill switch).
+    out.setdefault("epc_tier4_every", 30)
     return out
 
 
@@ -2411,12 +2416,20 @@ EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
 TIER1_EPCS = [0xE7, 0xE8]         # 瞬時電力、 瞬時電流 — real-time
 TIER2_EPCS = [0xE0, 0xE3]         # 積算電力量 (forward / reverse) — slow
 TIER3_EPCS = [0xD3, 0xE1]         # 係数 / 単位 — near-static
+TIER4_EPCS = [0xEA, 0xEB]         # spec 018: 定時積算電力量 fwd/rev — meter ts
 
 
-def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60):
-    """Pick which EPC tier to query for cycle *cycle_number*. tier3 wins
-    over tier2 when both intervals align so the rarest data still refreshes
-    on schedule."""
+def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60,
+                    tier4_every=30):
+    """Pick which EPC tier to query for cycle *cycle_number*.
+
+    spec 018: tier4 (定時積算電力量) wins over tier3 wins over tier2 when
+    intervals align — losing tier4 means missing a 30-min cumulative
+    energy boundary, while tier3 (coefficient/unit) is near-static and
+    can wait. tier4_every <= 0 disables tier4 entirely (kill switch).
+    """
+    if tier4_every > 0 and cycle_number % int(tier4_every) == 0:
+        return "tier4"
     if cycle_number % int(tier3_every) == 0:
         return "tier3"
     if cycle_number % int(tier2_every) == 0:
@@ -2429,6 +2442,8 @@ def epcs_for_tier(tier):
         return TIER2_EPCS
     if tier == "tier3":
         return TIER3_EPCS
+    if tier == "tier4":
+        return TIER4_EPCS
     return TIER1_EPCS
 
 
@@ -2523,6 +2538,37 @@ def parse_el_response(data):
         pos += pdc
     return result
 
+def decode_cumulative_energy_fixed(epc_bytes):
+    """spec 018: parse ECHONET Lite EPC 0xEA / 0xEB (定時積算電力量).
+
+    11-byte response:
+      bytes 0-1: year (big-endian uint16)
+      byte  2:   month
+      byte  3:   day
+      byte  4:   hour
+      byte  5:   minute
+      byte  6:   second
+      bytes 7-10: raw cumulative value (uint32; × coefficient × unit → kWh)
+
+    Returns (timestamp_iso, raw_value) or None for short / invalid input.
+    Meter clock confirmed as JST on a real 2026-06-22 probe, so ISO8601
+    output carries `+09:00`. year < 2000 is treated as "meter clock not
+    set" → returns None so the caller skips publishing.
+    """
+    if len(epc_bytes) < 11:
+        return None
+    year = struct.unpack(">H", bytes(epc_bytes[0:2]))[0]
+    if year < 2000:
+        return None
+    month, day, hour, minute, second = (
+        int(epc_bytes[2]), int(epc_bytes[3]), int(epc_bytes[4]),
+        int(epc_bytes[5]), int(epc_bytes[6]))
+    raw = struct.unpack(">I", bytes(epc_bytes[7:11]))[0]
+    ts = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}+09:00".format(
+        year, month, day, hour, minute, second)
+    return (ts, raw)
+
+
 def decode_measurements(props):
     result = {}
 
@@ -2566,6 +2612,20 @@ def decode_measurements(props):
             t_signed = struct.unpack(">h", struct.pack(">H", t_raw))[0]
             result["current_t_a"] = t_signed / 10.0
 
+    # spec 018: EA / EB cumulative energy at 30-min boundary with meter
+    # timestamp. decode_cumulative_energy_fixed returns None for invalid
+    # input (short payload or meter clock not set) — skip silently.
+    if 0xEA in props:
+        ea = decode_cumulative_energy_fixed(props[0xEA])
+        if ea is not None:
+            result["energy_forward_fixed_ts"] = ea[0]
+            result["energy_forward_fixed_raw"] = ea[1]
+    if 0xEB in props:
+        eb = decode_cumulative_energy_fixed(props[0xEB])
+        if eb is not None:
+            result["energy_reverse_fixed_ts"] = eb[0]
+            result["energy_reverse_fixed_raw"] = eb[1]
+
     return result
 
 def apply_energy_scale(measurements, coeff, unit_kwh):
@@ -2575,6 +2635,13 @@ def apply_energy_scale(measurements, coeff, unit_kwh):
         measurements["energy_forward_kwh"] = measurements["energy_forward_raw"] * c * u
     if "energy_reverse_raw" in measurements:
         measurements["energy_reverse_kwh"] = measurements["energy_reverse_raw"] * c * u
+    # spec 018: same scale for the 30-min boundary cumulative values.
+    if "energy_forward_fixed_raw" in measurements:
+        measurements["energy_forward_fixed_kwh"] = (
+            measurements["energy_forward_fixed_raw"] * c * u)
+    if "energy_reverse_fixed_raw" in measurements:
+        measurements["energy_reverse_fixed_kwh"] = (
+            measurements["energy_reverse_fixed_raw"] * c * u)
     return measurements
 
 # ---------------------------------------------------------------------------
@@ -3123,6 +3190,10 @@ SENSOR_DEFS = [
     ("energy_reverse", "Cumulative Energy Rev", "kWh", "energy",  "total_increasing"),
     ("current_r",      "Current R Phase",       "A",   "current", "measurement"),
     ("current_t",      "Current T Phase",       "A",   "current", "measurement"),
+    # spec 018: 30-min boundary cumulative energy with meter-side timestamp.
+    # Suited for HA Energy dashboard which expects 30-min aligned values.
+    ("energy_forward_fixed", "Cumulative Energy Fwd (30min)", "kWh", "energy", "total_increasing"),
+    ("energy_reverse_fixed", "Cumulative Energy Rev (30min)", "kWh", "energy", "total_increasing"),
 ]
 
 def _device_dict(device_id):
@@ -3256,6 +3327,21 @@ def publish_measurements(mqtt, device_id, m):
         mqtt.publish("{}/current_r".format(base), "{:.1f}".format(m["current_r_a"]))
     if "current_t_a" in m:
         mqtt.publish("{}/current_t".format(base), "{:.1f}".format(m["current_t_a"]))
+    # spec 018: 30-min boundary cumulative energy + meter-side timestamp.
+    # ts topics are retained=True so the last meter timestamp survives a
+    # broker rebuild (works well with the spec 016 discovery republish).
+    if "energy_forward_fixed_kwh" in m:
+        mqtt.publish("{}/energy_forward_fixed".format(base),
+                     "{:.3f}".format(m["energy_forward_fixed_kwh"]))
+    if "energy_reverse_fixed_kwh" in m:
+        mqtt.publish("{}/energy_reverse_fixed".format(base),
+                     "{:.3f}".format(m["energy_reverse_fixed_kwh"]))
+    if "energy_forward_fixed_ts" in m:
+        mqtt.publish("{}/energy_forward_fixed_ts".format(base),
+                     m["energy_forward_fixed_ts"], retain=True)
+    if "energy_reverse_fixed_ts" in m:
+        mqtt.publish("{}/energy_reverse_fixed_ts".format(base),
+                     m["energy_reverse_fixed_ts"], retain=True)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -3429,7 +3515,11 @@ def main():
                 # spec 011 C: tier rotation. Smaller per-cycle payload =
                 # faster meter response + less data starvation on the
                 # rare-but-needed tiers.
-                tier = decide_epc_tier(normal_cycle_count)
+                # spec 018: tier4 added (default every=30 = 30-min boundary
+                # cumulative energy with meter-side timestamp).
+                tier = decide_epc_tier(
+                    normal_cycle_count,
+                    tier4_every=int(cfg.get("epc_tier4_every", 30)))
                 cycle_epcs = epcs_for_tier(tier)
                 normal_cycle_count += 1
                 last_normal_poll_start = last_poll_start

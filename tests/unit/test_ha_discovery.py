@@ -148,14 +148,14 @@ def test_measurement_and_diag_share_identical_device_block():
 
 def test_publish_ha_discovery_includes_diag_when_called_once():
     """After integration the single entry point publish_ha_discovery should
-    publish both measurement and diagnostic configs (count = 5 measurement
-    + len(DIAG_SENSOR_DEFS) diagnostic)."""
+    publish both measurement and diagnostic configs (count =
+    len(SENSOR_DEFS) measurement + len(DIAG_SENSOR_DEFS) diagnostic)."""
     mqtt = FakeMQTT()
     mb.publish_ha_discovery(mqtt, "cubej1")
     payloads = _payloads_by_topic(mqtt)
     assert "homeassistant/sensor/cubej1/power/config" in payloads
     assert "homeassistant/sensor/cubej1/mqtt_reconnects_total/config" in payloads
-    assert len(payloads) == 5 + len(mb.DIAG_SENSOR_DEFS)
+    assert len(payloads) == len(mb.SENSOR_DEFS) + len(mb.DIAG_SENSOR_DEFS)
 
 
 def test_device_id_threads_through_topic_and_unique_id():

@@ -1,246 +1,216 @@
-# Plan: spec 017 Wi-SUN Rejoin Exponential Backoff + Serial Reopen + EVENT 24/29 Trigger
+# Plan: spec 018 Cumulative Energy Fixed (EPC 0xEA/0xEB) Tier 4
 
 ## Context
 
-spec 011 (`erxudp_timeout_force_reconnect_threshold = 5`) で「連続 ERXUDP timeout 5 回で wisun_connect やり直し」までは実装済。 ただし再接続の中身は **固定 30 秒 sleep** (`production_tool/mqtt_bridge.py:3506`) で、 長時間障害シナリオで以下が課題:
+当方の spec 011 C tier rotation で polling EPC を 3 tier に分け、 瞬時電力 (tier1) はリアルタイム、 積算電力量 (tier2 = 0xE0/0xE3、 5 サイクル毎) はゆっくり、 係数 (tier3 = 0xD3/0xE1、 60 サイクル毎) はほぼ静的に取れている。 しかし HA Energy ダッシュボードは **30 分粒度の累積電力量** を期待しており、 現状の tier2 「ポーリング時点の累積値」では:
+- ポーリング jitter で 30 分境界がずれる
+- bridge 再起動の前後で欠損
 
-1. **指数 backoff なし** — 30 秒で永遠リトライ、 メーターに無駄な SKJOIN 負荷
-2. **シリアル port reopen なし** — BP35CX 側 UART ハングから永遠に復帰しない
-3. **EVENT 24/29 (PANA 失敗) 即時トリガなし** — timeout 待ちの 30+ 秒を浪費
+ECHONET Lite の **0xEA (定時積算電力量 forward)** / **0xEB (reverse)** は メーター側が記録した 30 分境界の値 + 内蔵 timestamp を返す:
+- 11 byte レスポンス: bytes 0-6 = year/month/day/hour/min/sec、 bytes 7-10 = 累積値 uint32 (係数 × 単位適用後 kWh)
+- メーター内蔵 clock で記録するので bridge 側の jitter 影響ゼロ
+- HA Energy の 30 分粒度仕様に完全一致
 
-hals5412 fork `2779679` (production_tool_v2) の発想 (initial=30 / max=300 / multiplier=2.0、 N=5 で serial reopen、 EVENT 24 即時 trigger) を取り込む。
+hals5412 fork `c884ec3` の発想を取り込む (fork 自体は「全 EPC まとめて Get」思想で当方 tier rotation と非互換なので、 当方は **tier4 として独立に組み込む**)。
 
 ## Approach
 
-- pure helper `compute_rejoin_backoff(attempt, initial, multiplier, max_sec)` を抽出 (testable な核)
-- main loop の外側 except 経路は **既存の soft-retry-loop 構造を維持** (dig Round 1 決定 1): `time.sleep(30)` を `time.sleep(compute_rejoin_backoff(counter, ...))` に置換、 counter は DiagState `consecutive_wisun_connect_failures` で永続化 (1 outer except = 1 try)
-- 連続 N 回失敗で `os.close(fd)` + `open_serial(...)` で UART reopen (失敗時 WARN ログ + 元 fd 保持、 致命的扱いせず)
-- `read_erxudp` に EVENT 24/29 検出を入れ、 DiagState の `pending_wisun_rejoin` flag を立てて即時 rejoin
-- DiagState に `serial_reopen_total` counter (publish) + `consecutive_wisun_connect_failures` counter (内部) + `pending_wisun_rejoin` bool (内部) + 対応メソッド
-- `pending_wisun_rejoin` クリアは **raise 直前** (signal consume パターン、 dig Round 1 決定 2)
-- snapshot 公開は `serial_reopen_total` のみ (dig Round 1 決定 3: minimal schema 維持、 consecutive は transient state で長期観測価値が低い)
+- 新 `TIER4_EPCS = [0xEA, 0xEB]` (定時積算 fwd/rev)
+- `decide_epc_tier(cycle, tier2_every=5, tier3_every=60, tier4_every=30)` 拡張: 優先順 `tier4 > tier3 > tier2 > tier1`
+- `apply_defaults` に `epc_tier4_every` (default 30) 追加
+- `decode_measurements` に 0xEA/0xEB decoder 追加: meter timestamp + raw uint32 を返す
+- `apply_energy_scale` で `_fixed_kwh` 変種に係数 × 単位適用
+- `publish_measurements` で 2 新 topic + timestamp 属性発行
+- `SENSOR_DEFS` に 2 sensor 追加 (energy, total_increasing)
 
 ## Files to modify
 
 ### `production_tool/mqtt_bridge.py`
 
-1. **pure helper** (line 2200 付近、 `decide_epc_tier` の隣):
+1. **pure helper** (decode_measurements の前、 line 2526 付近):
    ```python
-   def compute_rejoin_backoff(attempt, initial_sec, multiplier, max_sec):
-       """spec 017: exponential backoff for wisun_connect retries.
+   def decode_cumulative_energy_fixed(epc_bytes):
+       """spec 018: parse ECHONET Lite EPC 0xEA / 0xEB (定時積算電力量).
 
-       attempt 0 → initial, 1 → initial*mult, ..., clamped at max_sec.
-       Negative attempt is treated as 0. multiplier <= 1 → linear at
-       initial. initial >= max → always max."""
-       a = max(0, int(attempt))
-       backoff = float(initial_sec) * (float(multiplier) ** a)
-       return int(min(backoff, float(max_sec)))
+       11-byte response:
+         bytes 0-1: year (big-endian uint16)
+         byte  2:   month
+         byte  3:   day
+         byte  4:   hour
+         byte  5:   minute
+         byte  6:   second
+         bytes 7-10: raw cumulative value (uint32)
+
+       Returns (timestamp_iso, raw_value) or None for short / invalid
+       input. dig Round 1 決定 1: ISO8601 に `+09:00` JST suffix を付与
+       (日本のスマートメーターは JST 設定が標準で、 実機検証で device
+       clock が UTC でも meter B-route 側は JST と推定。 deploy 後の
+       実機ログで `energy_forward_fixed_ts` の値と device 時刻を **手動
+       で突き合わせ**、 明らかにズレているなら +09:00 を見直す)。
+       dig Round 1 決定 2: year < 2000 を invalid と判定し None を返す
+       (メーター clock 未設定の場合のスキップ動作)。
+       """
+       if len(epc_bytes) < 11:
+           return None
+       year = struct.unpack(">H", bytes(epc_bytes[0:2]))[0]
+       if year < 2000:
+           return None
+       month, day, hour, minute, second = (
+           int(epc_bytes[2]), int(epc_bytes[3]), int(epc_bytes[4]),
+           int(epc_bytes[5]), int(epc_bytes[6]))
+       raw = struct.unpack(">I", bytes(epc_bytes[7:11]))[0]
+       ts = "{:04d}-{:02d}-{:02d}T{:02d}:{:02d}:{:02d}+09:00".format(
+           year, month, day, hour, minute, second)
+       return (ts, raw)
    ```
 
-2. **`apply_defaults`** (line 153 付近、 spec 019 ブロックの直後):
+2. **TIER 定数** (line 2410 付近、 既存 TIER3_EPCS の隣):
    ```python
-   # spec 017: Wi-SUN rejoin exponential backoff + serial port reopen.
-   out.setdefault("wisun_rejoin_backoff_initial_sec", 30)
-   out.setdefault("wisun_rejoin_backoff_max_sec", 300)
-   out.setdefault("wisun_rejoin_backoff_multiplier", 2.0)
-   out.setdefault("wisun_serial_reopen_after_rejoin_failures", 5)
+   TIER4_EPCS = [0xEA, 0xEB]         # 定時積算電力量 fwd/rev — meter timestamp
    ```
 
-3. **`DiagState.__init__`** (line 1820 付近、 spec 016 ブロックの隣):
+3. **`decide_epc_tier`** (line 2415 付近、 シグネチャに `tier4_every` 追加):
    ```python
-   # spec 017: Wi-SUN rejoin observability.
-   self.serial_reopen_total = 0
-   self.consecutive_wisun_connect_failures = 0
-   self.pending_wisun_rejoin = False
+   def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60,
+                      tier4_every=30):
+       """spec 018: tier4 (cumulative energy fixed) wins over tier3 wins
+       over tier2 — when multiple cycle-multiple conditions match the
+       rarer tier is selected so least-frequent EPCs still refresh."""
+       if tier4_every > 0 and cycle_number % int(tier4_every) == 0:
+           return "tier4"
+       if cycle_number % int(tier3_every) == 0:
+           return "tier3"
+       if cycle_number % int(tier2_every) == 0:
+           return "tier2"
+       return "tier1"
+   ```
+   注: `tier4_every <= 0` で機能無効化 (kill switch)、 既存挙動互換
+
+4. **`epcs_for_tier`** 拡張:
+   ```python
+   def epcs_for_tier(tier):
+       if tier == "tier2":
+           return TIER2_EPCS
+       if tier == "tier3":
+           return TIER3_EPCS
+       if tier == "tier4":
+           return TIER4_EPCS
+       return TIER1_EPCS
    ```
 
-4. **`DiagState` 新メソッド 2 本** (既存 on_wisun_reconnect の隣):
+5. **`apply_defaults`** (line 167 付近、 spec 017 ブロックの直後):
    ```python
-   def on_serial_reopen(self):
-       self.serial_reopen_total += 1
-
-   def on_wisun_pana_fail(self, event_id):
-       """spec 017: PANA fail (EVENT 24/29) — signal force-rejoin to
-       the main loop, also bump the SK event counter (existing path)."""
-       self.on_sk_event(event_id)
-       self.pending_wisun_rejoin = True
+   # spec 018: cumulative energy fixed (EPC 0xEA/0xEB) tier4. Meter
+   # records 30-min-boundary values with internal timestamp. Default
+   # every=30 cycles ≈ 30 min at poll_interval=60s. Set 0 to disable.
+   out.setdefault("epc_tier4_every", 30)
    ```
 
-5. **`should_force_wisun_reconnect`** (line 1234 付近、 pure helper を拡張):
+6. **`decode_measurements`** (line 2526 付近、 既存 dict に追加):
    ```python
-   def should_force_wisun_reconnect(consecutive, threshold, pending=False):
-       """spec 017: pending overrides the threshold check (immediate
-       rejoin signal from EVENT 24/29)."""
-       if pending:
-           return True
-       if int(threshold) <= 0:
-           return False
-       return int(consecutive) >= int(threshold)
-   ```
-   (default 引数 pending=False で既存 callers 互換)
+   # EA: cumulative forward energy at 30-min boundary (timestamped, scaled)
+   if 0xEA in props:
+       ea = decode_cumulative_energy_fixed(props[0xEA])
+       if ea is not None:
+           result["energy_forward_fixed_ts"] = ea[0]
+           result["energy_forward_fixed_raw"] = ea[1]
 
-6. **`_DIAG_SNAPSHOT_KEYS`** (line 1451 付近) に追加:
-   ```python
-   "serial_reopen_total",
-   ```
-   `pending_wisun_rejoin` は内部状態なので公開しない (spec 016 と同じ minimal schema 判断)
-
-7. **snapshot raw dict** (line 1949 付近):
-   ```python
-   "serial_reopen_total": self.serial_reopen_total,
+   # EB: cumulative reverse energy at 30-min boundary (timestamped, scaled)
+   if 0xEB in props:
+       eb = decode_cumulative_energy_fixed(props[0xEB])
+       if eb is not None:
+           result["energy_reverse_fixed_ts"] = eb[0]
+           result["energy_reverse_fixed_raw"] = eb[1]
    ```
 
-8. **`read_erxudp`** (line 2627 付近、 `kind == "event"` 分岐):
-   既存:
+7. **`apply_energy_scale`** (line 2571 付近、 既存ロジックに追加):
    ```python
-   if kind == "event":
-       if diag_state is not None:
-           try:
-               diag_state.on_sk_event(value)
-           except Exception as e:
-               log("diag on_sk_event error: {}".format(e))
-       continue
-   ```
-   差し替え (spec 017 で EVENT 24/29 を special handling、 他 event は従来通り):
-   ```python
-   if kind == "event":
-       if diag_state is not None:
-           try:
-               if value in ("24", "29"):
-                   diag_state.on_wisun_pana_fail(value)
-               else:
-                   diag_state.on_sk_event(value)
-           except Exception as e:
-               log("diag on_sk_event error: {}".format(e))
-       continue
+   if "energy_forward_fixed_raw" in measurements:
+       measurements["energy_forward_fixed_kwh"] = (
+           measurements["energy_forward_fixed_raw"] * c * u)
+   if "energy_reverse_fixed_raw" in measurements:
+       measurements["energy_reverse_fixed_kwh"] = (
+           measurements["energy_reverse_fixed_raw"] * c * u)
    ```
 
-9. **main loop の `should_force_wisun_reconnect` 呼び出し** (line 3458-3464 付近):
+8. **`SENSOR_DEFS`** (line 3120 付近) 拡張:
    ```python
-   if should_force_wisun_reconnect(
-           diag_state.consecutive_erxudp_timeouts,
-           int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
-           pending=diag_state.pending_wisun_rejoin):
-       # dig Round 1 決定 2: signal consume — clear before raise.
-       # If reconnect fails, EVENT 24/29 re-firing will re-set the flag,
-       # and ERXUDP timeout threshold also provides a safety net.
-       _was_pending = diag_state.pending_wisun_rejoin
-       diag_state.pending_wisun_rejoin = False
-       raise RuntimeError(
-           "wisun reconnect forced: consecutive_erxudp_timeouts={}, "
-           "pending={}".format(
-               diag_state.consecutive_erxudp_timeouts, _was_pending))
+   ("energy_forward_fixed", "Cumulative Energy Fwd (30min)", "kWh", "energy", "total_increasing"),
+   ("energy_reverse_fixed", "Cumulative Energy Rev (30min)", "kWh", "energy", "total_increasing"),
    ```
 
-10. **main loop 外側 except 経路** (line 3505-3516 付近、 既存型を保ったまま sleep を backoff に置換 + serial reopen 分岐追加、 dig Round 1 決定 1):
+9. **`publish_measurements`** (line 3247 付近) 拡張:
    ```python
-   except Exception as e:
-       attempt = diag_state.consecutive_wisun_connect_failures
-       _backoff = compute_rejoin_backoff(
-           attempt,
-           int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
-           float(cfg.get("wisun_rejoin_backoff_multiplier", 2.0)),
-           int(cfg.get("wisun_rejoin_backoff_max_sec", 300)))
-       log("Main loop error (attempt {}): {} - reconnecting Wi-SUN in {}s"
-           .format(attempt + 1, e, _backoff))
-       time.sleep(_backoff)
-       # spec 017: after N consecutive failures, reopen the serial port
-       # to recover from BP35CX UART hangs.
-       _reopen_after = int(cfg.get(
-           "wisun_serial_reopen_after_rejoin_failures", 5))
-       if _reopen_after > 0 and attempt + 1 >= _reopen_after:
-           try:
-               os.close(fd)
-               fd = open_serial(serial_port)
-               diag_state.on_serial_reopen()
-               log("Serial port reopened after {} failures".format(
-                   attempt + 1))
-           except Exception as re:
-               log("WARN: serial reopen failed (continuing with original fd): {}"
-                   .format(re))
-       try:
-           ipv6 = wisun_connect(fd, br_id, br_pwd, diag_state=diag_state)
-           log("Wi-SUN reconnected at {}".format(ipv6))
-           diag_state.consecutive_wisun_connect_failures = 0
-           try:
-               diag_state.on_wisun_reconnect()
-           except Exception as e3:
-               log("diag on_wisun_reconnect error: {}".format(e3))
-       except Exception as e2:
-           diag_state.consecutive_wisun_connect_failures += 1
-           log("Wi-SUN reconnect failed (will retry next cycle): {}".format(e2))
+   if "energy_forward_fixed_kwh" in m:
+       mqtt.publish("{}/energy_forward_fixed".format(base),
+                    "{:.3f}".format(m["energy_forward_fixed_kwh"]))
+   if "energy_reverse_fixed_kwh" in m:
+       mqtt.publish("{}/energy_reverse_fixed".format(base),
+                    "{:.3f}".format(m["energy_reverse_fixed_kwh"]))
+   # spec 018: meter-side timestamp as a separate sub-topic.
+   # dig Round 1 決定 3: retained=True for ts topics so the last meter
+   # timestamp survives broker rebuild (relevant after spec 016 republish).
+   # HA state machine itself does not back-fill state with this ts —
+   # Grafana/InfluxDB direct queries can use it for historical accuracy.
+   if "energy_forward_fixed_ts" in m:
+       mqtt.publish("{}/energy_forward_fixed_ts".format(base),
+                    m["energy_forward_fixed_ts"], retain=True)
+   if "energy_reverse_fixed_ts" in m:
+       mqtt.publish("{}/energy_reverse_fixed_ts".format(base),
+                    m["energy_reverse_fixed_ts"], retain=True)
    ```
+   注: `mqtt.publish(... retain=True)` の引数が既存 MQTTClient に対応しているか実装直前に確認 (既存 publish_ha_discovery が retain=True で呼んでいるので対応済の見込み)。
 
-   注: serial_port は line 3220 で `cfg.get("serial_port", "/dev/ttyS1")` から派生し main() スコープに保持されている、 outer except から参照可能 (実コード確認済)。
+10. **main loop** (line 3068 付近、 既存の `cycle_epcs = epcs_for_tier(tier)` 経路): `decide_epc_tier` シグネチャ拡張で `tier4_every=int(cfg.get("epc_tier4_every", 30))` を渡すよう改修
 
-### `tests/unit/test_compute_rejoin_backoff.py` (新規)
+### `tests/unit/test_decode_cumulative_energy_fixed.py` (新規)
 
 pure helper の TDD:
-- `test_returns_initial_at_attempt_zero`
-- `test_doubles_each_attempt_with_default_multiplier`
-- `test_clamps_at_max_sec`
-- `test_negative_attempt_treated_as_zero`
-- `test_multiplier_one_returns_initial`
-- `test_initial_greater_than_max_returns_max`
+- `test_decodes_normal_11_byte_payload_with_jst_suffix` (固定された 11 byte で `+09:00` 付き ts + raw uint32 取得)
+- `test_returns_none_for_short_payload` (10 byte 以下)
+- `test_returns_none_for_year_less_than_2000` (年=0、 年=1999 等 invalid を弾く、 dig Round 1 決定 2)
+- `test_handles_extreme_uint32_value` (0xFFFFFFFF)
+- `test_accepts_year_2000_as_lower_boundary` (= 2000 は valid、 strictly less than 2000 のみ invalid)
 
-### `tests/unit/test_diag_state.py` (拡張)
+### `tests/unit/test_epc_tier.py` (拡張)
 
-baseline `test_initial_snapshot_includes_zero_counters_uptime_and_version` 更新:
-- `"serial_reopen_total": 0` 追加 (`consecutive_wisun_connect_failures` は publish しないので expected dict には含めない、 dig Round 1 決定 3)
+既存 tier rotation テストに追加:
+- `test_tier4_at_every_30_cycles_default`
+- `test_tier4_wins_over_tier3_when_both_match`
+- `test_tier4_disabled_when_every_zero`
+- `test_epcs_for_tier_tier4_returns_ea_eb`
 
-新規:
-- `test_on_serial_reopen_increments_counter`
-- `test_on_wisun_pana_fail_sets_pending_flag_and_increments_sk_event_counter`
-- `test_pending_wisun_rejoin_starts_false`
-- `test_consecutive_wisun_connect_failures_starts_at_zero`
-- `test_snapshot_includes_serial_reopen_total_at_zero`
+### `tests/unit/test_existing_pure.py` または新規 `test_decode_measurements_fixed.py` (decode_measurements integration テスト)
 
-### `tests/unit/test_should_force_reconnect.py` (拡張)
+- `test_decode_measurements_decodes_0xEA_forward`
+- `test_decode_measurements_decodes_0xEB_reverse`
+- `test_apply_energy_scale_applies_to_fixed_variants`
 
-既存テスト群に追加:
-- `test_pending_overrides_threshold_check` (pending=True で threshold 未到達でも True 返却)
-- `test_pending_false_keeps_existing_behaviour`
+## Test list (TDD 順)
 
-### `tests/unit/test_read_erxudp_tid.py` (拡張) — EVENT 24/29 検出のテスト
-
-dig Round 2 注記: テスト用 `_FakeDiagState` を導入 (既存 read_erxudp テストは DiagState 渡していなかったので新規)。 `on_wisun_pana_fail` / `on_sk_event` の call 履歴を記録するシンプルな fake。
-
-- `test_read_erxudp_event_24_calls_on_wisun_pana_fail` (EVENT 24 line → on_wisun_pana_fail("24") のみ呼ばれ、 on_sk_event は呼ばれない)
-- `test_read_erxudp_event_29_calls_on_wisun_pana_fail` (同上)
-- `test_read_erxudp_event_22_still_calls_on_sk_event` (既存 path 互換、 PANA 系以外の EVENT は従来通り)
-
-## Pure helper のテスト先行 (TDD 順)
-
-1. **Red**: `test_returns_initial_at_attempt_zero` → AttributeError on compute_rejoin_backoff
-2. (stub: return initial_sec)
-3. **Red**: `test_doubles_each_attempt_with_default_multiplier` → stub では fail
-4. **Red**: `test_clamps_at_max_sec`
-5. **Red**: `test_negative_attempt_treated_as_zero`
-6. **Red**: `test_multiplier_one_returns_initial`
-7. **Red**: `test_initial_greater_than_max_returns_max`
-8-15. DiagState 拡張 (5 件) + should_force_wisun_reconnect 拡張 (2 件) + read_erxudp EVENT (2 件)
-16. main loop integration: テストせず実機検証 (spec 016/019 と同じ判断、 mock 過大)
+1-4. **Red**: `decode_cumulative_energy_fixed` 4 件 (pure helper TDD)
+5-8. **Red**: `decide_epc_tier` / `epcs_for_tier` 拡張 4 件
+9-11. **Red**: `decode_measurements` + `apply_energy_scale` integration 3 件
+12. main loop integration (`decide_epc_tier` call site) はテストせず実機検証
 
 ## Verification
 
-1. `.venv/bin/pytest -q --ignore=tests/benchmark` で **既存 361 + 新規 ~15 = ~376 件 pass**
-2. ruff check 新規エラー 0
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 377 + 新規 ~12 = ~389 件 pass
+2. ruff check 新規エラー無し
 3. lab-ub01 経由 deploy
 4. 実機で:
-   - `/api/diag` (admin auth 経由) に `serial_reopen_total: 0` が見える
-   - logcat / mqtt_bridge.log で WISUN 障害シナリオ発生時に「WARN: wisun_connect failed (attempt N): ... - sleep Ms」が出る
-   - serial reopen も 5 回連続失敗で発火するはず (実機長期観測)
-5. 長期効果: spec 011 の `wisun_reconnects_total` の伸びが緩やかになる (= 障害復帰が指数 backoff で抑制)
+   - 30 分後に新 MQTT topic `cubej/cubej1/energy_forward_fixed` (値) + `..._ts` (timestamp) が publish される
+   - HA discovery で `cumulative_energy_fwd_30min_kwh` sensor が出現、 device_class=energy で Energy ダッシュボードに選択可能
+5. 長期効果 (1 ヶ月程度): HA Energy 月次集計 vs メーター物理表示値 (= 検針) の誤差が ±0.1 kWh 以内 (spec.md SC-003)
 
 ## Commit 戦略
 
-前 4 回踏襲 (spec 014/015/016/019):
-- 018 spec.md を /tmp に stash
-- spec 017 関連 + spec.md + plan + redact-plans 適用で commit
-- 018 spec.md を restore して @ に戻す
-- 並行衝突あれば jj edit で cleanup
-- push は forward only (新ルール遵守)
+これが最後の spec (017/018/019 から残り無し)、 stash 不要、 シンプル commit:
+- redact plan
+- jj commit (spec.md + plan + 実装 + tests)
+- main forward push
+- deploy
 
 ## Commit message
 
-`feat(bridge): Wi-SUN rejoin 指数 backoff + serial reopen + EVENT 24/29 即時 trigger (spec 017)`
+`feat(bridge): 定時積算電力量 (EPC 0xEA/0xEB) tier4 で HA Energy 精度向上 (spec 018)`

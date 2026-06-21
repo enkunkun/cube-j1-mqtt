@@ -167,6 +167,47 @@ def test_apply_energy_scale_falls_back_to_passed_values_when_absent():
 
 
 # ---------------------------------------------------------------------------
+# spec 018: decode_measurements + apply_energy_scale for 0xEA/0xEB
+# ---------------------------------------------------------------------------
+
+
+def test_decode_measurements_decodes_0xEA_forward_fixed():
+    # Real meter probe payload (2026-06-22): year=2026 month=6 day=22 hour=8 min=30 sec=0 raw=512877
+    props = {0xEA: bytearray(b"\x07\xEA\x06\x16\x08\x1E\x00\x00\x07\xD3\x6D")}
+    m = mb.decode_measurements(props)
+    assert m["energy_forward_fixed_ts"] == "2026-06-22T08:30:00+09:00"
+    assert m["energy_forward_fixed_raw"] == 512877
+
+
+def test_decode_measurements_decodes_0xEB_reverse_fixed():
+    props = {0xEB: bytearray(b"\x07\xEA\x06\x16\x09\x00\x00\x00\x00\x00\x64")}
+    m = mb.decode_measurements(props)
+    assert m["energy_reverse_fixed_ts"] == "2026-06-22T09:00:00+09:00"
+    assert m["energy_reverse_fixed_raw"] == 100
+
+
+def test_decode_measurements_skips_0xEA_when_meter_clock_not_set():
+    """spec 018: year < 2000 = meter clock not set → no fields populated."""
+    props = {0xEA: bytearray(b"\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00")}
+    m = mb.decode_measurements(props)
+    assert "energy_forward_fixed_ts" not in m
+    assert "energy_forward_fixed_raw" not in m
+
+
+def test_apply_energy_scale_applies_to_fixed_variants():
+    measurements = {
+        "coefficient": 2,
+        "unit_kwh": 0.1,
+        "energy_forward_fixed_raw": 100,
+        "energy_reverse_fixed_raw": 50,
+    }
+    out = mb.apply_energy_scale(measurements, coeff=1, unit_kwh=1.0)
+    # 100 * 2 * 0.1 = 20.0、 50 * 2 * 0.1 = 10.0
+    assert out["energy_forward_fixed_kwh"] == 20.0
+    assert out["energy_reverse_fixed_kwh"] == 10.0
+
+
+# ---------------------------------------------------------------------------
 # MQTT helpers: _encode_remaining / _encode_str
 # ---------------------------------------------------------------------------
 
