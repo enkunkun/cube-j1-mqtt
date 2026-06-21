@@ -131,12 +131,19 @@ def apply_defaults(cfg):
     # is a balance between visibility and meter-poll interference (~12s
     # sweep stops meter traffic for that cycle).
     out.setdefault("eedscan_enabled", True)
-    out.setdefault("eedscan_interval_sec", 300)
+    # spec 012: shorten EEDSCAN interval so noise judgements stay fresh.
+    out.setdefault("eedscan_interval_sec", 120)
     # spec 011: ERXUDP resilience. timeout 30s + 2 intra-cycle retries
     # with 2s backoff covers the p95 5s tail and the rare 10-20s outliers.
     out.setdefault("erxudp_timeout_sec", 30)
     out.setdefault("erxudp_intra_cycle_retries", 2)
     out.setdefault("erxudp_retry_backoff_sec", 2)
+    # spec 012: noise-adaptive poll skip — skip normal poll when the last
+    # EEDSCAN shows the PAN channel is noisy (>= threshold). Avoids the
+    # wisun_reconnect storm that follows clusters of receive failures.
+    out.setdefault("noise_adaptive_skip_enabled", True)
+    out.setdefault("noise_skip_threshold", 100)
+    out.setdefault("noise_skip_max_consecutive", 3)
     # spec 013: poll_interval default 60s + ARIB STD-T108 floor 30s.
     # Faster polling risks exceeding the 360s/hour duty cycle once
     # retries/reconnects are factored in.
@@ -268,6 +275,16 @@ class EedScanState(object):
         if pan_channel is not None and pan_channel in self.last_result:
             out["eedscan_pan_channel_energy"] = self.last_result[pan_channel]
         return out
+
+    def is_noisy(self, threshold, pan_channel):
+        """Spec 012: True if the most recent sweep observed the PAN channel
+        at energy >= threshold. Empty history or missing channel returns
+        False (= caller runs the normal poll)."""
+        if not self.last_result:
+            return False
+        if pan_channel not in self.last_result:
+            return False
+        return self.last_result[pan_channel] >= threshold
 
 
 def decide_cycle_kind(probe_active, last_normal_start, now, poll_interval):
@@ -1439,6 +1456,8 @@ _DIAG_SNAPSHOT_KEYS = (
     "erxudp_timeouts_total",
     "erxudp_intra_cycle_retries_total",
     "erxudp_recovered_by_retry_total",
+    "erxudp_tid_mismatch_total",
+    "noise_adaptive_skips_total",
     "uptime_seconds",
     "version",
 )
@@ -1794,6 +1813,9 @@ class DiagState(object):
         # Spec 011: intra-cycle retry counters.
         self.erxudp_intra_cycle_retries_total = 0
         self.erxudp_recovered_by_retry_total = 0
+        # Spec 012: noise-adaptive skip + ERXUDP TID mismatch observability.
+        self.noise_adaptive_skips_total = 0
+        self.erxudp_tid_mismatch_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -1829,6 +1851,14 @@ class DiagState(object):
 
     def on_erxudp_recovered_by_retry(self):
         self.erxudp_recovered_by_retry_total += 1
+
+    # Spec 012: noise-adaptive skip + TID mismatch counters.
+
+    def on_noise_adaptive_skip(self):
+        self.noise_adaptive_skips_total += 1
+
+    def on_erxudp_tid_mismatch(self):
+        self.erxudp_tid_mismatch_total += 1
 
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
@@ -1888,6 +1918,8 @@ class DiagState(object):
                 self.erxudp_intra_cycle_retries_total,
             "erxudp_recovered_by_retry_total":
                 self.erxudp_recovered_by_retry_total,
+            "erxudp_tid_mismatch_total": self.erxudp_tid_mismatch_total,
+            "noise_adaptive_skips_total": self.noise_adaptive_skips_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2260,6 +2292,19 @@ def build_el_get(tid, epcs):
     for epc in epcs:
         frame += struct.pack("BB", epc, 0)   # EPC, PDC=0
     return bytes(frame)
+
+
+def extract_el_tid(payload):
+    """Return the big-endian TID from an ECHONET Lite payload, or None.
+
+    spec 012: used to reject ERXUDP frames whose TID doesn't match the one
+    we just sent. Payload bytes 2-3 are the TID (after EHD1/EHD2 at 0-1).
+    Returns None for payloads shorter than 4 bytes; the caller treats that
+    as a mismatch and discards the frame.
+    """
+    if len(payload) < 4:
+        return None
+    return struct.unpack(">H", bytes(payload[2:4]))[0]
 
 def parse_el_response(data):
     """Returns dict {epc_int: bytearray}."""
@@ -2869,6 +2914,8 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_timeouts_total",  "ERXUDP Timeouts",     None, None,        "total_increasing", "diagnostic"),
     ("erxudp_intra_cycle_retries_total", "ERXUDP Intra-Cycle Retries", None, None, "total_increasing", "diagnostic"),
     ("erxudp_recovered_by_retry_total",  "ERXUDP Recovered by Retry",  None, None, "total_increasing", "diagnostic"),
+    ("erxudp_tid_mismatch_total",        "ERXUDP TID Mismatch",        None, None, "total_increasing", "diagnostic"),
+    ("noise_adaptive_skips_total",       "Noise-Adaptive Skips",       None, None, "total_increasing", "diagnostic"),
     ("uptime_seconds",         "Uptime",              "s",  None,        "measurement",      "diagnostic"),
     ("version",                "Bridge Version",      None, None,        None,               "diagnostic"),
     # Spec 006: Wi-SUN health observability — RTT distribution + EVENT/FAIL.
@@ -3076,6 +3123,8 @@ def main():
     # spec 011 C: count normal cycles to rotate EPC tier across the
     # tier1 (per cycle), tier2 (5 cycles), tier3 (60 cycles) schedule.
     normal_cycle_count = 0
+    # spec 012: track consecutive noise-skip count for the fail-safe.
+    noise_skip_streak = 0
 
     while True:
         try:
@@ -3083,6 +3132,24 @@ def main():
             probing = probe_state.is_active(last_poll_start)
             kind = decide_cycle_kind(probing, last_normal_poll_start,
                                      last_poll_start, poll_interval)
+            # spec 012: skip normal poll while the PAN channel is noisy,
+            # with a fail-safe of N consecutive skips to prevent indefinite
+            # silence if EEDSCAN never settles.
+            if kind == "normal" and cfg.get("noise_adaptive_skip_enabled", True):
+                if (eedscan_state.is_noisy(
+                        threshold=int(cfg.get("noise_skip_threshold", 100)),
+                        pan_channel=diag_state.pan_channel)
+                        and noise_skip_streak < int(cfg.get(
+                            "noise_skip_max_consecutive", 3))):
+                    try:
+                        diag_state.on_noise_adaptive_skip()
+                    except Exception as e:
+                        log("diag on_noise_adaptive_skip error: {}".format(e))
+                    noise_skip_streak += 1
+                    time.sleep(compute_next_poll_sleep(
+                        last_poll_start, time.time(), poll_interval))
+                    continue
+                noise_skip_streak = 0
             if kind == "probe":
                 cycle_epcs = PROBE_EPCS
             else:

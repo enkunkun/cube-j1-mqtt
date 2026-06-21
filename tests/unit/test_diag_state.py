@@ -33,6 +33,9 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 011 retry counters also baseline at 0
         "erxudp_intra_cycle_retries_total": 0,
         "erxudp_recovered_by_retry_total": 0,
+        # spec 012 counters also baseline at 0
+        "erxudp_tid_mismatch_total": 0,
+        "noise_adaptive_skips_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -74,6 +77,15 @@ def test_on_erxudp_timeout_increments_counter():
     state = make_state()
     state.on_erxudp_timeout()
     assert state.snapshot(now=state.start_time)["erxudp_timeouts_total"] == 1
+
+
+def test_on_erxudp_tid_mismatch_increments_counter():
+    """spec 012: ERXUDP TID 不一致は専用カウンタで観測する。"""
+    state = make_state()
+    state.on_erxudp_tid_mismatch()
+    state.on_erxudp_tid_mismatch()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["erxudp_tid_mismatch_total"] == 2
 
 
 def test_counters_are_monotonically_non_decreasing():
