@@ -189,6 +189,10 @@ def apply_defaults(cfg):
     _rbet = out["realtime_burst_erxudp_timeout_sec"]
     if _rbet != 0 and _rbet < REALTIME_BURST_MIN_INTERVAL_SEC:
         out["realtime_burst_erxudp_timeout_sec"] = REALTIME_BURST_MIN_INTERVAL_SEC
+    # spec 025: burst (and catch-up) 中の force_wisun_reconnect threshold 緩和。
+    # 0 は kill switch (= base 5 採用、 spec 022 互換)。 floor なし (= ユーザ自由)。
+    out.setdefault("realtime_burst_force_reconnect_threshold",
+                   REALTIME_BURST_FORCE_RECONNECT_THRESHOLD)
     return out
 
 
@@ -458,6 +462,11 @@ REALTIME_BURST_MAX_DURATION_SEC = 3600
 # spec 023: burst mode 中の ERXUDP timeout 短縮 (30s base → 5s burst)。
 # 0 は kill switch (= base 採用、 spec 022 v1 互換)、 それ以外は 5s floor で clamp。
 REALTIME_BURST_ERXUDP_TIMEOUT_SEC = 5
+
+# spec 025: burst (and catch-up) 中の force_wisun_reconnect threshold 緩和。
+# base 5 × burst 5s = 25 秒で reconnect 発火を防ぐ。 30 × 5s = 150 秒 (= base
+# mode の 5 × 30s と同水準)。 0 は kill switch (= base 採用)。 floor なし。
+REALTIME_BURST_FORCE_RECONNECT_THRESHOLD = 30
 
 _POSITIVE_INT_KEYS = (
     "mqtt_port", "log_max_bytes", "log_backup_count",
@@ -2068,6 +2077,16 @@ def compute_intra_cycle_retries(mode, base_retries, burst_retries):
     if mode == "burst":
         return int(burst_retries)
     return int(base_retries)
+
+
+def compute_force_reconnect_threshold(mode, base_threshold, burst_threshold):
+    """spec 025: burst (or catch-up) なら burst_threshold、 それ以外 base.
+
+    burst_threshold <= 0 は kill switch sentinel として base 採用 (spec 023 と同じ pattern)。
+    caller (main loop) は spec 023 で計算済の `_effective_mode` を渡す。"""
+    if mode == "burst" and burst_threshold > 0:
+        return int(burst_threshold)
+    return int(base_threshold)
 
 
 class RealtimeModeState(object):
@@ -3935,9 +3954,17 @@ def main():
                     # overrides the threshold for immediate rejoin. Signal
                     # is consumed (cleared) right before raise; if reconnect
                     # fails the next EVENT 24/29 will re-set the flag.
+                    # spec 025: burst (and catch-up) 中は threshold を緩和し
+                    # reconnect 連発で 5s 周期が乱れるのを防ぐ。 _effective_mode
+                    # は spec 023 で iter 冒頭計算済 ("burst" or "off")。
+                    _force_threshold = compute_force_reconnect_threshold(
+                        _effective_mode,
+                        int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
+                        int(cfg.get("realtime_burst_force_reconnect_threshold",
+                                    REALTIME_BURST_FORCE_RECONNECT_THRESHOLD)))
                     if should_force_wisun_reconnect(
                         diag_state.consecutive_erxudp_timeouts,
-                        int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
+                        _force_threshold,
                         pending=diag_state.pending_wisun_rejoin,
                     ):
                         _was_pending = diag_state.pending_wisun_rejoin
