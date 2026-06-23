@@ -4044,19 +4044,17 @@ def main():
             # also recover.
             attempt = diag_state.consecutive_wisun_connect_failures
             # spec 026: burst (and catch-up) 中は initial backoff を 5s に短縮、
-            # reconnect 1 回あたりの時間ロスを 30s → 5s に減らす。 _effective_mode
-            # は spec 023 で try ブロック内で計算済 (= 同 iter scope、 except から
-            # も参照可能)。 ただし wisun_connect 失敗で try 内の _effective_mode
-            # 代入前に jump した場合は NameError、 そのため fallback で base 採用。
-            try:
-                _backoff_initial = compute_burst_aware_backoff_initial(
-                    _effective_mode,
-                    int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
-                    int(cfg.get("realtime_burst_rejoin_backoff_initial_sec",
-                                REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)))
-            except NameError:
-                _backoff_initial = int(cfg.get(
-                    "wisun_rejoin_backoff_initial_sec", 30))
+            # reconnect 1 回あたりの時間ロスを 30s → 5s に減らす。 main loop
+            # の `_effective_mode` は前 iter 値 / reconnect 中の未定義リスク
+            # があるので、 realtime_state を直接読んで mode 再判定 (catch-up
+            # 中 reconnect は稀のため非対応で実用上問題なし、 mode='burst' のみ
+            # で burst 扱い)。
+            _rt_mode_for_backoff = realtime_state.snapshot().get("mode", "off")
+            _backoff_initial = compute_burst_aware_backoff_initial(
+                _rt_mode_for_backoff,
+                int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
+                int(cfg.get("realtime_burst_rejoin_backoff_initial_sec",
+                            REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)))
             _backoff = compute_rejoin_backoff(
                 attempt,
                 _backoff_initial,
