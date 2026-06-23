@@ -193,6 +193,10 @@ def apply_defaults(cfg):
     # 0 は kill switch (= base 5 採用、 spec 022 互換)。 floor なし (= ユーザ自由)。
     out.setdefault("realtime_burst_force_reconnect_threshold",
                    REALTIME_BURST_FORCE_RECONNECT_THRESHOLD)
+    # spec 026: burst (and catch-up) 中の rejoin backoff initial 短縮 (30s → 5s)。
+    # 0 は kill switch (= base 30s 採用)。 floor なし。
+    out.setdefault("realtime_burst_rejoin_backoff_initial_sec",
+                   REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)
     return out
 
 
@@ -467,6 +471,12 @@ REALTIME_BURST_ERXUDP_TIMEOUT_SEC = 5
 # base 5 × burst 5s = 25 秒で reconnect 発火を防ぐ。 30 × 5s = 150 秒 (= base
 # mode の 5 × 30s と同水準)。 0 は kill switch (= base 採用)。 floor なし。
 REALTIME_BURST_FORCE_RECONNECT_THRESHOLD = 30
+
+# spec 026: burst (and catch-up) 中の rejoin backoff initial 短縮 (30s → 5s)。
+# 1 回 reconnect 5s + SKJOIN 5-15s = 10-20 秒で復帰、 spec 025 までの 30-60 秒
+# から大幅短縮。 multiplier / max は base のまま (= 連発時 exponential 保護維持)。
+# 0 は kill switch (= base 30s 採用)。 floor なし。
+REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC = 5
 
 _POSITIVE_INT_KEYS = (
     "mqtt_port", "log_max_bytes", "log_backup_count",
@@ -2087,6 +2097,16 @@ def compute_force_reconnect_threshold(mode, base_threshold, burst_threshold):
     if mode == "burst" and burst_threshold > 0:
         return int(burst_threshold)
     return int(base_threshold)
+
+
+def compute_burst_aware_backoff_initial(mode, base_initial, burst_initial):
+    """spec 026: burst (or catch-up) なら burst_initial、 それ以外 base.
+
+    burst_initial <= 0 は kill switch sentinel として base 採用 (spec 023/025 と同じ pattern)。
+    multiplier / max は base のまま (= burst 中も exponential 維持で連発時の保護)。"""
+    if mode == "burst" and burst_initial > 0:
+        return int(burst_initial)
+    return int(base_initial)
 
 
 class RealtimeModeState(object):
@@ -4023,9 +4043,23 @@ def main():
             # reopen after N consecutive failures so a BP35CX UART hang can
             # also recover.
             attempt = diag_state.consecutive_wisun_connect_failures
+            # spec 026: burst (and catch-up) 中は initial backoff を 5s に短縮、
+            # reconnect 1 回あたりの時間ロスを 30s → 5s に減らす。 _effective_mode
+            # は spec 023 で try ブロック内で計算済 (= 同 iter scope、 except から
+            # も参照可能)。 ただし wisun_connect 失敗で try 内の _effective_mode
+            # 代入前に jump した場合は NameError、 そのため fallback で base 採用。
+            try:
+                _backoff_initial = compute_burst_aware_backoff_initial(
+                    _effective_mode,
+                    int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
+                    int(cfg.get("realtime_burst_rejoin_backoff_initial_sec",
+                                REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)))
+            except NameError:
+                _backoff_initial = int(cfg.get(
+                    "wisun_rejoin_backoff_initial_sec", 30))
             _backoff = compute_rejoin_backoff(
                 attempt,
-                int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
+                _backoff_initial,
                 float(cfg.get("wisun_rejoin_backoff_multiplier", 2.0)),
                 int(cfg.get("wisun_rejoin_backoff_max_sec", 300)))
             log("Main loop error (attempt {}): {} - reconnecting Wi-SUN in {}s"
