@@ -114,9 +114,12 @@ def apply_defaults(cfg):
     out.setdefault("admin_user", "")
     out.setdefault("admin_password", "")
     # Number of consecutive ERXUDP timeouts before the bridge forces a
-    # Wi-SUN re-join. 0 = disabled (legacy behaviour). Default 5 corresponds
-    # to ~5 minutes of silence at the default poll_interval.
-    out.setdefault("erxudp_timeout_force_reconnect_threshold", 5)
+    # Wi-SUN re-join. 0 = disabled (legacy behaviour).
+    # spec 011 元 default 5、 spec 027 で 30 に変更。 実機 grafana 24h で
+    # 78% 欠損 + reconnect 430 回 (= 1 回/3 分) の主因と判明、 5 連続 fail で
+    # 発火する設計はメーター応答性悪化時に loop 化。 30 連続 (= 900 秒 ≒
+    # 15 分) に緩和でメーター完全 dead 検知は遅れるが欠損率劇的改善見込み。
+    out.setdefault("erxudp_timeout_force_reconnect_threshold", 30)
     # MQTT keep-alive (seconds). Cube J1 のメインループは ECHONET Lite
     # の同期 poll で詰まることがあり、上流デフォルトの 60s では broker から
     # 切断される（実測 約 12 分間隔）。300s なら poll が一時的に滞っても
