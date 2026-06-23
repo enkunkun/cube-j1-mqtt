@@ -49,6 +49,8 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "realtime_burst_completed_total": 0,
         "realtime_burst_aborted_total": 0,
         "realtime_mode_current": "off",
+        # spec 020: TID mismatch late publish recovery counter.
+        "erxudp_recovered_from_mismatch_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -354,3 +356,34 @@ def test_set_realtime_state_updates_mode_and_interval_gauge():
     snap = state.snapshot(now=state.start_time)
     assert snap["realtime_mode_current"] == "burst"
     assert snap["realtime_effective_interval_seconds"] == 5
+
+
+# ---------------------------------------------------------------------------
+# spec 020: TID mismatch late publish recovery
+# ---------------------------------------------------------------------------
+
+def test_on_erxudp_recovered_from_mismatch_increments():
+    state = make_state()
+    state.on_erxudp_recovered_from_mismatch(60.0)
+    snap = state.snapshot(now=state.start_time)
+    assert snap["erxudp_recovered_from_mismatch_total"] == 1
+
+
+def test_recovered_lag_percentiles_omitted_when_empty():
+    """deque 空時 percentile key は snapshot に含めない (= HA で「unknown」 維持)."""
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert "erxudp_recovered_lag_p50" not in snap
+    assert "erxudp_recovered_lag_p95" not in snap
+    assert "erxudp_recovered_lag_max" not in snap
+
+
+def test_recovered_lag_percentiles_emitted_when_filled():
+    state = make_state()
+    for lag in [60.0, 120.0, 180.0, 240.0, 300.0]:
+        state.on_erxudp_recovered_from_mismatch(lag)
+    snap = state.snapshot(now=state.start_time)
+    assert "erxudp_recovered_lag_p50" in snap
+    assert "erxudp_recovered_lag_p95" in snap
+    assert "erxudp_recovered_lag_max" in snap
+    assert snap["erxudp_recovered_lag_max"] == 300

@@ -1,114 +1,208 @@
-# Plan: spec 026 Burst Mode 中の wisun rejoin backoff 短縮
+# Plan: spec 020 TID Mismatch Late Publish (Revived 2026-06-24)
 
 ## Context
 
-spec 025 deploy (commit `e1533563`) verify: burst 5 分中 SKRESET 2 回 = 1 回あたり 30s backoff + SKJOIN ≒ 30-60 秒消費、 burst 5 分の 20-30% loss。 spec 026 で `compute_rejoin_backoff` の `initial_sec` を burst (and catch-up) 中だけ 5s に short circuit、 reconnect 所要時間を 6 倍速。
+2026-06-24 grafana dashboard snapshot (gcx cubej1-smart-meter --since 6h) + メトリクス解析で **真因確定**:
+- 物理層完璧 (LQI=241、 EEDSCAN pan_channel_energy=13、 SK EVENT 24/29=0)
+- **`erxudp_tid_mismatch_lag p50=5, p95=9, max=9 frame`** = メーター ECHONET 内部 queue が **9 周期 (= 9 分) 遅延蓄積**
+- bridge 30s timeout で諦め → 次 cycle で新 TID で send → メーターは 9 周期前の TID で応答 → bridge は spec 014 で破棄 (= mismatch)
+- 結果 60s 周期 polling の大半が timeout、 24h 78% 欠損
 
-既存パターン把握 (grep ベース、 Explore 省略):
-- `compute_rejoin_backoff(attempt, initial=30, multiplier=2.0, max=300)` line 2758 (推定)
-- main loop except 経路 line 4020-4030 で呼出
-- config: `wisun_rejoin_backoff_initial_sec` (30) / `_multiplier` (2.0) / `_max_sec` (300) at apply_defaults line 168-170
-- `attempt = diag_state.consecutive_wisun_connect_failures` line 4025
+spec 020 で TID mismatch frame を「9 分前のメーター応答」 として late publish 救済すれば、 grafana の穴を直接補完可能。 一度 pivot 中止 (2026-06-23) したが、 burst が機能しない real env でこそ spec 020 が救済策と判明。
+
+spec 020 spec.md (= specs/020-tid-mismatch-late-publish/spec.md) は前回 dig 結果が反映済 (= 累積系のみ late publish、 `_late_publish_ts` 別 topic, retain=True)。 plan を復元して TDD/deploy。
 
 ## Approach
 
-### v1 の構成
+### v1 MVP の構成
 
-1. **pure helper 1 つ** (TDD): `compute_burst_aware_backoff_initial(mode, base_initial, burst_initial) -> int`
-   - mode='burst' かつ burst_initial > 0 → burst_initial
-   - それ以外 → base_initial (= sentinel 0 で kill switch、 spec 023/025 と同じ pattern)
-2. **main loop 配線**: except 経路 line 4026 の `compute_rejoin_backoff` 呼出直前で `_effective_initial = compute_burst_aware_backoff_initial(_effective_mode, base, burst)` 計算、 第 2 引数に pass
-3. **`apply_defaults`** に 1 config (`realtime_burst_rejoin_backoff_initial_sec` default=5) 追加、 floor なし
-4. **kill switch**: `realtime_burst_rejoin_backoff_initial_sec=0` で base 採用
+1. **`SendHistoryRing` class** (pure、 collections.OrderedDict ベース、 FIFO eviction)
+   - `record(tid, send_ts, epc_list)`
+   - `lookup(tid)` → `(send_ts, epc_tuple)` | None
+2. **`read_erxudp` 戻り値拡張**: `bytearray | None` → `(payload, send_ts) | None`
+   - signature に `send_history=None` 追加
+   - TID mismatch path: ring lookup → hit なら `(payload, send_ts_A)` 返却 (= late frame)、 miss なら既存 discard
+3. **main loop**:
+   - `send_el_get` 直後に `history.record(sent_tid, time.time(), cycle_epcs)`
+   - `read_erxudp(..., send_history=send_history)` で result unpack
+   - `send_ts is not None` (= late frame) なら 累積系のみ filter → `publish_measurements(..., timestamp=send_ts)`
+   - `diag.on_erxudp_recovered_from_mismatch(now - send_ts)` で counter + lag 更新
+4. **`publish_measurements` 拡張**: `timestamp=None` 引数追加、 not None なら **累積系 key のみ** `_late_publish_ts` 別 topic (retain=True) 発行
+5. **DiagState 拡張**:
+   - `erxudp_recovered_from_mismatch_total` (counter)
+   - `erxudp_recovered_lag_seconds_recent` (deque maxlen=100) + p50/p95/max emit
+6. **Kill switch**: `tid_mismatch_recover_enabled` (default True)
 
-### 設計上の判断
+### 設計上の判断 (前回 dig 反映)
 
-- **initial だけ短縮、 multiplier / max はそのまま**: burst 中 reconnect 5 連発の異常状態は exponential 保護に任せる (5 → 10 → 20 → 40 → 80 = 155s、 burst 5 分の半分で警告水準)
-- **既存 `compute_rejoin_backoff` は変更しない**: caller (main loop) で第 2 引数だけ動的化、 spec 017 既存テスト 8 件全 pass 保証
-- **`_effective_mode` scope 確認 (FR-006)**: 実装時に except ブロックから `_effective_mode` が参照可能か grep で確認、 try ブロック内変数なので **except でも参照可能** (Python の scope) のはずだが要実装時 verify
+- **dig 決定 A: 累積系のみ late publish**: `CUMULATIVE_PUBLISH_KEYS = frozenset(("energy_forward", "energy_reverse", "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh", ...))`、 瞬時 (0xE7/E8) は HA グラフ歪みリスクで除外
+- **dig 決定 B: `_late_publish_ts` 別 topic + retain=True**: spec 018 pattern 踏襲、 既存 value topic 形式は壊さない
+- **filter 責務 = main loop**: late frame 時に `m` を CUMULATIVE_PUBLISH_KEYS のみで filter してから `publish_measurements(..., timestamp=send_ts)` 呼出
+- **`SendHistoryRing` thread-safety**: main loop only、 lock 不要
+- **read_erxudp 戻り値 tuple 化の callers**: main loop 2 箇所 (= 初回 + retry ループ)、 unpack 修正で互換
 
 ## Files to modify
 
 ### `production_tool/mqtt_bridge.py`
 
-1. **pure helper 1 つ** (compute_force_reconnect_threshold の直下、 line ~2080 周辺):
+1. **`SendHistoryRing` class** (DiagState 周辺、 RealtimeModeState の隣):
    ```python
-   def compute_burst_aware_backoff_initial(mode, base_initial, burst_initial):
-       """spec 026: burst (and catch-up) なら burst_initial、 それ以外 base.
-
-       burst_initial <= 0 は kill switch sentinel として base 採用 (spec 023/025 と同じ pattern)。
-       caller (main loop) は spec 023 で計算済の `_effective_mode` を渡す。"""
-       if mode == "burst" and burst_initial > 0:
-           return int(burst_initial)
-       return int(base_initial)
+   class SendHistoryRing(object):
+       """spec 020: TID → (send_ts, epc_tuple) bounded FIFO ring buffer.
+       Main loop only — no thread safety required."""
+       def __init__(self, maxlen=10):
+           self._maxlen = int(maxlen)
+           self._entries = collections.OrderedDict()
+       def record(self, tid, send_ts, epc_list):
+           if tid in self._entries:
+               del self._entries[tid]
+           self._entries[tid] = (float(send_ts), tuple(epc_list))
+           while len(self._entries) > self._maxlen:
+               self._entries.popitem(last=False)
+       def lookup(self, tid):
+           return self._entries.get(tid)
+       def __len__(self):
+           return len(self._entries)
    ```
 
-2. **定数追加** (REALTIME_BURST_* 群、 line ~458 周辺):
+2. **`read_erxudp` 拡張** (signature + TID mismatch path):
+   - signature に `send_history=None` 追加
+   - 戻り値全 path で tuple 化: `return (payload, None)` (= 正常) / `return (payload, send_ts_A)` (= late) / `return None` (= no data)
+   - TID mismatch path:
+     ```python
+     if expected_tid is not None and tid != expected_tid:
+         if diag_state is not None:
+             diag_state.on_erxudp_tid_mismatch(expected_tid, tid)
+         if send_history is not None:
+             hit = send_history.lookup(tid)
+             if hit is not None:
+                 send_ts_A, _epcs = hit
+                 return (payload, send_ts_A)
+         continue  # discard (既存 spec 014)
+     ```
+
+3. **`CUMULATIVE_PUBLISH_KEYS`** 定数追加 (publish_measurements 周辺):
    ```python
-   REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC = 5
+   CUMULATIVE_PUBLISH_KEYS = frozenset((
+       "energy_forward", "energy_reverse",
+       "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh",
+       "energy_forward_fixed_ts", "energy_reverse_fixed_ts",
+       "energy_forward_fixed_raw", "energy_reverse_fixed_raw",
+   ))
    ```
 
-3. **`apply_defaults`** (line ~197、 spec 025 ブロックの直後):
+4. **`publish_measurements` 拡張** (optional `timestamp=None`):
    ```python
-   # spec 026: burst (and catch-up) 中の rejoin backoff initial 短縮。
-   # base 30s × 2 回 reconnect = 60+ 秒消費を防ぐ。 5s で 1 回 reconnect 約 10 秒。
-   # 0 は kill switch (= base 採用)。 floor なし。
-   out.setdefault("realtime_burst_rejoin_backoff_initial_sec",
-                  REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)
+   def publish_measurements(mqtt, device_id, m, timestamp=None):
+       # 既存 value topic publish (変更なし)
+       ...
+       # spec 020: late frame の timestamp を `_late_publish_ts` topic で発行
+       if timestamp is not None:
+           ts_iso = format_iso8601_utc(timestamp)
+           base = "{}/{}".format(MQTT_TOPIC_PREFIX, device_id)
+           for key in m.keys():
+               topic = "{}/{}_late_publish_ts".format(base, key)
+               mqtt.publish(topic, ts_iso, retain=True)
    ```
 
-4. **main loop 配線** (line 4026 周辺、 `compute_rejoin_backoff` 呼出):
+5. **DiagState 拡張**:
+   - `__init__`: `self.erxudp_recovered_from_mismatch_total = 0`、 `self.erxudp_recovered_lag_seconds_recent = collections.deque(maxlen=100)`
+   - method: `on_erxudp_recovered_from_mismatch(self, lag_sec)`:
+     ```python
+     self.erxudp_recovered_from_mismatch_total += 1
+     self.erxudp_recovered_lag_seconds_recent.append(float(lag_sec))
+     ```
+   - `_DIAG_SNAPSHOT_KEYS` + raw dict に `erxudp_recovered_from_mismatch_total` 追加
+   - snapshot 末尾の deque percentile セクションに `erxudp_recovered_lag_seconds_recent` 追加 (spec 011 follow-up 2 と同 pattern、 空時 omit)
+
+6. **`apply_defaults`**: `out.setdefault("tid_mismatch_recover_enabled", True)`
+
+7. **main 関数で SendHistoryRing 生成** (state init 周辺):
    ```python
-   # spec 026: burst (and catch-up) 中は initial backoff を 5s に短縮、
-   # reconnect 1 回あたりの時間ロスを 30s → 5s に減らす。
-   # _effective_mode は spec 023 で try ブロック内で計算済、 Python scope で
-   # except からも参照可 (= main loop 1 iter 内で定義)。
-   _effective_initial = compute_burst_aware_backoff_initial(
-       _effective_mode,
-       int(cfg.get("wisun_rejoin_backoff_initial_sec", 30)),
-       int(cfg.get("realtime_burst_rejoin_backoff_initial_sec",
-                   REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)))
-   _backoff = compute_rejoin_backoff(
-       attempt,
-       _effective_initial,
-       float(cfg.get("wisun_rejoin_backoff_multiplier", 2.0)),
-       int(cfg.get("wisun_rejoin_backoff_max_sec", 300)))
+   send_history = SendHistoryRing(maxlen=int(cfg.get(
+       "tid_mismatch_history_maxlen", 10)))
    ```
 
-### `tests/unit/test_compute_burst_aware_backoff_initial.py` (新規)
+8. **main loop 配線**:
+   - `send_el_get` 直後 (= 初回 + retry 両方):
+     ```python
+     send_el_get(fd, ipv6, sent_tid, epc_list=cycle_epcs)
+     if cfg.get("tid_mismatch_recover_enabled", True):
+         send_history.record(sent_tid, time.time(), cycle_epcs)
+     ```
+   - `read_erxudp` callers (2 箇所) を tuple unpack に変更:
+     ```python
+     result = read_erxudp(fd, timeout=_erxudp_timeout,
+                          diag_state=diag_state,
+                          expected_tid=sent_tid,
+                          send_history=send_history
+                                       if cfg.get("tid_mismatch_recover_enabled", True)
+                                       else None)
+     if result is None:
+         data, send_ts = None, None
+     else:
+         data, send_ts = result
+     ```
+   - publish chain で send_ts 分岐:
+     ```python
+     m = decode_measurements(props)
+     m = apply_energy_scale(m, coeff, unit_kwh)
+     if send_ts is not None:
+         diag_state.on_erxudp_recovered_from_mismatch(time.time() - send_ts)
+         m_late = {k: v for k, v in m.items() if k in CUMULATIVE_PUBLISH_KEYS}
+         if m_late:
+             publish_measurements(mqtt, device_id, m_late, timestamp=send_ts)
+     else:
+         publish_measurements(mqtt, device_id, m)
+     ```
 
-- `test_off_mode_returns_base`
-- `test_burst_mode_returns_burst_initial`
-- `test_burst_initial_zero_returns_base_kill_switch`
-- `test_burst_initial_negative_returns_base` (defensive)
-- `test_returns_int_for_float_input` (defensive cast)
+### `tests/unit/test_send_history_ring.py` (新規)
+
+- `test_initial_len_is_zero`
+- `test_record_stores_send_ts_and_epcs`
+- `test_lookup_returns_recorded_entry`
+- `test_lookup_returns_none_for_unknown_tid`
+- `test_eviction_keeps_only_maxlen_entries`
+- `test_record_same_tid_refreshes_and_does_not_evict_others`
+- `test_record_overwrites_send_ts_for_same_tid`
+
+### `tests/unit/test_diag_state.py` (拡張)
+
+- baseline test expected dict に `erxudp_recovered_from_mismatch_total: 0` 追加
+- `test_on_erxudp_recovered_from_mismatch_increments`
+- `test_recovered_lag_percentiles_omitted_when_empty`
+- `test_recovered_lag_percentiles_emitted_when_filled`
+
+### main loop / read_erxudp / publish_measurements 配線
+
+実機検証 (= memory `feedback-tdd-spec-template.md` の確立方針)
 
 ## Test list (TDD 順)
 
-1-5. **Red→Green**: `compute_burst_aware_backoff_initial` 5 件 (pure helper)
-6. main loop 配線 + apply_defaults + 定数 (テストせず、 実機検証)
+1-7. **Red→Green**: `SendHistoryRing` 7 件 (pure class)
+8-11. **Red→Green**: DiagState 4 件 (拡張 + baseline 更新)
+12. read_erxudp / main loop / publish_measurements / apply_defaults (実機検証)
 
 ## Verification
 
-1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 ~422 + 新規 ~5 = ~427 件 pass
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 ~429 + 新規 ~11 = ~440 件 pass
 2. ruff check 新規エラー無し
 3. lab-ub01 経由 deploy
-4. 実機検証:
-   - mode=off で reconnect 時 log に `reconnecting Wi-SUN in 30s` (= spec 017 既存)
-   - burst 5 分起動 → reconnect 発生時 log に `reconnecting Wi-SUN in 5s` (= spec 026 効果)
-   - burst 5 分 SKRESET 2 回でも reconnect 1 回あたり ≦ 10 秒で復帰
-5. SC-002 / SC-003 を満たす
+4. 実機 1-2h で:
+   - `/api/diag` で `erxudp_recovered_from_mismatch_total > 0` (= late publish 発火確認)
+   - `erxudp_recovered_lag_seconds_recent` percentile が 60-600s 範囲 (= 1-10 周期遅延)
+   - mosquitto_sub で `cubej/cubej1/energy_forward_late_publish_ts` topic 着信確認
+   - grafana で `cube_j1_smart_meter_energy_forward_kwh_total` の穴がスムーズに塗られる
+5. SC-003 (1 週間運用で `erxudp_recovered_from_mismatch_total > 0`) 達成
 
 ## Commit 戦略
 
-- spec 020 spec.md は @ に残置、 spec 026 commit には含めず stash 必要
-  - `/tmp/spec020-stash6/` に backup → rm → spec 026 commit → restore
-- spec 026 spec.md + plan + 実装 + tests を 1 commit
+- @ に spec 020 spec.md (Status revived) のみ、 stash 不要
 - redact-plans.sh
-- jj commit
-- jj git push --remote fork --bookmark main (forward only、 e1533563 → 新 commit)
+- jj commit (spec.md + plan + 実装 + tests)
+- jj git push --remote fork --bookmark main (forward only)
 - lab-ub01 経由 deploy
 
 ## Commit message
 
-`feat(bridge): burst (and catch-up) 中の rejoin backoff initial 30s → 5s (spec 026)`
+`feat(bridge): TID mismatch frame を ring buffer 経由で late publish 救済 (spec 020)`

@@ -200,6 +200,11 @@ def apply_defaults(cfg):
     # 0 は kill switch (= base 30s 採用)。 floor なし。
     out.setdefault("realtime_burst_rejoin_backoff_initial_sec",
                    REALTIME_BURST_REJOIN_BACKOFF_INITIAL_SEC)
+    # spec 020: TID mismatch frame を 過去 send 時刻で late publish 救済。
+    # メーター ECHONET 内部 queue 遅延応答 (= grafana 観察で p95=9 frame 蓄積)
+    # を破棄せず累積系 EPC のみ過去 timestamp で publish、 grafana の穴補完。
+    out.setdefault("tid_mismatch_recover_enabled", True)
+    out.setdefault("tid_mismatch_history_maxlen", 10)
     return out
 
 
@@ -1663,6 +1668,8 @@ _DIAG_SNAPSHOT_KEYS = (
     "realtime_burst_aborted_total",
     "realtime_mode_current",
     "realtime_effective_interval_seconds",
+    # spec 020: TID mismatch late publish recovery counter.
+    "erxudp_recovered_from_mismatch_total",
     "uptime_seconds",
     "version",
 )
@@ -2112,6 +2119,33 @@ def compute_burst_aware_backoff_initial(mode, base_initial, burst_initial):
     return int(base_initial)
 
 
+class SendHistoryRing(object):
+    """spec 020: TID → (send_ts, epc_tuple) bounded FIFO ring buffer.
+
+    spec 014 で TID mismatch frame を破棄するパスで、 mismatch TID が過去 send
+    の TID と一致するなら「メーター ECHONET 内部 queue 遅延応答」 と判定して
+    late publish 救済する用途。 main loop only (admin thread から触らない) →
+    lock 不要、 plain OrderedDict で FIFO eviction。
+    """
+
+    def __init__(self, maxlen=10):
+        self._maxlen = int(maxlen)
+        self._entries = collections.OrderedDict()
+
+    def record(self, tid, send_ts, epc_list):
+        if tid in self._entries:
+            del self._entries[tid]  # move to end (refresh)
+        self._entries[tid] = (float(send_ts), tuple(epc_list))
+        while len(self._entries) > self._maxlen:
+            self._entries.popitem(last=False)  # evict oldest
+
+    def lookup(self, tid):
+        return self._entries.get(tid)
+
+    def __len__(self):
+        return len(self._entries)
+
+
 class RealtimeModeState(object):
     """spec 022: realtime polling mode の thread-safe holder.
 
@@ -2209,6 +2243,15 @@ class DiagState(object):
         self.realtime_burst_aborted_total = 0
         self.realtime_mode_current = "off"
         self.realtime_effective_interval_seconds = None
+        # Spec 020: TID mismatch late publish recovery — counter + rolling
+        # window of lag in seconds (= now - send_ts at mismatch capture)。
+        # last_recovered_send_ts は read_erxudp → main loop の bus 用 (= 戻り値
+        # tuple 化を避けるため diag_state 経由で send_ts を渡す)。 main loop
+        # は read 直後に値を参照 → None リセット、 race condition なし
+        # (main thread のみ)。
+        self.erxudp_recovered_from_mismatch_total = 0
+        self.erxudp_recovered_lag_seconds_recent = collections.deque(maxlen=100)
+        self.last_recovered_send_ts = None
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -2302,6 +2345,15 @@ class DiagState(object):
         self.realtime_mode_current = mode
         self.realtime_effective_interval_seconds = effective_interval_seconds
 
+    # Spec 020: TID mismatch late publish recovery counter.
+
+    def on_erxudp_recovered_from_mismatch(self, lag_sec, send_ts=None):
+        self.erxudp_recovered_from_mismatch_total += 1
+        self.erxudp_recovered_lag_seconds_recent.append(float(lag_sec))
+        # send_ts を main loop に渡す bus 用 (= 戻り値 tuple 化を避ける)。
+        if send_ts is not None:
+            self.last_recovered_send_ts = float(send_ts)
+
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
     def on_erxudp_latency(self, ms):
@@ -2376,6 +2428,9 @@ class DiagState(object):
             "realtime_mode_current": self.realtime_mode_current,
             "realtime_effective_interval_seconds":
                 self.realtime_effective_interval_seconds,
+            # spec 020: TID mismatch late publish recovery counter.
+            "erxudp_recovered_from_mismatch_total":
+                self.erxudp_recovered_from_mismatch_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2406,6 +2461,17 @@ class DiagState(object):
             out["erxudp_tid_mismatch_lag_p95"] = int(round(
                 _percentile(ordered_lags, 95)))
             out["erxudp_tid_mismatch_lag_max"] = ordered_lags[-1]
+
+        # Spec 020: TID mismatch late publish recovery lag (seconds) percentiles.
+        # Omit when no late publish has ever occurred so HA keeps "unknown".
+        rec_lags = list(self.erxudp_recovered_lag_seconds_recent)
+        if rec_lags:
+            ordered_rec = sorted(rec_lags)
+            out["erxudp_recovered_lag_p50"] = int(round(
+                _percentile(ordered_rec, 50)))
+            out["erxudp_recovered_lag_p95"] = int(round(
+                _percentile(ordered_rec, 95)))
+            out["erxudp_recovered_lag_max"] = int(round(ordered_rec[-1]))
 
         # Spec 006: named EVENT / ER counters. Omit zero-count entries
         # so HA discovery does not advertise sensors that have never fired.
@@ -3027,7 +3093,7 @@ def _run_eedscan_sweep(fd, eedscan_state, diag_state):
 PROBE_EPCS = [0x80]
 
 def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
-                readline=None):
+                readline=None, send_history=None):
     """Wait for ERXUDP and return payload as bytearray, or None.
 
     When *diag_state* is supplied, EVENT/FAIL lines observed before the
@@ -3039,6 +3105,15 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
     Wi-SUN re-join) being mistaken for the response to the current
     request. *readline* is the line-reader callable, defaulting to the
     module-level `serial_readline`; tests inject a fake.
+
+    spec 020: when *send_history* is supplied, a TID mismatch frame whose
+    TID was previously recorded in the ring buffer is RESCUED instead of
+    discarded — diag_state.on_erxudp_recovered_from_mismatch(lag, send_ts)
+    is invoked (which also stashes send_ts in diag_state.last_recovered_send_ts
+    as a bus to the caller) and the payload is returned. The caller can
+    detect a late frame by checking diag_state.last_recovered_send_ts right
+    after this call returns (then reset to None). Ring lookup miss falls
+    back to the spec 014 discard path.
     """
     if readline is None:
         readline = serial_readline
@@ -3097,6 +3172,27 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                         except Exception as e:
                             log("diag on_erxudp_tid_mismatch error: {}"
                                 .format(e))
+                    # spec 020: ring lookup で late frame 救済を試行。
+                    # send_history に hit → 過去 send 時の TID と一致、
+                    # メーター ECHONET 内部 queue 遅延応答と判定 → payload を
+                    # caller に返す + diag bus に send_ts を stash。
+                    if (send_history is not None and got_tid is not None
+                            and diag_state is not None):
+                        hit = send_history.lookup(got_tid)
+                        if hit is not None:
+                            send_ts_a, _epcs = hit
+                            try:
+                                diag_state.on_erxudp_recovered_from_mismatch(
+                                    time.time() - send_ts_a,
+                                    send_ts=send_ts_a)
+                                log("INFO: ERXUDP TID mismatch got={:04X} "
+                                    "recovered as late frame (send_ts ago "
+                                    "{:.1f}s)".format(
+                                        got_tid, time.time() - send_ts_a))
+                            except Exception as e:
+                                log("diag on_erxudp_recovered_from_mismatch "
+                                    "error: {}".format(e))
+                            return payload
                     if got_tid is None:
                         log("WARN: ERXUDP payload too short ({} bytes), "
                             "discarding".format(len(payload)))
@@ -3627,7 +3723,17 @@ def publish_diag(mqtt, device_id, snapshot):
             continue
         mqtt.publish("{}/diag/{}".format(base, sid), str(value), retain=True)
 
-def publish_measurements(mqtt, device_id, m):
+# spec 020: late publish 対象 = 累積系 EPC のみ (= HA グラフ歪みリスクの
+# 瞬時系 0xE7/0xE8 は除外)。 main loop で m を filter してから
+# publish_measurements に渡す。
+CUMULATIVE_PUBLISH_KEYS = frozenset((
+    "energy_forward_kwh", "energy_reverse_kwh",
+    "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh",
+    "energy_forward_fixed_ts", "energy_reverse_fixed_ts",
+))
+
+
+def publish_measurements(mqtt, device_id, m, timestamp=None):
     base = "cubej/{}".format(device_id)
     if "power_w" in m:
         mqtt.publish("{}/power".format(base), str(m["power_w"]))
@@ -3654,6 +3760,16 @@ def publish_measurements(mqtt, device_id, m):
     if "energy_reverse_fixed_ts" in m:
         mqtt.publish("{}/energy_reverse_fixed_ts".format(base),
                      m["energy_reverse_fixed_ts"], retain=True)
+    # spec 020: late frame (= TID mismatch 救済 frame) は timestamp 引数で
+    # 識別、 累積系 key のみ `_late_publish_ts` topic で過去時刻を発行。
+    # 既存 value topic も publish するが HA state は last_changed=now で
+    # 上書きされる、 InfluxDB / Grafana 側で `_late_publish_ts` を join 可能。
+    if timestamp is not None:
+        ts_iso = format_iso8601_utc(timestamp)
+        for key in m.keys():
+            if key in CUMULATIVE_PUBLISH_KEYS:
+                mqtt.publish("{}/{}_late_publish_ts".format(base, key),
+                             ts_iso, retain=True)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -3690,6 +3806,13 @@ def main():
     # spec 022: realtime burst mode holder. Admin UI / API mutates via
     # start_burst/stop_burst, main loop reads via tick()/snapshot().
     realtime_state = RealtimeModeState()
+
+    # spec 020: TID mismatch late publish 用 ring buffer (= 過去 send の
+    # TID → send_ts を bounded で保持、 メーター ECHONET 内部 queue 遅延応答
+    # 救済)。 disabled 時は send_history=None を read_erxudp に渡す。
+    send_history = SendHistoryRing(maxlen=int(cfg.get(
+        "tid_mismatch_history_maxlen", 10))) if cfg.get(
+        "tid_mismatch_recover_enabled", True) else None
 
     # spec 019: persist Wi-Fi AP toggle state across reboots. The store
     # is shared with the admin handler's ApController so toggles via
@@ -3916,11 +4039,15 @@ def main():
                 # the previous cycle or a stale frame after Wi-SUN re-join).
                 sent_tid = tid
                 send_el_get(fd, ipv6, sent_tid, epc_list=cycle_epcs)
+                # spec 020: send 直後に ring 記録 (= mismatch 救済の根拠)
+                if send_history is not None:
+                    send_history.record(sent_tid, time.time(), cycle_epcs)
                 tid = (tid + 1) & 0xFFFF
                 t_send = time.time()
                 data = read_erxudp(fd, timeout=_erxudp_timeout,
                                    diag_state=diag_state,
-                                   expected_tid=sent_tid)
+                                   expected_tid=sent_tid,
+                                   send_history=send_history)
                 attempt = 0
                 while data is None and should_retry_in_cycle(attempt, _max_retries):
                     try:
@@ -3930,11 +4057,14 @@ def main():
                     time.sleep(_backoff)
                     sent_tid = tid
                     send_el_get(fd, ipv6, sent_tid, epc_list=cycle_epcs)
+                    if send_history is not None:
+                        send_history.record(sent_tid, time.time(), cycle_epcs)
                     tid = (tid + 1) & 0xFFFF
                     t_send = time.time()
                     data = read_erxudp(fd, timeout=_erxudp_timeout,
                                        diag_state=diag_state,
-                                       expected_tid=sent_tid)
+                                       expected_tid=sent_tid,
+                                       send_history=send_history)
                     attempt += 1
                 if data is not None and attempt > 0:
                     try:
@@ -3957,7 +4087,22 @@ def main():
                     if kind == "normal":
                         # Probe responses (0x80 only) carry no power values;
                         # publish only on real measurement cycles.
-                        publish_measurements(mqtt, device_id, m)
+                        # spec 020: read_erxudp が late frame 救済した場合、
+                        # diag_state.last_recovered_send_ts に send_ts が
+                        # stash されてる (bus パターン)。 累積系 EPC のみ
+                        # filter + 過去 timestamp で publish。
+                        _late_ts = diag_state.last_recovered_send_ts
+                        diag_state.last_recovered_send_ts = None
+                        if _late_ts is not None:
+                            _m_late = dict(
+                                (k, v) for k, v in m.items()
+                                if k in CUMULATIVE_PUBLISH_KEYS)
+                            if _m_late:
+                                publish_measurements(
+                                    mqtt, device_id, _m_late,
+                                    timestamp=_late_ts)
+                        else:
+                            publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)
                     try:
                         diag_state.on_poll_success(now)
