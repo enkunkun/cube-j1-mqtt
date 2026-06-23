@@ -182,6 +182,13 @@ def apply_defaults(cfg):
                    REALTIME_BURST_DEFAULT_DURATION_SEC)
     out.setdefault("realtime_burst_default_interval_sec",
                    REALTIME_BURST_DEFAULT_INTERVAL_SEC)
+    # spec 023: burst 中の ERXUDP timeout 短縮。 0 は kill switch (= base 採用、
+    # spec 022 v1 互換)、 それ以外は 5s floor で clamp (= burst_interval_min と同価)。
+    out.setdefault("realtime_burst_erxudp_timeout_sec",
+                   REALTIME_BURST_ERXUDP_TIMEOUT_SEC)
+    _rbet = out["realtime_burst_erxudp_timeout_sec"]
+    if _rbet != 0 and _rbet < REALTIME_BURST_MIN_INTERVAL_SEC:
+        out["realtime_burst_erxudp_timeout_sec"] = REALTIME_BURST_MIN_INTERVAL_SEC
     return out
 
 
@@ -447,6 +454,10 @@ REALTIME_BURST_DEFAULT_DURATION_SEC = 300
 REALTIME_BURST_DEFAULT_INTERVAL_SEC = 5
 REALTIME_BURST_MIN_INTERVAL_SEC = 5
 REALTIME_BURST_MAX_DURATION_SEC = 3600
+
+# spec 023: burst mode 中の ERXUDP timeout 短縮 (30s base → 5s burst)。
+# 0 は kill switch (= base 採用、 spec 022 v1 互換)、 それ以外は 5s floor で clamp。
+REALTIME_BURST_ERXUDP_TIMEOUT_SEC = 5
 
 _POSITIVE_INT_KEYS = (
     "mqtt_port", "log_max_bytes", "log_backup_count",
@@ -2037,6 +2048,26 @@ def compute_effective_poll_interval(now, base_interval, mode_state):
         if exp is not None and now < exp:
             return int(mode_state.get("burst_interval", base_interval))
     return int(base_interval)
+
+
+def compute_erxudp_timeout(mode, base_timeout, burst_timeout):
+    """spec 023: burst (or catch-up) なら burst_timeout、 それ以外 base.
+
+    burst_timeout <= 0 は kill switch sentinel として base 採用 (dig 決定 B)。
+    catch-up は caller 側で mode='burst' として渡す (= burst の余韻)。"""
+    if mode == "burst" and burst_timeout > 0:
+        return int(burst_timeout)
+    return int(base_timeout)
+
+
+def compute_intra_cycle_retries(mode, base_retries, burst_retries):
+    """spec 023: burst (or catch-up) なら burst_retries、 それ以外 base.
+
+    burst default = 0 (= 失敗即次 iter で 5s 体感維持、 dig 決定 A)。
+    catch-up は caller が mode='burst' として渡す。"""
+    if mode == "burst":
+        return int(burst_retries)
+    return int(base_retries)
 
 
 class RealtimeModeState(object):
@@ -3826,7 +3857,16 @@ def main():
                 # spec 011: ERXUDP resilience — extend timeout to handle
                 # the p95 tail and add intra-cycle retries to mask single-
                 # cycle drops from HA's perspective.
-                _erxudp_timeout = int(cfg.get("erxudp_timeout_sec", 30))
+                # spec 023: burst (and catch-up) 中は base 30s だと 5s cycle
+                # が成立しないので burst 専用の短 timeout を採用。
+                _effective_mode = ("burst"
+                                   if _rt_mode == "burst" or catchup_remaining > 0
+                                   else "off")
+                _erxudp_timeout = compute_erxudp_timeout(
+                    _effective_mode,
+                    int(cfg.get("erxudp_timeout_sec", 30)),
+                    int(cfg.get("realtime_burst_erxudp_timeout_sec",
+                                REALTIME_BURST_ERXUDP_TIMEOUT_SEC)))
                 _max_retries = int(cfg.get("erxudp_intra_cycle_retries", 2))
                 _backoff = float(cfg.get("erxudp_retry_backoff_sec", 2))
                 # spec 014: capture the TID actually sent so read_erxudp can
