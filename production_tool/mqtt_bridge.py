@@ -3630,6 +3630,17 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_tid_mismatch_lag_p50",      "TID Mismatch Lag p50",       None, None, "measurement",      "diagnostic"),
     ("erxudp_tid_mismatch_lag_p95",      "TID Mismatch Lag p95",       None, None, "measurement",      "diagnostic"),
     ("erxudp_tid_mismatch_lag_max",      "TID Mismatch Lag Max",       None, None, "measurement",      "diagnostic"),
+    # Spec 020: TID mismatch late publish recovery (= 過去 send TID の遅延応答を救済).
+    ("erxudp_recovered_from_mismatch_total", "ERXUDP Recovered from Mismatch", None, None, "total_increasing", "diagnostic"),
+    ("erxudp_recovered_lag_p50",         "Recovered Lag p50",          "s",  None, "measurement",      "diagnostic"),
+    ("erxudp_recovered_lag_p95",         "Recovered Lag p95",          "s",  None, "measurement",      "diagnostic"),
+    ("erxudp_recovered_lag_max",         "Recovered Lag Max",          "s",  None, "measurement",      "diagnostic"),
+    # Spec 022: realtime burst mode (= Admin UI ボタンで 5 分間 5s polling).
+    ("realtime_burst_started_total",     "Realtime Burst Started",     None, None, "total_increasing", "diagnostic"),
+    ("realtime_burst_completed_total",   "Realtime Burst Completed",   None, None, "total_increasing", "diagnostic"),
+    ("realtime_burst_aborted_total",     "Realtime Burst Aborted",     None, None, "total_increasing", "diagnostic"),
+    ("realtime_mode_current",            "Realtime Mode",              None, None, None,               "diagnostic"),
+    ("realtime_effective_interval_seconds", "Realtime Effective Interval", "s", None, "measurement",   "diagnostic"),
     ("noise_adaptive_skips_total",       "Noise-Adaptive Skips",       None, None, "total_increasing", "diagnostic"),
     ("uptime_seconds",         "Uptime",              "s",  None,        "measurement",      "diagnostic"),
     ("version",                "Bridge Version",      None, None,        None,               "diagnostic"),
