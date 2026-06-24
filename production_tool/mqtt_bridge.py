@@ -2142,6 +2142,18 @@ class SendHistoryRing(object):
     def lookup(self, tid):
         return self._entries.get(tid)
 
+    def lookup_latest(self):
+        """spec 020 v1.5: 直近 send entry を返す (= 空なら None).
+
+        got_tid=0 (= メーター uninit response) を「直近 send への応答」 と仮定して
+        late publish 救済する用途。 OrderedDict 末尾 = 最新 send (= record() で
+        既存 key は del → 末尾挿入で move-to-end するため insertion order = 時系列)。
+        """
+        if not self._entries:
+            return None
+        latest_tid = next(reversed(self._entries))
+        return self._entries[latest_tid]
+
     def __len__(self):
         return len(self._entries)
 
@@ -3176,9 +3188,16 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                     # send_history に hit → 過去 send 時の TID と一致、
                     # メーター ECHONET 内部 queue 遅延応答と判定 → payload を
                     # caller に返す + diag bus に send_ts を stash。
+                    # spec 020 v1.5: got_tid=0 (= メーター uninit response、
+                    # 実機観察で mismatch frame の 100% を占める) は通常 lookup
+                    # で hit しないので、 fallback で「直近 send への応答」 と
+                    # 仮定して lookup_latest で救済。 累積系のみ late publish
+                    # 設計のため不正確でも害は限定的 (累積値は単調増加)。
                     if (send_history is not None and got_tid is not None
                             and diag_state is not None):
                         hit = send_history.lookup(got_tid)
+                        if hit is None and got_tid == 0:
+                            hit = send_history.lookup_latest()
                         if hit is not None:
                             send_ts_a, _epcs = hit
                             try:

@@ -67,3 +67,34 @@ def test_record_overwrites_send_ts_for_same_tid():
     ring.record(0x1234, 200.0, [0xE0])
     send_ts, _ = ring.lookup(0x1234)
     assert send_ts == 200.0
+
+
+# ---------------------------------------------------------------------------
+# spec 020 v1.5: lookup_latest (= 直近 send entry、 got_tid=0 救済用)
+# ---------------------------------------------------------------------------
+
+def test_lookup_latest_empty_ring_returns_none():
+    ring = mb.SendHistoryRing(maxlen=10)
+    assert ring.lookup_latest() is None
+
+
+def test_lookup_latest_returns_most_recent_entry():
+    ring = mb.SendHistoryRing(maxlen=10)
+    ring.record(0x1, 100.0, [0xE0])
+    ring.record(0x2, 200.0, [0xE3])
+    ring.record(0x3, 300.0, [0xE7])
+    hit = ring.lookup_latest()
+    assert hit is not None
+    send_ts, epcs = hit
+    assert send_ts == 300.0
+    assert epcs == (0xE7,)
+
+
+def test_lookup_latest_reflects_refresh_via_record():
+    """同 TID 再 record で latest が更新される."""
+    ring = mb.SendHistoryRing(maxlen=10)
+    ring.record(0x1, 100.0, [0xE0])
+    ring.record(0x2, 200.0, [0xE3])
+    ring.record(0x1, 300.0, [0xE0])  # refresh、 末尾に移動
+    send_ts, _ = ring.lookup_latest()
+    assert send_ts == 300.0

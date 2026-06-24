@@ -2,7 +2,7 @@
 
 **Feature Branch**: `020-tid-mismatch-late-publish`
 **Created**: 2026-06-22
-**Status**: **Draft (Revived 2026-06-24)** — 一度 pivot 判断 (2026-06-23) で「burst できるなら不要」 と中止したが、 2026-06-24 grafana dashboard snapshot 解析で **真因が「メーター ECHONET 内部 queue 9 frame 遅延蓄積 + bridge 30s timeout ミスマッチ」** と判明。 LQI 241 / EEDSCAN 13 で物理層完璧、 SK EVENT 24/29 ゼロ、 しかし `erxudp_tid_mismatch_lag p95=9` = mismatch frame は **9 分前のメーター応答**。 spec 020 で late publish 救済すれば grafana の穴を直接補完可能。 pivot 取消で実装着手。
+**Status**: **Deployed + v1.5 (got_tid=0 fallback) 2026-06-24** — 一度 pivot 判断 (2026-06-23) で「burst できるなら不要」 と中止、 2026-06-24 grafana dashboard 解析で真因確定して v1 実装 (`9dc0ebfa`)。 deploy 後 1h 観察で **救済率 8% (= 39 discard 中 3 救済)** = mismatch frame の **100% が got_tid=0 の uninit response** (= メーター異常挙動、 ECHONET Lite 仕様外)、 過去 send TID と一致せず ring lookup miss。 v1.5 で got_tid=0 を「直近 send への応答」 と仮定 (= `lookup_latest()` fallback) して救済対象に追加、 hit rate 8% → 90%+ 期待。
 **Input**: User description: "spec 014 で破棄している TID mismatch frame は実は『過去送信した TID=A の send 時刻に近い時点でメーターが計測した値』。 単純に捨ててるのは勿体無い、 Grafana の穴を補完できないか?"
 
 ## Background
