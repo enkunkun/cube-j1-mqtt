@@ -51,6 +51,8 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "realtime_mode_current": "off",
         # spec 020: TID mismatch late publish recovery counter.
         "erxudp_recovered_from_mismatch_total": 0,
+        # spec 028: 瞬時電力 recovery backfill counter (= 別 channel で 0xE7 救済).
+        "power_w_recovered_backfill_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -387,3 +389,16 @@ def test_recovered_lag_percentiles_emitted_when_filled():
     assert "erxudp_recovered_lag_p95" in snap
     assert "erxudp_recovered_lag_max" in snap
     assert snap["erxudp_recovered_lag_max"] == 300
+
+
+# ---------------------------------------------------------------------------
+# spec 028: power_w recovery backfill counter (= 直接 += pattern、 on_* method なし)
+# ---------------------------------------------------------------------------
+
+def test_power_w_recovered_backfill_total_reflected_in_snapshot():
+    """publish_recovery_backfill が attribute を += する pattern を snapshot で観測."""
+    state = make_state()
+    state.power_w_recovered_backfill_total += 1
+    state.power_w_recovered_backfill_total += 1
+    snap = state.snapshot(now=state.start_time)
+    assert snap["power_w_recovered_backfill_total"] == 2

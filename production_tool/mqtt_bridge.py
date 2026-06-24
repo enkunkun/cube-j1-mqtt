@@ -204,7 +204,8 @@ def apply_defaults(cfg):
     # メーター ECHONET 内部 queue 遅延応答 (= grafana 観察で p95=9 frame 蓄積)
     # を破棄せず累積系 EPC のみ過去 timestamp で publish、 grafana の穴補完。
     out.setdefault("tid_mismatch_recover_enabled", True)
-    out.setdefault("tid_mismatch_history_maxlen", 10)
+    out.setdefault("tid_mismatch_history_maxlen", 240)  # spec 028: 10 → 240 で深い遅延吸収
+    out.setdefault("power_w_recovery_backfill_enabled", True)  # spec 028: 瞬時電力救済 frame backfill 経路
     return out
 
 
@@ -1670,6 +1671,8 @@ _DIAG_SNAPSHOT_KEYS = (
     "realtime_effective_interval_seconds",
     # spec 020: TID mismatch late publish recovery counter.
     "erxudp_recovered_from_mismatch_total",
+    # spec 028: 瞬時電力 0xE7 救済 frame backfill counter (= 別 channel).
+    "power_w_recovered_backfill_total",
     "uptime_seconds",
     "version",
 )
@@ -2264,6 +2267,10 @@ class DiagState(object):
         self.erxudp_recovered_from_mismatch_total = 0
         self.erxudp_recovered_lag_seconds_recent = collections.deque(maxlen=100)
         self.last_recovered_send_ts = None
+        # spec 028: 瞬時電力 0xE7 救済 frame の backfill JSON publish 回数.
+        # publish_recovery_backfill 内で直接 += 1 (= on_* method なし、 spec 020
+        # last_recovered_send_ts と同じく単純 counter)。
+        self.power_w_recovered_backfill_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -2443,6 +2450,9 @@ class DiagState(object):
             # spec 020: TID mismatch late publish recovery counter.
             "erxudp_recovered_from_mismatch_total":
                 self.erxudp_recovered_from_mismatch_total,
+            # spec 028: 瞬時電力 0xE7 救済 frame backfill counter.
+            "power_w_recovered_backfill_total":
+                self.power_w_recovered_backfill_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -3654,6 +3664,8 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_recovered_lag_p50",         "Recovered Lag p50",          "s",  None, "measurement",      "diagnostic"),
     ("erxudp_recovered_lag_p95",         "Recovered Lag p95",          "s",  None, "measurement",      "diagnostic"),
     ("erxudp_recovered_lag_max",         "Recovered Lag Max",          "s",  None, "measurement",      "diagnostic"),
+    # Spec 028: 瞬時電力 0xE7 救済 frame backfill (= 別 channel で本来時刻にプロット).
+    ("power_w_recovered_backfill_total", "Power W Recovered Backfill", None, None, "total_increasing", "diagnostic"),
     # Spec 022: realtime burst mode (= Admin UI ボタンで 5 分間 5s polling).
     ("realtime_burst_started_total",     "Realtime Burst Started",     None, None, "total_increasing", "diagnostic"),
     ("realtime_burst_completed_total",   "Realtime Burst Completed",   None, None, "total_increasing", "diagnostic"),
@@ -3801,6 +3813,30 @@ def publish_measurements(mqtt, device_id, m, timestamp=None):
                 mqtt.publish("{}/{}_late_publish_ts".format(base, key),
                              ts_iso, retain=True)
 
+# spec 028: 救済 frame の瞬時値を別 topic に過去時刻 backfill JSON で publish。
+# telegraf JSON parser が `json_time_key="ts"` で metric.time に変換、
+# prometheus remote_write が client-supplied timestamp として送信 (= 2h backfill)。
+RECOVERY_BACKFILL_KEYS = frozenset(("power_w",))
+
+
+def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None):
+    """spec 028: 救済 frame の瞬時値を `<key>_recovered_json` topic に
+    `{"value": V, "ts": "<ISO8601 UTC>"}` 形式で publish (retain=False, qos=0).
+
+    `diag_state` が渡されたら `power_w_recovered_backfill_total` を increment。
+    """
+    base = "cubej/{}".format(device_id)
+    ts_iso = format_iso8601_utc(send_ts)
+    for key, value in m.items():
+        if value is None:
+            continue
+        topic = "{}/{}_recovered_json".format(base, key)
+        payload = json.dumps({"value": value, "ts": ts_iso})
+        mqtt.publish(topic, payload, qos=0, retain=False)
+        if diag_state is not None:
+            diag_state.power_w_recovered_backfill_total += 1
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -3841,7 +3877,7 @@ def main():
     # TID → send_ts を bounded で保持、 メーター ECHONET 内部 queue 遅延応答
     # 救済)。 disabled 時は send_history=None を read_erxudp に渡す。
     send_history = SendHistoryRing(maxlen=int(cfg.get(
-        "tid_mismatch_history_maxlen", 10))) if cfg.get(
+        "tid_mismatch_history_maxlen", 240))) if cfg.get(
         "tid_mismatch_recover_enabled", True) else None
 
     # spec 019: persist Wi-Fi AP toggle state across reboots. The store
@@ -4131,6 +4167,17 @@ def main():
                                 publish_measurements(
                                     mqtt, device_id, _m_late,
                                     timestamp=_late_ts)
+                            # spec 028: 瞬時系 (= 0xE7) は別 topic に backfill JSON で
+                            # publish、 grafana で `power_watts_recovered` series に
+                            # 過去時刻でプロット (= HA 経路は触らない)。
+                            if cfg.get("power_w_recovery_backfill_enabled", True):
+                                _m_bf = dict(
+                                    (k, v) for k, v in m.items()
+                                    if k in RECOVERY_BACKFILL_KEYS)
+                                if _m_bf:
+                                    publish_recovery_backfill(
+                                        mqtt, device_id, _m_bf,
+                                        _late_ts, diag_state)
                         else:
                             publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)
