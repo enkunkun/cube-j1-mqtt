@@ -2,7 +2,7 @@
 
 **Feature Branch**: `028-instantaneous-power-recovery`
 **Created**: 2026-06-24
-**Status**: Draft
+**Status**: **Deployed 2026-06-25** — bridge `f581c005` + compose `ad6a6c47` で deploy 完了 (= compose 先 → cube 後 順序、 dig E 決定通り)。 配線確証揃った: code marker 14 件 deploy 反映 + main loop `_m_bf = dict(...)` 配線 + telegraf JSON consumer + dashboard panel-1 refId=B 追加 + DIAG_SENSOR_DEFS 登録。 e2e wire 観察: 2 件 mismatch (= 15:10:55 / 15:54:08) 両方とも **reconnect 直後 cycle 0 = tier4 cycle (= `0 % 30 == 0` で `[0xEA, 0xEB]` cumulative-only) 構造的必然で `m["power_w"]` 不在 → `_m_bf empty` skip** が `poll_success` event の `context` 欠落から決定的に確認。 配線 bug でなく **設計通りの skip**。 次の自然 tier1 cycle mismatch (= 期待値 30-50 分/件) で `power_w_recovered_backfill_total >= 1` + `cube_j1_smart_meter_power_watts_recovered` series 出現 + grafana panel-1 で "Recovered" 点プロット観察を long-term verify。 副次成果: spec 027 残骸 `erxudp_timeout_force_reconnect_threshold=5` を config.json から削除 (= Step 0 で発見)、 deploy 後 `wisun_reconnects_total=1` で 30 threshold 到達 → SKRESET + SKJOIN → 約 2 分で polling 復帰を実機確認 = spec 027 評価データ取得済。
 **Input**: ユーザ要望: 「救済込みで見れる Instantaneous Power が欲しい」 + 「深い遅延も in-memory 内なら吸収できる仕組みにしたい」
 
 ## Background
