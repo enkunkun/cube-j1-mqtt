@@ -2,7 +2,7 @@
 
 **Feature Branch**: `029-cumulative-energy-recovery-backfill`
 **Created**: 2026-06-25
-**Status**: Draft
+**Status**: **Deployed 2026-06-25** — compose `9769a088` + cube `73c22f33` で deploy 完了 (= compose 先 → cube 後 順序、 dig E 決定踏襲)。 配線確証: bridge code reflect + main loop `_late_ts` 分岐に spec 029 backfill 配線 + telegraf JSON consumer topics 1→5 件拡張 + starlark SUFFIX dict 5 entry + diag-num consumer cumulative counter 追加 + dashboard panel-10 refId=C/D `_recovered` overlay + 新 panel-82 cumulative backfill rate。 cloud verify: `cube_j1_smart_meter_cumulative_recovered_backfill_total=0` (= telegraf pipeline 健全証跡)、 `energy_forward_kwh_recovered` series 空 (= deploy 直後 uptime 79s で mismatch 未発火、 整合)。 e2e wire: spec 028 と違って **tier2/4 cycle で構造的に必ず hit** (= 既存 10/10 mismatch すべて tier2/4 だった事実から deploy 後最初の mismatch でほぼ確実に発火、 自然 verify 容易)。 副次成果: Step 0 で device config.json 5 key 全 `<not set>` 確認 (= spec 027 残骸も既消失維持)、 副次修正 commit 不要 = pure spec 029 単独 deploy。 副次発見: subagent 報告で `bridge_version=None` 観測 (= 別 spec 候補、 spec 029 と無関係、 todo 候補)。
 **Input**: ユーザ指摘 (= 2026-06-25): 「救済率は上がってるのに panel で見れないのは片手落ち。 telegraf consumer 設定でこの topic 未 subscribe も含めて実装なのでは」
 
 ## Background
