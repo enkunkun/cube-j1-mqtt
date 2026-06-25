@@ -3855,7 +3855,7 @@ def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None,
             continue
         topic = "{}/{}_recovered_json".format(base, key)
         payload = json.dumps({"value": value, "ts": ts_iso})
-        mqtt.publish(topic, payload, qos=0, retain=False)
+        mqtt.publish(topic, payload, retain=False)
         if diag_state is not None:
             setattr(diag_state, counter_attr,
                     getattr(diag_state, counter_attr, 0) + 1)

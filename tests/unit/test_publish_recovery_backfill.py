@@ -106,10 +106,18 @@ def test_none_value_skipped():
     assert diag.power_w_recovered_backfill_total == 0
 
 
-def test_retain_false_qos_0():
-    """backfill 用途、 retain=False で broker に滞留させない、 qos=0 で HA 互換."""
+def test_retain_false():
+    """backfill 用途、 retain=False で broker に滞留させない (= 救済 frame は
+    publish 時点で意味、 次以降の subscriber に再配送不要).
+
+    spec 028 v1.1 (= 2026-06-25 hotfix): 当初 `qos=0` も assert していたが
+    実機 MQTTClient.publish() は `qos` 引数を受け付けない signature で
+    TypeError → main loop catch → reconnect 強制誘発という 2 重バグ。
+    実機 publish sig (= `publish(topic, payload, retain=False)`) に合わせ
+    `qos` 渡しを削除、 test も retain のみ assert に縮小。
+    """
     mqtt = FakeMqtt()
     mb.publish_recovery_backfill(mqtt, "cubej1", {"power_w": 350}, 1782307200.0)
     _, _, kwargs = mqtt.calls[0]
     assert kwargs.get("retain") is False
-    assert kwargs.get("qos") == 0
+    assert "qos" not in kwargs  # 実機 sig に qos なし、 渡してはいけない
