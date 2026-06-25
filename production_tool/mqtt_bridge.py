@@ -206,6 +206,7 @@ def apply_defaults(cfg):
     out.setdefault("tid_mismatch_recover_enabled", True)
     out.setdefault("tid_mismatch_history_maxlen", 240)  # spec 028: 10 → 240 で深い遅延吸収
     out.setdefault("power_w_recovery_backfill_enabled", True)  # spec 028: 瞬時電力救済 frame backfill 経路
+    out.setdefault("cumulative_recovery_backfill_enabled", True)  # spec 029: 累積系救済 frame backfill 経路
     return out
 
 
@@ -1673,6 +1674,8 @@ _DIAG_SNAPSHOT_KEYS = (
     "erxudp_recovered_from_mismatch_total",
     # spec 028: 瞬時電力 0xE7 救済 frame backfill counter (= 別 channel).
     "power_w_recovered_backfill_total",
+    # spec 029: 累積系 (energy_*_kwh) 救済 frame backfill counter (= 別 channel).
+    "cumulative_recovered_backfill_total",
     "uptime_seconds",
     "version",
 )
@@ -2271,6 +2274,8 @@ class DiagState(object):
         # publish_recovery_backfill 内で直接 += 1 (= on_* method なし、 spec 020
         # last_recovered_send_ts と同じく単純 counter)。
         self.power_w_recovered_backfill_total = 0
+        # spec 029: 累積系 (energy_*_kwh) 救済 frame の backfill JSON publish 回数.
+        self.cumulative_recovered_backfill_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -2453,6 +2458,9 @@ class DiagState(object):
             # spec 028: 瞬時電力 0xE7 救済 frame backfill counter.
             "power_w_recovered_backfill_total":
                 self.power_w_recovered_backfill_total,
+            # spec 029: 累積系 (energy_*_kwh) 救済 frame backfill counter.
+            "cumulative_recovered_backfill_total":
+                self.cumulative_recovered_backfill_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -3666,6 +3674,8 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_recovered_lag_max",         "Recovered Lag Max",          "s",  None, "measurement",      "diagnostic"),
     # Spec 028: 瞬時電力 0xE7 救済 frame backfill (= 別 channel で本来時刻にプロット).
     ("power_w_recovered_backfill_total", "Power W Recovered Backfill", None, None, "total_increasing", "diagnostic"),
+    # Spec 029: 累積系 (energy_*_kwh) 救済 frame backfill (= spec 020 v1.5 可視化完成).
+    ("cumulative_recovered_backfill_total", "Cumulative Recovered Backfill", None, None, "total_increasing", "diagnostic"),
     # Spec 022: realtime burst mode (= Admin UI ボタンで 5 分間 5s polling).
     ("realtime_burst_started_total",     "Realtime Burst Started",     None, None, "total_increasing", "diagnostic"),
     ("realtime_burst_completed_total",   "Realtime Burst Completed",   None, None, "total_increasing", "diagnostic"),
@@ -3818,12 +3828,25 @@ def publish_measurements(mqtt, device_id, m, timestamp=None):
 # prometheus remote_write が client-supplied timestamp として送信 (= 2h backfill)。
 RECOVERY_BACKFILL_KEYS = frozenset(("power_w",))
 
+# spec 029: 累積系 (energy_*_kwh) の救済 frame backfill。 spec 020 v1.5 で
+# `_late_publish_ts` retain publish していたが telegraf 未 subscribe で grafana
+# に来ない片手落ち状態を、 spec 028 と同 JSON 経路で完全可視化する。
+# `_fixed_kwh` 系も bridge publish 対象 (= reconnect 直後 cycle 0 = tier4 で
+# 必ず発火、 panel overlay は forward/reverse のみ)。
+CUMULATIVE_BACKFILL_KEYS = frozenset((
+    "energy_forward_kwh", "energy_reverse_kwh",
+    "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh",
+))
 
-def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None):
-    """spec 028: 救済 frame の瞬時値を `<key>_recovered_json` topic に
+
+def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None,
+                              counter_attr="power_w_recovered_backfill_total"):
+    """spec 028/029: 救済 frame の値を `<key>_recovered_json` topic に
     `{"value": V, "ts": "<ISO8601 UTC>"}` 形式で publish (retain=False, qos=0).
 
-    `diag_state` が渡されたら `power_w_recovered_backfill_total` を increment。
+    `diag_state` が渡されたら `counter_attr` で指定された attribute を increment。
+    spec 028 default = `power_w_recovered_backfill_total` (= 互換)。
+    spec 029 caller は `counter_attr="cumulative_recovered_backfill_total"` を渡す。
     """
     base = "cubej/{}".format(device_id)
     ts_iso = format_iso8601_utc(send_ts)
@@ -3834,7 +3857,8 @@ def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None):
         payload = json.dumps({"value": value, "ts": ts_iso})
         mqtt.publish(topic, payload, qos=0, retain=False)
         if diag_state is not None:
-            diag_state.power_w_recovered_backfill_total += 1
+            setattr(diag_state, counter_attr,
+                    getattr(diag_state, counter_attr, 0) + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -4178,6 +4202,21 @@ def main():
                                     publish_recovery_backfill(
                                         mqtt, device_id, _m_bf,
                                         _late_ts, diag_state)
+                            # spec 029: 累積系 (= energy_*_kwh) も別 topic に
+                            # backfill JSON publish、 grafana panel-10 の
+                            # `*_recovered` series で救済点 plot。 既存
+                            # `_late_publish_ts` retain (= spec 020 v1.5) と
+                            # 並列存在 (= 両方残す)。
+                            if cfg.get("cumulative_recovery_backfill_enabled", True):
+                                _m_cum_bf = dict(
+                                    (k, v) for k, v in m.items()
+                                    if k in CUMULATIVE_BACKFILL_KEYS)
+                                if _m_cum_bf:
+                                    publish_recovery_backfill(
+                                        mqtt, device_id, _m_cum_bf,
+                                        _late_ts, diag_state,
+                                        counter_attr=(
+                                            "cumulative_recovered_backfill_total"))
                         else:
                             publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)

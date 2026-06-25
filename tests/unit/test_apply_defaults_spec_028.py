@@ -22,3 +22,15 @@ def test_explicit_override_is_preserved():
     })
     assert cfg["tid_mismatch_history_maxlen"] == 10
     assert cfg["power_w_recovery_backfill_enabled"] is False
+
+
+def test_default_cumulative_recovery_backfill_enabled_is_true():
+    """spec 029: 累積系 backfill 経路は default ON."""
+    cfg = mb.apply_defaults({})
+    assert cfg["cumulative_recovery_backfill_enabled"] is True
+
+
+def test_cumulative_explicit_override_preserved():
+    """spec 029: kill switch off を明示 override すれば setdefault が尊重."""
+    cfg = mb.apply_defaults({"cumulative_recovery_backfill_enabled": False})
+    assert cfg["cumulative_recovery_backfill_enabled"] is False

@@ -53,6 +53,8 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "erxudp_recovered_from_mismatch_total": 0,
         # spec 028: 瞬時電力 recovery backfill counter (= 別 channel で 0xE7 救済).
         "power_w_recovered_backfill_total": 0,
+        # spec 029: 累積系 (energy_*_kwh) recovery backfill counter.
+        "cumulative_recovered_backfill_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -402,3 +404,13 @@ def test_power_w_recovered_backfill_total_reflected_in_snapshot():
     state.power_w_recovered_backfill_total += 1
     snap = state.snapshot(now=state.start_time)
     assert snap["power_w_recovered_backfill_total"] == 2
+
+
+def test_cumulative_recovered_backfill_total_reflected_in_snapshot():
+    """spec 029: 累積系 counter も同 pattern で snapshot に反映."""
+    state = make_state()
+    state.cumulative_recovered_backfill_total += 1
+    state.cumulative_recovered_backfill_total += 1
+    state.cumulative_recovered_backfill_total += 1
+    snap = state.snapshot(now=state.start_time)
+    assert snap["cumulative_recovered_backfill_total"] == 3
