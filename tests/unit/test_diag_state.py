@@ -58,6 +58,9 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 034: SKSCAN channel mask cache counters.
         "wisun_reconnect_short_scan_total": 0,
         "wisun_reconnect_fallback_full_scan_total": 0,
+        # spec 035: SKLL64 cached + SKJOIN 直行 counters.
+        "wisun_reconnect_cached_skjoin_total": 0,
+        "wisun_reconnect_cached_skjoin_fallback_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -461,3 +464,113 @@ def test_snapshot_includes_fallback_full_scan_total():
     state = make_state()
     snap = state.snapshot(now=state.start_time)
     assert "wisun_reconnect_fallback_full_scan_total" in snap
+
+
+# ---------------------------------------------------------------------------
+# spec 035: SKLL64 cached + SKJOIN 直行 — cache attrs + counters
+# ---------------------------------------------------------------------------
+
+def test_pan_id_starts_none():
+    state = make_state()
+    assert state.pan_id is None
+
+
+def test_mac_starts_none():
+    state = make_state()
+    assert state.mac is None
+
+
+def test_ipv6_starts_none():
+    state = make_state()
+    assert state.ipv6 is None
+
+
+def test_consecutive_skjoin_failures_starts_zero():
+    state = make_state()
+    assert state.consecutive_skjoin_failures == 0
+
+
+def test_on_skll64_sets_ipv6():
+    state = make_state()
+    state.on_skll64("FE80:0000:0000:0000:021C:6400:0B03:D4E3")
+    assert state.ipv6 == "FE80:0000:0000:0000:021C:6400:0B03:D4E3"
+
+
+def test_on_skjoin_failure_increments():
+    state = make_state()
+    state.on_skjoin_failure(invalidate_threshold=2)
+    assert state.consecutive_skjoin_failures == 1
+
+
+def test_on_skjoin_failure_keeps_cache_below_threshold():
+    """1 fail (= threshold 2 未満) なら cache 残る."""
+    state = make_state()
+    state.pan_channel = 57
+    state.pan_id = "D4E3"
+    state.mac = "001C64000B03D4E3"
+    state.ipv6 = "FE80:0000:0000:0000:021C:6400:0B03:D4E3"
+    state.on_skjoin_failure(invalidate_threshold=2)
+    assert state.pan_channel == 57
+    assert state.pan_id == "D4E3"
+    assert state.mac == "001C64000B03D4E3"
+    assert state.ipv6 == "FE80:0000:0000:0000:021C:6400:0B03:D4E3"
+
+
+def test_on_skjoin_failure_invalidates_cache_at_threshold():
+    """2 fail 連続で cache 全 None になる."""
+    state = make_state()
+    state.pan_channel = 57
+    state.pan_id = "D4E3"
+    state.mac = "001C64000B03D4E3"
+    state.ipv6 = "FE80::1"
+    state.on_skjoin_failure(invalidate_threshold=2)
+    state.on_skjoin_failure(invalidate_threshold=2)
+    assert state.pan_channel is None
+    assert state.pan_id is None
+    assert state.mac is None
+    assert state.ipv6 is None
+
+
+def test_on_skjoin_success_resets_failures():
+    state = make_state()
+    state.on_skjoin_failure(invalidate_threshold=99)  # 高 threshold で cache 残す
+    assert state.consecutive_skjoin_failures == 1
+    state.on_skjoin_success()
+    assert state.consecutive_skjoin_failures == 0
+
+
+def test_on_wisun_reconnect_cached_skjoin_increments():
+    state = make_state()
+    state.on_wisun_reconnect_cached_skjoin()
+    state.on_wisun_reconnect_cached_skjoin()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["wisun_reconnect_cached_skjoin_total"] == 2
+
+
+def test_on_wisun_reconnect_cached_skjoin_fallback_increments():
+    state = make_state()
+    state.on_wisun_reconnect_cached_skjoin_fallback()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["wisun_reconnect_cached_skjoin_fallback_total"] == 1
+
+
+def test_on_wisun_joined_sets_pan_id_and_mac():
+    """spec 035: pan dict から pan_id/mac を cache 記録 (= 既存 lqi/channel に加えて)."""
+    state = make_state()
+    state.on_wisun_joined({
+        "LQI": "C0", "Channel": "21",
+        "Pan ID": "D4E3", "Addr": "001C64000B03D4E3",
+    })
+    assert state.pan_id == "D4E3"
+    assert state.mac == "001C64000B03D4E3"
+
+
+def test_on_wisun_joined_skips_missing_pan_id_and_mac():
+    """spec 035: pan dict から Pan ID/Addr 省略時、 既存 attribute は維持 (= 既存 L254 互換)."""
+    state = make_state()
+    state.pan_id = "OLD"
+    state.mac = "OLDMAC"
+    state.on_wisun_joined({"LQI": "10", "Channel": "21"})
+    # 既存 attribute 維持 (= 上書きしない、 既存 test L254 が dict 省略パターンを assert)
+    assert state.pan_id == "OLD"
+    assert state.mac == "OLDMAC"

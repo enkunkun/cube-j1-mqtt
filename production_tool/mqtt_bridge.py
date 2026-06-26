@@ -212,6 +212,11 @@ def apply_defaults(cfg):
     # fallback_duration は単 ch 取り損ね時の全 scan duration (= SCAN_DURATION_BASE 既存値)。
     out.setdefault("wisun_reconnect_channel_mask_enabled", True)
     out.setdefault("wisun_reconnect_channel_mask_fallback_duration", 6)
+    # spec 035: SKLL64 cached + SKJOIN 直行 (= SKSCAN 完全 skip で reconnect 35s → 7s).
+    # enabled=False で旧挙動 (= 毎 reconnect で SKSCAN 全 scan、 spec 011 系列互換)。
+    # threshold = 連続 SKJOIN 失敗で cache 全 invalidate する閾値、 2 = 一時ノイズ吸収。
+    out.setdefault("wisun_reconnect_cached_skjoin_enabled", True)
+    out.setdefault("wisun_reconnect_cached_skjoin_invalidate_threshold", 2)
     return out
 
 
@@ -1684,6 +1689,9 @@ _DIAG_SNAPSHOT_KEYS = (
     # spec 034: SKSCAN channel mask cache (reconnect 32s → 4s) effect metrics.
     "wisun_reconnect_short_scan_total",
     "wisun_reconnect_fallback_full_scan_total",
+    # spec 035: SKLL64 cached + SKJOIN 直行 (reconnect 35s → 7s) effect metrics.
+    "wisun_reconnect_cached_skjoin_total",
+    "wisun_reconnect_cached_skjoin_fallback_total",
     "uptime_seconds",
     "version",
 )
@@ -2289,6 +2297,16 @@ class DiagState(object):
         # 回数。 cache hit rate = short / (short + fallback) を grafana 観察。
         self.wisun_reconnect_short_scan_total = 0
         self.wisun_reconnect_fallback_full_scan_total = 0
+        # spec 035: SKLL64 cached + SKJOIN 直行 (reconnect 35s → 7s). bridge
+        # process 生存中、 メーター pan_id/mac/ipv6 を cache して SKSCAN/SKLL64
+        # を完全 skip。 SKJOIN N 回連続失敗で cache 全 invalidate → 次回必ず
+        # 全 scan path に fallback。
+        self.pan_id = None              # str (hex), e.g. "D4E3"
+        self.mac = None                 # str (16 文字 hex), e.g. "001C64000B03D4E3"
+        self.ipv6 = None                # str (SKLL64 結果 link-local IPv6)
+        self.consecutive_skjoin_failures = 0
+        self.wisun_reconnect_cached_skjoin_total = 0
+        self.wisun_reconnect_cached_skjoin_fallback_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -2317,6 +2335,32 @@ class DiagState(object):
     def on_wisun_reconnect_fallback_full_scan(self):
         """spec 034: 単 ch fail で fallback 全 scan に落ちた時 (= chan 変動 / 雑音時)."""
         self.wisun_reconnect_fallback_full_scan_total += 1
+
+    def on_skll64(self, ipv6):
+        """spec 035: SKLL64 結果を cache。 wisun_connect の SKLL64 成功直後に呼ぶ。"""
+        self.ipv6 = ipv6
+
+    def on_skjoin_success(self):
+        """spec 035: SKJOIN 成功で連続失敗 counter リセット。"""
+        self.consecutive_skjoin_failures = 0
+
+    def on_skjoin_failure(self, invalidate_threshold=2):
+        """spec 035: SKJOIN 失敗で counter += 1、 threshold 以上で cache 全 invalidate
+        (= 次回必ず SKSCAN 全 scan path に fallback)。"""
+        self.consecutive_skjoin_failures += 1
+        if self.consecutive_skjoin_failures >= invalidate_threshold:
+            self.pan_channel = None
+            self.pan_id = None
+            self.mac = None
+            self.ipv6 = None
+
+    def on_wisun_reconnect_cached_skjoin(self):
+        """spec 035: cached SKJOIN 直行で reconnect 成功した時 (= 35s → 7s 短縮)."""
+        self.wisun_reconnect_cached_skjoin_total += 1
+
+    def on_wisun_reconnect_cached_skjoin_fallback(self):
+        """spec 035: cached SKJOIN 失敗で fallback 全 scan に落ちた時."""
+        self.wisun_reconnect_cached_skjoin_fallback_total += 1
 
     def on_mqtt_reconnect(self):
         self.mqtt_reconnects_total += 1
@@ -2433,6 +2477,13 @@ class DiagState(object):
         chan_hex = pan_info.get("Channel")
         if chan_hex is not None:
             self.pan_channel = int(chan_hex, 16)
+        # spec 035: cached SKJOIN 直行用に pan_id/mac も cache
+        pan_id = pan_info.get("Pan ID")
+        if pan_id is not None:
+            self.pan_id = pan_id
+        mac = pan_info.get("Addr")
+        if mac is not None:
+            self.mac = mac
 
     # --- snapshot for MQTT publish ---
 
@@ -2487,6 +2538,11 @@ class DiagState(object):
                 self.wisun_reconnect_short_scan_total,
             "wisun_reconnect_fallback_full_scan_total":
                 self.wisun_reconnect_fallback_full_scan_total,
+            # spec 035: SKLL64 cached + SKJOIN 直行 effect counters.
+            "wisun_reconnect_cached_skjoin_total":
+                self.wisun_reconnect_cached_skjoin_total,
+            "wisun_reconnect_cached_skjoin_fallback_total":
+                self.wisun_reconnect_cached_skjoin_fallback_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2773,22 +2829,12 @@ def skll64(fd, mac):
             continue
     return None
 
-def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
-                  fallback_duration=SCAN_DURATION_BASE, diag_state=None):
-    """Full SKSTACK-IP join sequence. Returns IPv6 address of meter.
+def _wisun_init_sequence(fd, br_id, br_pwd):
+    """spec 035: SKRESET + identity + credential 設定を helper 化。
 
-    spec 034: `prefer_known_channel=True` (= reconnect path 用) で
-    diag_state.pan_channel が既知なら、 まず単 ch mask scan (duration=3
-    ≒ 4s、 max_retries=1) を試行 → 失敗なら fallback で全 scan
-    (= duration=fallback_duration) に落ちる。 初回 join (= default False)
-    では pan_channel 未知のため、 直接全 scan path に進む。
-
-    `fallback_duration` = main loop から
-    `config.get("wisun_reconnect_channel_mask_fallback_duration", 6)`
-    で渡される (= SCAN_DURATION_BASE と同値が default)。
-
-    `diag_state` is forwarded to skscan and the PAN info is recorded onto it
-    once a usable PAN is selected.
+    既存 wisun_connect 先頭の冪等な init を抽出、 cached SKJOIN 失敗時の
+    fallback 経路で 2 度目の clean state init にも再利用 (= EVENT 24 後の
+    BP35CX internal state 残留 risk 回避)。
     """
     log("SKRESET")
     skcommand(fd, "SKRESET", timeout=5)
@@ -2809,6 +2855,109 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
 
     # Force ASCII-hex ERXUDP payload format so parser stays stable.
     skcommand(fd, "WOPT 1")
+
+
+def _wait_skjoin_event25(fd, pan, ipv6, timeout):
+    """spec 035: SKJOIN 発行後の EVENT 25/24 待ち loop を helper 化。
+
+    戻り値: True (= EVENT 25 接続成功) / False (= EVENT 24 PANA fail or
+    timeout = 呼出側で fallback or raise 判定)。 LED blink 副作用込み。
+    cached path = timeout=30 (= 早諦め fallback)、 full path = timeout=90
+    (= 既存挙動互換)。
+    """
+    orig_led = led_read()
+    stop_event = threading.Event()
+    t = threading.Thread(target=_led_blink,
+                         args=(stop_event, [(0, 255, 0), (0, 0, 255)]))
+    t.daemon = True
+    t.start()
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = serial_readline(fd, timeout=2)
+            if line is None:
+                continue
+            if "EVENT 25" in line:
+                if LOGGER is not None:
+                    emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
+                else:
+                    log("SKJOIN: connected")
+                return True
+            if "EVENT 24" in line:
+                if LOGGER is not None:
+                    emit_wisun_join_failed(LOGGER,
+                                           reason="PANA authentication failed (EVENT 24)")
+                return False
+        return False  # timeout
+    finally:
+        stop_event.set()
+        t.join(timeout=1)
+        led_rgb(*orig_led)
+
+
+def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
+                  fallback_duration=SCAN_DURATION_BASE,
+                  prefer_cached_join=False, cached_invalidate_threshold=2,
+                  diag_state=None):
+    """Full SKSTACK-IP join sequence. Returns IPv6 address of meter.
+
+    spec 034: `prefer_known_channel=True` で単 ch mask scan を先に試行
+    (= disable 推奨、 [[spec-034]] cache hit rate 0% で実証失敗)。
+
+    spec 035: `prefer_cached_join=True` で cache 4 件 (= pan_channel/pan_id/
+    mac/ipv6) 全揃いなら SKSCAN/SKLL64 完全 skip + SKSREG S2/S3 + SKJOIN
+    cached_ipv6 直行 (= reconnect 35s → 7s、 5 倍短縮見込み)。 SKJOIN 失敗
+    (= EVENT 24 / 30s timeout) で `cached_invalidate_threshold` (= default 2)
+    回連続で cache 全 invalidate + fallback で SKSCAN 全 scan path に進む。
+
+    `fallback_duration` = main loop から
+    `config.get("wisun_reconnect_channel_mask_fallback_duration", 6)` で渡される。
+
+    `diag_state` is forwarded to skscan and the PAN info is recorded onto it
+    once a usable PAN is selected.
+    """
+    _wisun_init_sequence(fd, br_id, br_pwd)
+
+    # spec 035: cached SKJOIN 直行 path (= SKSCAN/SKLL64 完全 skip)
+    if prefer_cached_join and diag_state is not None:
+        cached_ch = diag_state.pan_channel
+        cached_pid = diag_state.pan_id
+        cached_mac = diag_state.mac
+        cached_ipv6 = diag_state.ipv6
+        if all(x is not None for x in (cached_ch, cached_pid, cached_mac, cached_ipv6)):
+            log("SKJOIN cached direct (ch={} pan_id={} mac={} ipv6={})".format(
+                cached_ch, cached_pid, cached_mac, cached_ipv6))
+            cached_succeeded = False
+            try:
+                ch_hex = "{:02X}".format(int(cached_ch))
+                skcommand(fd, "SKSREG S2 {}".format(ch_hex))
+                skcommand(fd, "SKSREG S3 {}".format(cached_pid))
+                serial_write(fd, "SKJOIN {}\r\n".format(cached_ipv6))
+                cached_pan = {"Channel": ch_hex, "Pan ID": cached_pid,
+                              "Addr": cached_mac}
+                if _wait_skjoin_event25(fd, cached_pan, cached_ipv6, timeout=30):
+                    cached_succeeded = True
+            except Exception as e:
+                log("SKJOIN cached path raised: {} - falling back".format(e))
+
+            if cached_succeeded:
+                if diag_state is not None:
+                    try:
+                        diag_state.on_skjoin_success()
+                        diag_state.on_wisun_reconnect_cached_skjoin()
+                    except Exception as e:
+                        log("diag on_skjoin_success error: {}".format(e))
+                return cached_ipv6
+
+            # cached path 失敗 → counter + invalidate + re-init for clean state
+            if diag_state is not None:
+                try:
+                    diag_state.on_skjoin_failure(cached_invalidate_threshold)
+                    diag_state.on_wisun_reconnect_cached_skjoin_fallback()
+                except Exception as e:
+                    log("diag on_skjoin_failure error: {}".format(e))
+            log("SKJOIN cached failed, re-init + SKSCAN fallback")
+            _wisun_init_sequence(fd, br_id, br_pwd)
 
     pan = None
     known_ch = getattr(diag_state, "pan_channel", None) if diag_state else None
@@ -2854,6 +3003,11 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
     if not ipv6:
         raise RuntimeError("SKLL64 failed")
     log("Meter IPv6: {}".format(ipv6))
+    if diag_state is not None:
+        try:
+            diag_state.on_skll64(ipv6)  # spec 035: cache ipv6 for next reconnect
+        except Exception as e:
+            log("diag on_skll64 error: {}".format(e))
 
     skcommand(fd, "SKSREG S2 {}".format(channel))
     skcommand(fd, "SKSREG S3 {}".format(pan_id))
@@ -2861,38 +3015,15 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
     log("SKJOIN {}".format(ipv6))
     serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
 
-    orig_led = led_read()
-    stop_event = threading.Event()
-    t = threading.Thread(target=_led_blink,
-                         args=(stop_event, [(0, 255, 0), (0, 0, 255)]))
-    t.daemon = True
-    t.start()
-    try:
-        deadline = time.time() + 90
-        while time.time() < deadline:
-            line = serial_readline(fd, timeout=2)
-            if line is None:
-                continue
-            if "EVENT 25" in line:
-                if LOGGER is not None:
-                    emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
-                else:
-                    log("SKJOIN: connected")
-                # spec 010 で undocumented `SKSCAN 0 ... 0` (SIDE arg) が
-                # EEDSCAN を返すと確定したので、 起動時 sweep は外し、
-                # main loop で eedscan_state による定期実行に統一。
-                return ipv6
-            if "EVENT 24" in line:
-                if LOGGER is not None:
-                    emit_wisun_join_failed(LOGGER,
-                                           reason="PANA authentication failed (EVENT 24)")
-                raise RuntimeError("SKJOIN: PANA authentication failed (EVENT 24)")
-    finally:
-        stop_event.set()
-        t.join(timeout=1)
-        led_rgb(*orig_led)
-
-    raise RuntimeError("SKJOIN: timeout")
+    if _wait_skjoin_event25(fd, pan, ipv6, timeout=90):
+        if diag_state is not None:
+            try:
+                diag_state.on_skjoin_success()  # spec 035: reset failure counter
+            except Exception as e:
+                log("diag on_skjoin_success error: {}".format(e))
+        return ipv6
+    # EVENT 24 PANA fail or timeout
+    raise RuntimeError("SKJOIN: PANA authentication failed or timeout")
 
 # ---------------------------------------------------------------------------
 # ECHONET Lite frame builder / parser
@@ -3776,6 +3907,9 @@ DIAG_SENSOR_DEFS = [
     # Spec 034: SKSCAN channel mask cache (= reconnect 32s → 4s 短縮効果率).
     ("wisun_reconnect_short_scan_total",    "Wi-SUN Reconnect Short Scan", None, None, "total_increasing", "diagnostic"),
     ("wisun_reconnect_fallback_full_scan_total", "Wi-SUN Reconnect Fallback Full Scan", None, None, "total_increasing", "diagnostic"),
+    # Spec 035: SKLL64 cached + SKJOIN 直行 (= reconnect 35s → 7s 短縮効果率).
+    ("wisun_reconnect_cached_skjoin_total", "Wi-SUN Reconnect Cached SKJOIN", None, None, "total_increasing", "diagnostic"),
+    ("wisun_reconnect_cached_skjoin_fallback_total", "Wi-SUN Reconnect Cached SKJOIN Fallback", None, None, "total_increasing", "diagnostic"),
     # Spec 022: realtime burst mode (= Admin UI ボタンで 5 分間 5s polling).
     ("realtime_burst_started_total",     "Realtime Burst Started",     None, None, "total_increasing", "diagnostic"),
     ("realtime_burst_completed_total",   "Realtime Burst Completed",   None, None, "total_increasing", "diagnostic"),
@@ -4443,15 +4577,18 @@ def main():
                     log("WARN: serial reopen failed (continuing with original fd): {}"
                         .format(re))
             try:
-                # spec 034: reconnect path で既知 pan_channel を使った単 ch mask
-                # scan (= ~4s) → 失敗時 fallback 全 scan (= 旧挙動)。
-                # `wisun_reconnect_channel_mask_enabled=False` で旧挙動互換。
+                # spec 034: 単 ch mask scan path (= disable 推奨、 cache hit 0%)
+                # spec 035: cached SKJOIN 直行 path (= SKSCAN/SKLL64 skip で 35s→7s)
                 ipv6 = wisun_connect(
                     fd, br_id, br_pwd,
                     prefer_known_channel=bool(cfg.get(
                         "wisun_reconnect_channel_mask_enabled", True)),
                     fallback_duration=int(cfg.get(
                         "wisun_reconnect_channel_mask_fallback_duration", 6)),
+                    prefer_cached_join=bool(cfg.get(
+                        "wisun_reconnect_cached_skjoin_enabled", True)),
+                    cached_invalidate_threshold=int(cfg.get(
+                        "wisun_reconnect_cached_skjoin_invalidate_threshold", 2)),
                     diag_state=diag_state)
                 log("Wi-SUN reconnected at {}".format(ipv6))
                 diag_state.consecutive_wisun_connect_failures = 0

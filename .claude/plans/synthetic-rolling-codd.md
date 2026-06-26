@@ -1,147 +1,254 @@
-# Plan: spec 034 SKSCAN Channel Mask Cache (= spec 011 F: reconnect 32s→4s で sparseness さらに改善)
+# Plan: spec 035 SKLL64 Cached + SKJOIN 直行 (= spec 011 G: SKSCAN 完全 skip で reconnect 35s → 7s)
 
 ## Context
 
-spec 033 deploy 後 panel-1 観察で「リカバー一部増えてるが空白多い」 = reconnect の SKSCAN 32s 占有が polling sparseness 主因の一つ。 cube-j1-mqtt reconnect は SKRESET → SKVER/SKSETPWD/SKSETRBID → **SKSCAN 32s** → SKJOIN で計 35-40s、 1h で 4-5 回 (= spec 032 threshold=6) = 1h 内 **2-3 分が SKSCAN 待ち**。
+[[spec-034-skscan-channel-mask-cache]] v1 Phase 2 (= 2026-06-27 00:37 真 deploy 1h verify) で「単 ch active scan でメーター beacon hit せず cache hit rate 0%」 確定、 active scan アプローチ自体が機能不能と判明 ([[feedback-spec034-single-ch-scan-fails]])。 別アプローチ = **メーター IPv6 / MAC / pan_id / channel は join 後固定** という性質を利用し、 bridge process 生存中 cache → SKSCAN 完全 skip + SKJOIN 直行で reconnect 35s → 7s = 5 倍短縮見込み。
 
-メーター pan_channel (= 現在 57) は join 後固定で、 BP35CX `SKSCAN 2 <mask> <duration> <side>` の mask 引数で単 ch のみ scan 可 (= ch57 なら `0x01000000`、 duration 3 で ~4s)。 reconnect 時に既知 ch のみ短 scan + 失敗時 fallback 全 scan で SKSCAN 32s → 4s = **8 倍短縮** 見込み、 reconnect 全体 35s → 7s、 panel-1 sparseness 緩和。
+tako 合議 (= 2026-06-27 01:00) で「software 改善は spec 035 のみ補助、 物理層 RF 改善が本命」 判定済、 ユーザは software 路線維持を選択 = spec 035 を最終 software 改善として実装。
 
-[[reference-tako-instantaneous-power-architectural-cap]] が「software 改善余地」 として spec 011 F (= SKSCAN 固定) を最終形態に位置付けた spec、 spec 032/033 に続く 3 件目の software 改善。
+### 期待効果
+
+| Step | spec 011 系列 (= 旧 + spec 034 disable) | spec 035 cached path |
+|---|---|---|
+| SKRESET | 1s | 1s |
+| SKVER/SKSETPWD/SKSETRBID/WOPT 1 | 3-4s | 3-4s |
+| SKSCAN | **17-32s** | **0s skip** |
+| SKLL64 | 1s | **0s skip** (= cached ipv6) |
+| SKSREG S2/S3 | 1s | 1s |
+| SKJOIN + EVENT 25 待ち | 1-2s | 1-2s |
+| **合計** | 24-41s | **6-8s** |
+
+= 5 倍短縮、 reconnect 5 件/h × 30s 短縮 = 150s/h sparseness 改善。 ただし erxudp_timeouts 30/h (= 30 分/h 主因) には届かず、 補助的施策。
 
 ## Approach
 
 ### v1 MVP の構成
 
-1. **新 pure helper `channel_to_mask(ch)`** = `skscan` 直前 (= 約 line 2638 周辺) に追加、 ch33-60 → 32-bit bitmap 変換 (= `1 << (ch - 33)`)
-2. **`skscan` 拡張サイン** (= 約 line 2643): `skscan(fd, channel_mask="FFFFFFFF", duration=SCAN_DURATION_BASE, max_retries=None, diag_state=None)` で旧 caller (= keyword なし呼出) 無変更互換。 `max_retries=None` は既存 `SCAN_RETRY_LIMIT` 追従 (= duration 増分 retry)、 `max_retries=1` は 1 回試行で抜け (= 単 ch path 用、 dig round 2 A 決定)
-3. **`wisun_connect` 拡張サイン** (= 約 line 2729): `wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False, fallback_duration=SCAN_DURATION_BASE, diag_state=None)` で旧 caller 無変更互換。 `fallback_duration` は main loop で `config.get("wisun_reconnect_channel_mask_fallback_duration", 6)` 取得して渡す (= dig round 2 B 決定)
-4. **wisun_connect 内 2 段 scan path** (= dig 決定 = wisun_connect 内 fallback、 caller 1 呼出で完結):
-   - `prefer_known_channel=True` かつ `diag_state.pan_channel` が None でなければ → 単 ch mask scan (= `channel_to_mask(pan_channel)` + duration 3) を 1 回試行
-   - PAN 見つからず → fallback で `SKSCAN 2 FFFFFFFF {fallback_duration} 0` 実行 (= 旧挙動)
-   - `prefer_known_channel=False` or `pan_channel is None` → 直接全 scan path
-5. **main loop reconnect path** (= line 4360) で `wisun_connect(..., prefer_known_channel=True, ...)` 渡し、 初回 join (= line 3998) は default `False` で全 scan 維持 (= safety)
-6. **DiagState 拡張 2 counter**: `wisun_reconnect_short_scan_total` (= 単 ch 成功) + `wisun_reconnect_fallback_full_scan_total` (= fallback 全 scan)、 「短縮効果率」 grafana 観察可
-7. **apply_defaults 2 keys** (= dig 決定 = spec.md 通り escape hatch 完備):
-   - `wisun_reconnect_channel_mask_enabled` (default `True`)
-   - `wisun_reconnect_channel_mask_fallback_duration` (default `6`、 spec 010 SCAN_DURATION_BASE と同値)
+1. **DiagState 拡張 (= 3 cache attr + 1 counter + 2 metric counter)**:
+   - `self.pan_id = None`、 `self.mac = None`、 `self.ipv6 = None` (= 既存 `pan_channel` と並列に追加)
+   - `self.consecutive_skjoin_failures = 0` (= cache invalidation 判定用)
+   - `self.wisun_reconnect_cached_skjoin_total = 0` / `self.wisun_reconnect_cached_skjoin_fallback_total = 0` (= 効果観察用)
+   - `on_wisun_joined(pan)` 拡張: pan_id / mac 記録追加 + ipv6 は別途 SKLL64 結果を set する method 新設 `on_skll64(ipv6)`
+   - `on_skjoin_success()` / `on_skjoin_failure()` method 追加 (= counter + cache invalidate gating)
 
-### 設計上の判断 (dig round 1 で確定済)
+2. **`wisun_connect` 拡張**:
+   - サイン: `wisun_connect(fd, br_id, br_pwd, prefer_cached_join=False, cached_invalidate_threshold=2, diag_state=None)`
+   - `prefer_cached_join=True` + cache 4 件全揃い (= pan_channel/pan_id/mac/ipv6 全部 non-None) なら → **SKSCAN/SKLL64 skip + SKSREG S2/S3 + SKJOIN cached_ipv6** 直行 path
+   - SKJOIN 失敗 (= EVENT 24 / timeout 90s) で `diag_state.on_skjoin_failure()` で counter += 1、 threshold (= 2) 超で cache 全 invalidate (= pan_channel = pan_id = mac = ipv6 = None) → 次回必ず SKSCAN 全 scan
+   - SKJOIN 成功で `on_skjoin_success()` で counter リセット
+   - cache 未揃 or `prefer_cached_join=False` (= 初回 join) → 既存 SKSCAN 全 scan path 経由 (= [[spec-034]] disable 後の旧挙動互換)
+   - **spec 034 引数 (= `prefer_known_channel`/`fallback_duration`) は維持** (= 削除すると既存 caller 壊れる、 spec 034 disable は config 経由なので code 互換維持)
 
-- **dig A — 単 ch duration**: `3` (= ~4s、 spec.md 明記)。 BP35CX 仕様 192*2^3 = 1536 symbol times ≒ 3-4 秒、 既知 ch (= ノイズ無視) なら検出余裕あり
-- **dig B — fallback location**: `wisun_connect` 内 2 段 scan (= 1 呼出で 2 段)。 main loop 上位 except 任せ案 (= 単 ch fail で raise → spec 017 backoff 30s 待ち) は sparseness 改善目的に反する
-- **dig C — kill switch**: `enabled` + `fallback_duration` の 2 keys (= spec.md 通り)。 spec 034 は spec 033 と違い reconnect 経路根本変更で risk 高い、 escape hatch 推奨
+3. **main loop reconnect path** (= line 4360 周辺、 spec 034 で既に config gating 配線済):
+   - `cfg.get("wisun_reconnect_cached_skjoin_enabled", True)` で gating
+   - `cfg.get("wisun_reconnect_cached_skjoin_invalidate_threshold", 2)` で fallback 閾値
+   - spec 034 既存 `wisun_reconnect_channel_mask_enabled` は default `True` のままだが、 cube-j1 では explicit `False` override 維持 (= 既に config push 済)
+   - 初回 join (= line 4084) は default `prefer_cached_join=False` 維持 = safety
+
+4. **apply_defaults 2 keys 追加**:
+   - `wisun_reconnect_cached_skjoin_enabled` (default `True`)
+   - `wisun_reconnect_cached_skjoin_invalidate_threshold` (default `2`)
+
+5. **DiagState `_DIAG_SNAPSHOT_KEYS` + raw dict + DIAG_SENSOR_DEFS 拡張** ([[feedback-diag-sensor-defs-publish]]):
+   - 新 2 counter (= cached_skjoin_total / cached_skjoin_fallback_total) を MQTT publish
+   - 既存 pan_channel と同様の publish パターン (= pan_id/mac/ipv6 は MQTT 不要、 string 値 + 機微性低、 ただし DiagState 内のみ保持で OK)
+   - cache 3 件 (= pan_id/mac/ipv6) は admin UI で見えると便利だが、 spec 035 v1 では DiagState 内のみ (= MQTT publish はスコープ外)
+
+### 設計上の判断 (= dig 2 round で確定)
+
+**Round 1**:
+- **dig 1A — cache invalidate threshold default = 2** (= 一時ノイズ吸収 + メーター reboot 検出 trade-off の中庸)
+- **dig 1B — SKLL64 skip = cached ipv6 直接** (= 1s 短縮、 SKLL64(mac) は決定的計算で再生成意味なし)
+- **dig 1C — cache MQTT publish = v1 では DiagState 内のみ** (= 新 2 counter だけ MQTT publish、 pan_id/mac/ipv6 は scope 外)
+- **dig 1D — pan_id/mac format = str (hex)** (= SKSCAN 出力そのまま、 SKSREG S3 も str 受け取り = 変換ゼロ)
+
+**Round 2**:
+- **dig 2A — `_wait_skjoin_event25` 関数化** (= 既存 wisun_connect L2876-2889 EVENT 25/24 待ち loop を helper 抽出、 cached path + full scan path で再利用 = [[tidy-first]] 構造変更 1 commit 同梱)
+- **dig 2B — cached path SKJOIN timeout = 30s** (= 正常 SKJOIN 1-2s に対して余裕 15 倍、 stale cache 時 30s で fallback 進行 = full path 60s+ より 2 倍早諦め)
+- **dig 2C — cached fail 後 SKRESET 2 度目入れる** (= EVENT 24 PANA fail 後の BP35CX state 残留 risk 回避、 +1s overhead 容認 = fallback path overhead 60s+ の 1.6% 増)
+- **dig 2D — `on_wisun_joined` 拡張 `.get()` で optional**: 既存 test_diag_state L254 が pan dict から `Pan ID`/`Addr` 省略 → `pan_info.get("Pan ID")` / `.get("Addr")` で None default、 既存 test 互換確保
 
 ### Trade-off
 
-- **MQTT publish 件数**: 変化なし (= polling 周辺は spec 033 で確定済、 spec 034 は SKSCAN duration のみ)
-- **reconnect 単 ch fail 時**: +4s 余分待ち (= 単 ch 試行 4s) で全 scan 32s に fallback = 全体 36s。 ただし期待 cache hit rate >= 90% で稀
-- **メーター chan 変動 (= reboot 時稀)**: 単 ch 必ず fail → fallback で 36s reconnect 1 回発生、 以降 `diag_state.pan_channel` 更新で次回 reconnect は新 ch で 4s 短 scan 戻り
-- **既存 `SCAN_DURATION_BASE=6`** 完全保護 (= 初回 join、 fallback 経路で流用)
+- **bridge restart 時**: cache 消える = 初回 join で全 scan 必須 (= 月 1 回程度の overhead、 容認可)
+- **メーター reboot 時**: cache 古い → SKJOIN 失敗 → 2 fail で invalidate → 全 scan fallback、 1 回だけ 110-130s overhead (= 月 1 回程度、 sparseness 影響軽微)
+- **メーター chan 変動 (= ARIB STD-T108 reallocation)**: 同 reboot pattern で fallback、 lab メーター実績 = 6 ヶ月 ch57 固定
+- **既存 [[spec-034]] disable 互換**: spec 034 引数残置 + cube-j1 config explicit False で旧挙動、 spec 035 default True で cached path 試行 → 失敗時 spec 034 path (= disable で全 scan) に落ちる、 2 段防御
 
 ## Files to modify
 
 ### `production_tool/mqtt_bridge.py`
 
-1. **`channel_to_mask(ch)` 新 pure helper** = `SCAN_DURATION_BASE` 定数 (= line 2636) 直後に追加:
+1. **DiagState `__init__`** (= 約 line 2229):
    ```python
-   def channel_to_mask(ch):
-       """spec 034: BP35CX channel 番号 (= ch33-60) を SKSCAN 2 用 32-bit
-       channel mask に変換。 ch33 = bit 0, ch60 = bit 27.
-       例: channel_to_mask(57) = 0x01000000 (= bit 24)
-       """
-       return 1 << (int(ch) - 33)
+   self.pan_id = None              # str (hex)、 既存 pan_channel と並列
+   self.mac = None                 # str (= 16 文字 hex)
+   self.ipv6 = None                # str (= SKLL64 結果 IPv6)
+   self.consecutive_skjoin_failures = 0
+   self.wisun_reconnect_cached_skjoin_total = 0
+   self.wisun_reconnect_cached_skjoin_fallback_total = 0
    ```
 
-2. **`skscan` サイン拡張** (= line 2643):
-   - L2643: `def skscan(fd, channel_mask="FFFFFFFF", duration=SCAN_DURATION_BASE, max_retries=None, diag_state=None):`
-   - L2650: `duration = SCAN_DURATION_BASE` 削除 (= 引数で初期化)
-   - L2651 (= `while duration <= SCAN_RETRY_LIMIT` 直前) に `attempt = 0` 初期化 (= ループ外 = 1 skscan 呼出 1 counter) + L2695 `duration += 1` 直前に `attempt += 1; if max_retries is not None and attempt >= max_retries: break` 挿入 (= dig round 3 C: 1 回試行 break、 max_retries=None で旧挙動互換)
-   - L2658: `"SKSCAN 2 FFFFFFFF {} 0\r\n".format(duration)` → `"SKSCAN 2 {} {} 0\r\n".format(channel_mask, duration)`
-   - 旧 caller (= `skscan(fd, diag_state=diag_state)`) は default `max_retries=None` で旧挙動互換 (= duration 増分 retry)
-
-3. **`wisun_connect` サイン拡張 + 2 段 scan** (= line 2729-2812):
-   - サイン: `def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False, fallback_duration=SCAN_DURATION_BASE, diag_state=None):`
-   - L2755-2758 の SKSCAN 呼出 1 箇所を「2 段 path」 で置換:
-     - 単 ch 試行 (= `prefer_known_channel=True` + `diag_state.pan_channel` あり) → `skscan(fd, channel_mask="{:08X}".format(channel_to_mask(known_ch)), duration=3, max_retries=1, diag_state=diag_state)` (= dig round 2 A: 1 回試行で抜け)
-     - 失敗 (= `pan.get("Channel")` 偽) なら fallback `skscan(fd, channel_mask="FFFFFFFF", duration=fallback_duration, diag_state=diag_state)` (= max_retries=None default = duration 増分 retry で旧挙動)
-     - counter 副作用 (= dig round 3 D): 単 ch 成功時 `on_wisun_reconnect_short_scan()` / 単 ch 失敗で fallback path 入った時のみ `on_wisun_reconnect_fallback_full_scan()`。 初回 join (= `prefer_known_channel=False`) は counter 発火しない (= SC cache hit rate 計算の分母から除外) =「単 ch 取り損ね率」 metric 性質保持
-     - 既存 try/except 防御 pattern 踏襲 (= diag bug が measurement path 遮らない)
-   - 以降 SKJOIN / SKLL64 / SKSREG 等は完全保護
-
-4. **main loop reconnect path** (= line 4360) で `wisun_connect(..., prefer_known_channel=<gated>, fallback_duration=<from-config>, ...)` 渡し:
-   - `prefer_known_channel = config.get("wisun_reconnect_channel_mask_enabled", True)` で gating (= False なら旧挙動)
-   - `fallback_duration = int(config.get("wisun_reconnect_channel_mask_fallback_duration", 6))` (= dig round 2 B 決定)
-   - 初回 join (= line 3998) は引数省略 = default `prefer_known_channel=False` + `fallback_duration=SCAN_DURATION_BASE` 維持 = safety、 pan_channel 未知のため
-
-5. **DiagState 拡張** (= line 2230 周辺 `__init__` + line 1651 `_DIAG_SNAPSHOT_KEYS` + line 3669 DIAG_SENSOR_DEFS):
-   - `self.wisun_reconnect_short_scan_total = 0` / `self.wisun_reconnect_fallback_full_scan_total = 0`
-   - `on_wisun_reconnect_short_scan(self)` / `on_wisun_reconnect_fallback_full_scan(self)` method
-   - `_DIAG_SNAPSHOT_KEYS` + snapshot raw dict + DIAG_SENSOR_DEFS 各 2 件追加 ([[feedback-diag-sensor-defs-publish]] 必須)
-
-6. **apply_defaults** (= line 101-210、 末尾追加):
+2. **DiagState method 追加** (= 約 line 2310 周辺、 既存 `on_wisun_joined` の隣):
    ```python
-   # spec 034: SKSCAN channel mask cache for faster reconnect (32s → 4s).
-   out.setdefault("wisun_reconnect_channel_mask_enabled", True)
-   out.setdefault("wisun_reconnect_channel_mask_fallback_duration", 6)
+   def on_skll64(self, ipv6):
+       """spec 035: SKLL64 結果を cache。 wisun_connect の SKLL64 成功直後に呼ぶ。"""
+       self.ipv6 = ipv6
+
+   def on_skjoin_success(self):
+       """spec 035: SKJOIN 成功で連続失敗 counter リセット。"""
+       self.consecutive_skjoin_failures = 0
+
+   def on_skjoin_failure(self, invalidate_threshold=2):
+       """spec 035: SKJOIN 失敗で counter += 1、 threshold 超えで cache 全 invalidate。"""
+       self.consecutive_skjoin_failures += 1
+       if self.consecutive_skjoin_failures >= invalidate_threshold:
+           self.pan_channel = None
+           self.pan_id = None
+           self.mac = None
+           self.ipv6 = None
+
+   def on_wisun_reconnect_cached_skjoin(self):
+       self.wisun_reconnect_cached_skjoin_total += 1
+
+   def on_wisun_reconnect_cached_skjoin_fallback(self):
+       self.wisun_reconnect_cached_skjoin_fallback_total += 1
    ```
 
-### `tests/unit/test_channel_to_mask.py` (= 新規)
+3. **DiagState `on_wisun_joined` 拡張** (= 約 line 2400 周辺):
+   - 既存 pan_channel 記録に加えて pan_id (= 必ず str)、 mac (= str) も記録
 
-- `test_channel_33_returns_bit_0` (= `channel_to_mask(33) == 0x1`)
-- `test_channel_57_returns_known_mask` (= `channel_to_mask(57) == 0x01000000`、 lab メーター現 ch)
-- `test_channel_60_returns_max_bit` (= `channel_to_mask(60) == 0x08000000`)
-- `test_int_string_arg_coerced` (= `channel_to_mask("57") == 0x01000000`、 diag_state.pan_channel が str fallback case の安全弁)
+4. **`_DIAG_SNAPSHOT_KEYS` + raw dict + DIAG_SENSOR_DEFS** (= 既存 spec 034 と同 pattern):
+   - 新 2 counter (= cached_skjoin_total / cached_skjoin_fallback_total) を全 3 箇所追加
+   - pan_id/mac/ipv6 は v1 では MQTT publish しない (= dig C で確認)
 
-### `tests/unit/test_apply_defaults_spec_034.py` (= 新規)
+5. **`wisun_connect` 拡張サイン + 2 段 path**:
+   ```python
+   def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
+                     fallback_duration=SCAN_DURATION_BASE,
+                     prefer_cached_join=False, cached_invalidate_threshold=2,
+                     diag_state=None):
+       """... 既存 docstring + spec 035 説明追加 ..."""
+       # SKRESET / SKVER / SKSETPWD / SKSETRBID / WOPT 1 は不変
 
-- `test_default_channel_mask_enabled_true`
-- `test_default_fallback_duration_6`
-- `test_explicit_override_respected` (= user config の `False` / `4` が保持)
+       # spec 035: cached SKJOIN 直行 path
+       if prefer_cached_join and diag_state is not None:
+           cached_ch = diag_state.pan_channel
+           cached_pid = diag_state.pan_id
+           cached_mac = diag_state.mac
+           cached_ipv6 = diag_state.ipv6
+           if all(x is not None for x in (cached_ch, cached_pid, cached_mac, cached_ipv6)):
+               log("SKJOIN cached direct (ch={} pan_id={} ipv6={})".format(
+                   cached_ch, cached_pid, cached_ipv6))
+               try:
+                   ch_hex = "{:02X}".format(int(cached_ch))
+                   skcommand(fd, "SKSREG S2 {}".format(ch_hex))
+                   skcommand(fd, "SKSREG S3 {}".format(cached_pid))
+                   serial_write(fd, "SKJOIN {}\r\n".format(cached_ipv6))
+                   # 以降 EVENT 25/24 待ち path (= 既存 line 2876-2889 の path を関数化 or inline で共通化)
+                   if _wait_skjoin_event25(fd, timeout=30):
+                       try:
+                           diag_state.on_skjoin_success()
+                           diag_state.on_wisun_reconnect_cached_skjoin()
+                       except Exception as e:
+                           log("diag on_skjoin_success error: {}".format(e))
+                       return cached_ipv6
+                   # EVENT 24 or timeout → fall through to fallback
+                   try:
+                       diag_state.on_skjoin_failure(cached_invalidate_threshold)
+                       diag_state.on_wisun_reconnect_cached_skjoin_fallback()
+                   except Exception as e:
+                       log("diag on_skjoin_failure error: {}".format(e))
+               except Exception as e:
+                   log("SKJOIN cached path failed: {} - falling back to full scan".format(e))
+                   try:
+                       diag_state.on_skjoin_failure(cached_invalidate_threshold)
+                       diag_state.on_wisun_reconnect_cached_skjoin_fallback()
+                   except Exception as e2:
+                       pass
+       # 以降 SKSCAN 全 scan path (= 既存挙動、 spec 034 引数も含めて完全保護)
+       # ... (既存 line 2755-2895 の path)
+   ```
+   - **`_wait_skjoin_event25(fd, timeout)` 関数化必須** (= dig 2A): 既存 EVENT 25/24 待ち loop = line 2876-2889 を helper 抽出。 戻り値 = True (= EVENT 25 成功) / False (= EVENT 24 PANA fail or timeout)。 cached path = `timeout=30` (= dig 2B)、 full path = `timeout=90` (= 既存維持)
+   - **cached fail 後の re-SKRESET** (= dig 2C): cached path 失敗で fallback に進む直前に `skcommand(fd, "SKRESET", timeout=5)` + `time.sleep(1)` + SKVER/SKSETPWD/SKSETRBID/WOPT 1 再実行 (= 既存 wisun_connect 先頭の冪等な init sequence を関数化 `_wisun_init_sequence(fd, br_id, br_pwd)` に抽出して 2 度目呼出が clean)
+   - SKSCAN 成功後の path で **`on_wisun_joined(pan)` 拡張 (= pan_id/mac `.get()` 安全取得、 dig 2D) + `on_skll64(ipv6)` 呼出 + `on_skjoin_success()` 呼出** を追加
+
+6. **apply_defaults** (= line 209 周辺):
+   ```python
+   # spec 035: SKLL64 cached + SKJOIN 直行 (= SKSCAN skip で reconnect 35s → 7s).
+   out.setdefault("wisun_reconnect_cached_skjoin_enabled", True)
+   out.setdefault("wisun_reconnect_cached_skjoin_invalidate_threshold", 2)
+   ```
+
+7. **main loop reconnect path** (= line 4445 周辺、 spec 034 で既に `wisun_connect(..., prefer_known_channel=..., fallback_duration=..., diag_state=...)` 呼出):
+   ```python
+   ipv6 = wisun_connect(
+       fd, br_id, br_pwd,
+       prefer_known_channel=bool(cfg.get("wisun_reconnect_channel_mask_enabled", True)),
+       fallback_duration=int(cfg.get("wisun_reconnect_channel_mask_fallback_duration", 6)),
+       prefer_cached_join=bool(cfg.get("wisun_reconnect_cached_skjoin_enabled", True)),
+       cached_invalidate_threshold=int(cfg.get("wisun_reconnect_cached_skjoin_invalidate_threshold", 2)),
+       diag_state=diag_state)
+   ```
+
+### `tests/unit/test_apply_defaults_spec_035.py` (= 新規)
+
+- `test_default_cached_skjoin_enabled_true`
+- `test_default_invalidate_threshold_2`
+- `test_explicit_override_respected`
 
 ### `tests/unit/test_diag_state.py` (= 既存拡張)
 
-- `test_wisun_reconnect_short_scan_total_baseline_zero`
-- `test_on_wisun_reconnect_short_scan_increments`
-- `test_wisun_reconnect_fallback_full_scan_total_baseline_zero`
-- `test_on_wisun_reconnect_fallback_full_scan_increments`
-- `test_snapshot_includes_short_scan_total` (= MQTT publish 経路保護、 [[feedback-diag-sensor-defs-publish]])
-- `test_snapshot_includes_fallback_full_scan_total`
+- `test_pan_id_starts_none` (= baseline)
+- `test_mac_starts_none`
+- `test_ipv6_starts_none`
+- `test_consecutive_skjoin_failures_starts_zero`
+- `test_on_wisun_joined_sets_pan_id_and_mac` (= pan dict から記録確認)
+- `test_on_skll64_sets_ipv6`
+- `test_on_skjoin_success_resets_failures` (= 一度 fail 後 success で 0 リセット)
+- `test_on_skjoin_failure_increments` (= 1 fail で counter 1)
+- `test_on_skjoin_failure_invalidates_cache_at_threshold` (= threshold 2 で cache 全 None)
+- `test_on_skjoin_failure_keeps_cache_below_threshold` (= 1 fail では cache 残る)
+- `test_wisun_reconnect_cached_skjoin_total_baseline_zero`
+- `test_on_wisun_reconnect_cached_skjoin_increments`
+- `test_wisun_reconnect_cached_skjoin_fallback_total_baseline_zero`
+- `test_on_wisun_reconnect_cached_skjoin_fallback_increments`
+- `test_snapshot_includes_cached_skjoin_totals` (= MQTT publish 経路保護、 2 件)
+- (既存 baseline test に新 counter 2 件追加が必要 = spec 034 で同 pattern 確立済)
 
 ## Test list (TDD 順)
 
-1. `test_channel_33_returns_bit_0` (= pure helper baseline)
-2. `test_channel_57_returns_known_mask` (= 主要 use case)
-3. `test_channel_60_returns_max_bit` (= 境界)
-4. `test_int_string_arg_coerced` (= robust 性)
-5. `apply_defaults` 3 件 (= 1 cycle で書ける)
-6. DiagState 6 件 (= counter 2 件 × 3 cases、 spec 028/029 で同 pattern 確立済)
-7. main loop / wisun_connect 拡張 = 実機検証 (= SC-005 で「reconnect 後 short scan total > 0」 と「panel-1 sparseness 改善」 確認)
+1. **apply_defaults 3 件** (= 1 cycle、 spec 028/29/032/034 で同 pattern)
+2. **DiagState cache attr 4 件** (= pan_id/mac/ipv6/consecutive_skjoin_failures 全部 baseline None/0)
+3. **DiagState method 6 件** (= on_skll64 / on_skjoin_success / on_skjoin_failure 3 cases / on_wisun_reconnect_cached_skjoin × 2 件)
+4. **DiagState on_wisun_joined 拡張 1 件** (= pan dict から pan_id/mac 記録、 既存 test 互換性破らない)
+5. **DiagState snapshot 2 件** (= 新 2 counter 経路保護、 既存 baseline test 1 件修正)
+6. main loop / wisun_connect 拡張 = 実機検証 (= SC-005 で「cached_skjoin_total > 0」 + cache hit rate >= 95%)
 
 ## Verification
 
-1. `.venv/bin/pytest -q --ignore=tests/benchmark` で既存 463 + 新規 ~13 件 pass
-2. `ruff check production_tool/mqtt_bridge.py tests/unit/test_channel_to_mask.py tests/unit/test_apply_defaults_spec_034.py` 新規エラー無し
-3. cube-j1-mqtt 1 commit (= 私が直接、 subagent rate limit risk 回避) + jj push --remote fork (= forward only、 5 step)
-4. lab-ub01 経由 deploy (= `~/cube-j1-mqtt/install/adb_push_update.sh cube-j1.home.arpa`)
-5. **Phase 1 sanity check** (= deploy 直後 5-8 分後、 `ScheduleWakeup delaySeconds=480`、 [[feedback-phased-deploy-observation]]):
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で既存 476 + 新規 ~18 件 pass
+2. cube-j1-mqtt 1 commit (= 私が直接、 subagent rate limit 回避) + jj push --remote fork (= forward only)
+3. lab-ub01 経由 deploy + **deploy 反映 grep 確認** (= [[feedback-lab-ub01-deploy-stale-git]] 必須): `ssh lab-ub01 'adb shell "grep -c on_skll64 /data/local/mqtt_bridge.py"'` で実機ファイル直接確認
+4. cube-j1 `/data/local/config.json` で spec 034 disable override 維持確認 (= spec 035 の前提)
+5. **Phase 1 sanity** (= deploy 後 5-8 分、 `ScheduleWakeup` or `CronCreate`):
    - bridge alive (`pgrep -f mqtt_bridge`)
-   - polling success 継続 (= last_poll_success_ts 5 分以内更新)
-   - reconnect 0-1 件想定範囲内、 bridge log で「SKSCAN single-ch try (ch=57 mask=01000000)」 出現確認
-   - `/api/diag` で `wisun_reconnect_short_scan_total` / `..._fallback_full_scan_total` snapshot 経路生存確認
-6. **Phase 2 SC-005 達成判定** (= 残 50 分後、 `ScheduleWakeup delaySeconds=3000`):
-   - `wisun_reconnect_short_scan_total > 0`
-   - cache hit rate `short / (short + fallback) >= 90%`
-   - reconnect 所要時間 32s → 5-10s 短縮 (= bridge log で SKRESET から EVENT 25 までの時刻差で観察)
-   - panel-1 sparseness 改善 (= cluster 1h 5 個 → 7-8 個期待)
-7. SC-006 (= 1 週間 long-term で fallback 率 5% 以下) は別セッション継続
+   - `/api/diag` で `wisun_reconnect_cached_skjoin_total` / `_fallback_total` snapshot 経路生存
+   - 新 cache attr (= pan_id/mac/ipv6) は v1 では MQTT publish しないが、 DiagState 内に保持されてるか実機 verify (= bridge log で「SKJOIN cached direct」 が初回 join 後の reconnect で出るか)
+   - reconnect 0-1 件想定範囲
+6. **Phase 2 SC-005** (= 1h 累積):
+   - `wisun_reconnect_cached_skjoin_total > 0` (= cache 直行発火)
+   - cache 成功率 `cached / (cached + fallback) >= 95%`
+   - reconnect 所要時間 17-32s → 6-8s 短縮 (= bridge log で SKRESET → EVENT 25 時刻差)
+   - panel-1 sparseness cluster 数増加 (= grafana lab dashboard で前後比較)
 
 ## Commit 戦略
 
 - compose 不要 (= telegraf 変更なし、 既存 DIAG_SENSOR_DEFS publish に乗る)
-- cube-j1-mqtt 1 commit + push (= 私が直接、 subagent rate limit risk 回避)
+- cube-j1-mqtt 1 commit + push
 - `~/.claude/hooks/redact-plans.sh` 適用、 plan file 同梱
-- `jj git push --remote fork --bookmark main` で forward only
+- jj 5 step (= fetch → log → rebase → set → push)
 
 ## Commit message
 
-`feat(bridge): reconnect 時 SKSCAN を既知 channel mask 単 ch scan + 失敗時 fallback で 32s → 4s 短縮 (spec 034 = spec 011 F)`
+`feat(bridge): SKLL64 cached + SKJOIN 直行で SKSCAN 完全 skip、 reconnect 35s → 7s 短縮 (spec 035 = spec 011 G、 spec 034 失敗の代替)`

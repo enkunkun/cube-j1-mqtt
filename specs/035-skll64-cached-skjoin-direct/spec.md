@@ -2,7 +2,7 @@
 
 **Feature Branch**: `035-skll64-cached-skjoin-direct`
 **Created**: 2026-06-27
-**Status**: Draft
+**Status**: Implemented (Phase 1.5/Phase 2 verify 待ち)
 **Input**: spec 034 Phase 2 (= 2026-06-27 00:37) で「単 ch active scan ではメーター beacon hit せず」 真因判明。 [[spec-034-skscan-channel-mask-cache]] の dig 過程で「方針 B = SKSCAN skip + SKJOIN 直行」 が subagent 調査で「risk」 評価された経緯あるが、 spec 034 v1 deploy で「短 ch active scan アプローチ自体が機能しない (= cache hit rate 0%)」 確定 → 方針 B を現実的最終手段として再評価。
 
 ## Background
