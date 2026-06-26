@@ -6,20 +6,12 @@ import mqtt_bridge as mb
 
 # ---------------------------------------------------------------------------
 # apply_defaults: new keys
+# (spec 011 当時の `_timeout_sec=30 / _intra_cycle_retries=0` default test は
+#  spec 032 で巻き戻し済 = `_timeout_sec=6 / _intra_cycle_retries=3` に変更、
+#  該当 default test は tests/unit/test_apply_defaults_spec_032.py に移管。
+#  spec 011 spec.md は歴史記録として残し、 retry_backoff_sec test と
+#  override 維持 test のみここに保持。)
 # ---------------------------------------------------------------------------
-
-def test_apply_defaults_erxudp_timeout_sec_default_30():
-    cfg = mb.apply_defaults({})
-    assert cfg["erxudp_timeout_sec"] == 30
-
-
-def test_apply_defaults_intra_cycle_retries_default_0():
-    """spec 011 follow-up 2: even at 1 retry the recovery rate stayed at
-    2% and retry rate at ~0.92/min, so the meter's queue kept filling.
-    Set the floor to 0; operators can opt back in via config."""
-    cfg = mb.apply_defaults({})
-    assert cfg["erxudp_intra_cycle_retries"] == 0
-
 
 def test_apply_defaults_retry_backoff_sec_default_2():
     cfg = mb.apply_defaults({})

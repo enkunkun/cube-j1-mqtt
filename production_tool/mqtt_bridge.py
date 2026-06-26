@@ -119,7 +119,7 @@ def apply_defaults(cfg):
     # 78% 欠損 + reconnect 430 回 (= 1 回/3 分) の主因と判明、 5 連続 fail で
     # 発火する設計はメーター応答性悪化時に loop 化。 30 連続 (= 900 秒 ≒
     # 15 分) に緩和でメーター完全 dead 検知は遅れるが欠損率劇的改善見込み。
-    out.setdefault("erxudp_timeout_force_reconnect_threshold", 30)
+    out.setdefault("erxudp_timeout_force_reconnect_threshold", 6)  # spec 032: 30 → 6 (spec 027 巻き戻し、 broute-mqtt 並み反応性)
     # MQTT keep-alive (seconds). Cube J1 のメインループは ECHONET Lite
     # の同期 poll で詰まることがあり、上流デフォルトの 60s では broker から
     # 切断される（実測 約 12 分間隔）。300s なら poll が一時的に滞っても
@@ -143,8 +143,8 @@ def apply_defaults(cfg):
     # piling up replies in the meter's ECHONET queue. With retries off,
     # the queue gets a chance to drain; retry can be opted back in via
     # config when the queue clears.
-    out.setdefault("erxudp_timeout_sec", 30)
-    out.setdefault("erxudp_intra_cycle_retries", 0)
+    out.setdefault("erxudp_timeout_sec", 6)  # spec 032: 30 → 6 (broute-mqtt 5s 並み)
+    out.setdefault("erxudp_intra_cycle_retries", 3)  # spec 032: 0 → 3 (broute-mqtt 並み短期集中 retry)
     out.setdefault("erxudp_retry_backoff_sec", 2)
     # spec 012: noise-adaptive poll skip — skip normal poll when the last
     # EEDSCAN shows the PAN channel is noisy (>= threshold). Avoids the

@@ -1,201 +1,112 @@
-# Plan: spec 029 Cumulative Energy Recovery Backfill (= spec 020 v1.5 可視化完成)
+# Plan: spec 032 Aggressive Polling Defaults (= broute-mqtt 並み短 timeout + 早期 reconnect + retry 増)
 
 ## Context
 
-2026-06-25 user 指摘: 「救済率 (= panel-81) 90%+ 上がってるのに panel-1 で見れない、 telegraf consumer 未 subscribe を含めて実装なのでは = 片手落ち」。
+2026-06-26 subagent 調査で他社 OSS 4 実装 (= hsakoh/broute-mqtt 等) との対比で **cube-j1-mqtt が保守的すぎる** ことが判明:
+- `erxudp_timeout_sec=30s` (broute-mqtt 5s の 6 倍)
+- `erxudp_intra_cycle_retries=0` (broute-mqtt 3)
+- `erxudp_timeout_force_reconnect_threshold=30` (broute-mqtt 数分復帰、 cube は 30 分死)
 
-spec 020 v1.5 で TID mismatch 救済率 90%+ 達成、 累積系 `_late_publish_ts` topic 過去時刻 retain publish するが telegraf 未 subscribe で grafana に来ない (= 設計 split 上の見送り、 memory [[feedback-compose-telegraf-pipeline]] の 「bridge + compose 両方修正必須」 ルール違反)。
+同日 device override PoC (= 30→6 / 0→3 / 30→6) で 33 分実証:
+- last_poll_success_ts: 28 分前 (= 沈黙) → **2 分前** ✅
+- timeouts/h rate: 49/h → **18/h** (= 約 1/3 改善)
+- backfill 発火率: 5.7 倍
+- reconnect 頻度: ほぼ同等 (= polling 健全化で reconnect 必要性自体減少)
 
-spec 028 で瞬時系 (= `power_w`) を別 topic `_recovered_json` JSON + telegraf JSON parser + prometheus client-supplied timestamp backfill (= grafana cloud 2h 受理) する完全可視化経路を確立済。 spec 029 はこの同一 pattern を累積系 (= `energy_*_kwh`) に適用、 spec 020 v1.5 可視化を完成させる。
-
-完成後: grafana panel-10 Cumulative Energy に refId=B/C `_recovered` series overlay = 累積系 救済点が過去時刻 plot、 panel-80 で累積系 backfill 発火 rate も可視化 (= panel-80 + 81 + 82 で救済 dashboard 完成)。
+tako 「architectural cap」 結論 (= 2026-06-26 5 agent 合議、 spec 031 へ pivot しかけた) を user 反論「Nature Remo E が成立してる」 + reference 実装調査 + PoC で **完全反証**。 spec 011 D 系の改善余地が実証済、 default 化で恒久反映。
 
 ## Approach
 
-### v1 MVP の構成
+最小実装 (= config 3 default 変更だけ、 main loop / read_erxudp / force_reconnect 既存実装互換):
 
-1. **`publish_recovery_backfill` ヘルパーを generic 化**: `counter_attr` 引数追加で increment 対象 counter を caller 指定、 spec 028 既存 caller は default 引数で互換 (= breaking change なし)
-2. **`CUMULATIVE_BACKFILL_KEYS` 定数追加** (= 4 keys): `energy_forward_kwh`, `energy_reverse_kwh`, `energy_forward_fixed_kwh`, `energy_reverse_fixed_kwh`
-3. **main loop 配線**: spec 028 backfill 分岐の **直後** に spec 029 累積系 backfill (= `cumulative_recovery_backfill_enabled` gate)
-4. **DiagState 拡張**: `cumulative_recovered_backfill_total` counter (= snapshot key + DIAG_SENSOR_DEFS 登録)
-5. **`apply_defaults`**: `cumulative_recovery_backfill_enabled = True`
-6. **telegraf**: 既存 spec 028 mqtt_recovery_backfill consumer の topics + starlark SUFFIX dict 拡張 (= consumer / processor 新規ではなく既存拡張で済む = 軽量)、 diag-num consumer に新 counter topic 追加
-7. **grafana**: panel-10 Cumulative Energy に refId=B/C `_recovered` overlay
+1. **`apply_defaults`** 3 行変更:
+   - line 122: `erxudp_timeout_force_reconnect_threshold` 30 → 6
+   - line 146: `erxudp_timeout_sec` 30 → 6
+   - line 147: `erxudp_intra_cycle_retries` 0 → 3
+2. **既存 spec 023/025 burst 専用 default** 維持 (= burst 中だけ別値、 base のみ変更)
+3. **Step 0**: device config.json で PoC override (= 3 keys explicit) を削除 (= default 化効果の純粋計測)
+4. **tier batch** は **別 spec 011 E に分離** (= 既存構造変更要、 spec 032 とは独立進行可)
 
-### 設計上の判断 (dig round 1 で確定済)
+### 設計上の判断 (dig 待ち)
 
-- **既存 helper generic 化 (= `counter_attr` 引数)**: 2 helper 並列より 1 helper + 引数で extensibility 高、 spec 028 既存 9 test が default 引数で互換 pass
-- **counter 別 metric**: `power_w_recovered_backfill_total` 既存維持 + `cumulative_recovered_backfill_total` 新規 = 「瞬時系 vs 累積系」 の発火頻度を別 panel で観察可能、 rename しない
-- **既存 `_late_publish_ts` retain topic は触らない**: spec 020 v1.5 既存挙動完全保護、 新経路 spec 029 と並列存在 (= broker に「最後の救済時刻」 retain は util)
-- **`_fixed_kwh_recovered` も bridge 側 publish 対象** (= 構造的に reconnect 直後 cycle 0 = tier4 で必ず mismatch + `m["*_fixed_kwh"]` 含む → spec 029 で初めて可視化 = bonus 効果)
-- **dig A 決定 — Step 0 config 事前確認**: 実装着手 step 0 で lab-ub01 経由 SSH で `cumulative_recovery_backfill_enabled` explicit override 有無確認、 spec 027/028 と同型の落とし穴前倒し回避 (= [[feedback-config-setdefault-override]] 教訓)
-- **dig B 決定 — rate panel**: **新 panel-82 追加** で `cumulative_recovered_backfill_total` rate /5m を別 visualize、 panel-80 (= spec 028 `power_w`) は維持 = 「瞬時系 vs 累積系」 比較容易、 将来 0xE8 拡張で panel-83 と整合
-- **dig C 決定 — panel-10 overlay**: **forward + reverse の 2 series のみ** (= `energy_forward_kwh_recovered` + `energy_reverse_kwh_recovered`)、 `_fixed_kwh` 系は bridge 側 publish するが panel overlay は skip (= panel-10 内 series 5+2=7 で視認性維持、 spec 018 meter timestamp で別経路カバー)
-
-## Step 0: 着手前確認 (= dig A 決定)
-
-```bash
-ssh lab-ub01 'adb shell cat /data/local/config.json' \
-  | python3 -c 'import json,sys; c=json.load(sys.stdin); print("cumulative_recovery_backfill_enabled =", c.get("cumulative_recovery_backfill_enabled", "<not set>"))'
-```
-
-判定:
-- `<not set>` (= 期待値、 新規 key): apply_defaults 新 default True がそのまま効く → OK 着手
-- 数値 (= 想定外): explicit override 削除 commit を deploy 前に挟む
+- **counter naming**: 既存 `erxudp_timeout_sec` / `erxudp_intra_cycle_retries` / `erxudp_timeout_force_reconnect_threshold` をそのまま使用、 rename しない
+- **default 値 6 / 3 / 6 の根拠**: broute-mqtt (= reference) の 5s/3retry を踏襲、 ただし threshold は **6 cycle = 6 分 ≒ 反応性 + 安定性の中間** で 6 採用 (= broute-mqtt 直接対応値なし、 cube-j1 60s 周期ベースで判断)
+- **PoC 33 分の小サンプル制約**: 1 週間運用で再評価 (= SC-005)
+- **kill switch**: `setdefault` 標準挙動で device explicit override は尊重 (= 旧値復帰可、 緊急時 escape hatch)
+- **spec 027 巻き戻し**: spec 027 で 5→30 にした threshold を 30→6 で巻き戻し、 spec 027 v2 (= wall-clock + health probe + 段階的 recovery) の **代替** 位置付け = 単純 threshold 調整で済むなら大規模再設計不要
 
 ## Files to modify
 
 ### `production_tool/mqtt_bridge.py`
 
-1. **`CUMULATIVE_BACKFILL_KEYS` 定数** (= `RECOVERY_BACKFILL_KEYS` 直下):
-   ```python
-   CUMULATIVE_BACKFILL_KEYS = frozenset((
-       "energy_forward_kwh", "energy_reverse_kwh",
-       "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh",
-   ))
-   ```
-
-2. **`publish_recovery_backfill` 拡張** (= 既存 helper):
-   ```python
-   def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None,
-                                 counter_attr="power_w_recovered_backfill_total"):
-       """spec 028/029: 救済 frame の値を <key>_recovered_json topic に JSON publish.
-       counter_attr で increment 対象 DiagState attribute を caller 指定。
-       """
-       base = "cubej/{}".format(device_id)
-       ts_iso = format_iso8601_utc(send_ts)
-       for key, value in m.items():
-           if value is None:
-               continue
-           topic = "{}/{}_recovered_json".format(base, key)
-           payload = json.dumps({"value": value, "ts": ts_iso})
-           mqtt.publish(topic, payload, qos=0, retain=False)
-           if diag_state is not None:
-               setattr(diag_state, counter_attr,
-                       getattr(diag_state, counter_attr, 0) + 1)
-   ```
-
-3. **main loop 配線** (= `_late_ts is not None` 分岐内、 spec 028 後):
-   ```python
-   if cfg.get("power_w_recovery_backfill_enabled", True):
-       _m_bf = dict((k, v) for k, v in m.items() if k in RECOVERY_BACKFILL_KEYS)
-       if _m_bf:
-           publish_recovery_backfill(mqtt, device_id, _m_bf, _late_ts, diag_state)
-   # spec 029: 累積系 backfill
-   if cfg.get("cumulative_recovery_backfill_enabled", True):
-       _m_cum_bf = dict(
-           (k, v) for k, v in m.items()
-           if k in CUMULATIVE_BACKFILL_KEYS)
-       if _m_cum_bf:
-           publish_recovery_backfill(
-               mqtt, device_id, _m_cum_bf, _late_ts, diag_state,
-               counter_attr="cumulative_recovered_backfill_total")
-   ```
-
-4. **DiagState 拡張**:
-   - `__init__`: `self.cumulative_recovered_backfill_total = 0`
-   - `_DIAG_SNAPSHOT_KEYS`: `power_w_recovered_backfill_total` の隣に追加
-   - snapshot raw dict: 同様
-
-5. **`DIAG_SENSOR_DEFS`**:
-   ```python
-   ("cumulative_recovered_backfill_total", "Cumulative Recovered Backfill",
-    None, None, "total_increasing", "diagnostic"),
-   ```
-
-6. **`apply_defaults`**:
-   ```python
-   out.setdefault("cumulative_recovery_backfill_enabled", True)  # spec 029
-   ```
-
-### `tests/unit/test_publish_recovery_backfill.py` (拡張)
-
-- `test_default_counter_attr_is_power_w_for_spec028_compat` (= 既存 caller 互換確認)
-- `test_counter_attr_argument_increments_specified_attribute` (= cumulative_recovered_backfill_total 指定)
-- `test_counter_attr_missing_attribute_initializes_to_1` (= `setattr/getattr` の default 0 → +1)
-
-### `tests/unit/test_apply_defaults_spec_028.py` (拡張、 spec 029 default も)
-
-- `test_default_cumulative_recovery_backfill_enabled_is_true`
-- `test_cumulative_explicit_override_preserved`
-
-### `tests/unit/test_diag_state.py` (拡張)
-
-- baseline test の expected dict に `cumulative_recovered_backfill_total: 0` 追加
-- `test_cumulative_recovered_backfill_total_reflected_in_snapshot`
-
-### main loop 配線 + telegraf + grafana (= 実機検証)
-
-- 配線は実機 deploy で SC-006 確認
-
-### `compose/telegraf/telegraf.conf`
-
-既存 `mqtt_recovery_backfill` consumer の `topics` 拡張:
-```toml
-topics = [
-  "cubej/+/power_w_recovered_json",
-  "cubej/+/energy_forward_kwh_recovered_json",
-  "cubej/+/energy_reverse_kwh_recovered_json",
-  "cubej/+/energy_forward_fixed_kwh_recovered_json",
-  "cubej/+/energy_reverse_fixed_kwh_recovered_json",
-]
-```
-
-既存 starlark SUFFIX dict 拡張:
+3 行変更:
 ```python
-SUFFIX = {
-    "power_w_recovered_json": "power_watts_recovered",
-    "energy_forward_kwh_recovered_json": "energy_forward_kwh_recovered",
-    "energy_reverse_kwh_recovered_json": "energy_reverse_kwh_recovered",
-    "energy_forward_fixed_kwh_recovered_json": "energy_forward_fixed_kwh_recovered",
-    "energy_reverse_fixed_kwh_recovered_json": "energy_reverse_fixed_kwh_recovered",
-}
+# line 122
+out.setdefault("erxudp_timeout_force_reconnect_threshold", 6)  # 30 → 6 (spec 032)
+# line 146
+out.setdefault("erxudp_timeout_sec", 6)  # 30 → 6 (spec 032)
+# line 147
+out.setdefault("erxudp_intra_cycle_retries", 3)  # 0 → 3 (spec 032)
 ```
 
-既存 diag-num consumer の topics に追加:
-```toml
-"cubej/+/diag/cumulative_recovered_backfill_total",
+### `tests/unit/test_apply_defaults_spec_032.py` (= 新規、 dig A 決定)
+
+spec 027 pattern 踏襲、 spec 単位 1 file:
+- `test_default_erxudp_timeout_sec_is_6` (= 30→6 default)
+- `test_default_erxudp_intra_cycle_retries_is_3` (= 0→3 default)
+- `test_default_erxudp_timeout_force_reconnect_threshold_is_6` (= 30→6 default)
+- `test_explicit_override_preserved_for_aggressive_polling_keys` (= 全 3 keys の override 維持 guard)
+
+### spec 027 既存 test の扱い (= dig B 決定)
+
+**delete**: `tests/unit/test_apply_defaults_force_reconnect_threshold.py` を完全削除。 spec 032 で default 巻き戻し済 = spec 027 test も意味失う、 codebase クリーン化。 spec 027 spec.md は **歴史記録として残す** (= delete しない、 「2026-06-25 deploy → 2026-06-26 spec 032 で巻き戻し」 の経緯記録)。
+
+## Step 0: 着手前確認 + PoC override 削除
+
+```bash
+ssh lab-ub01 'adb shell cat /data/local/config.json' \
+  | python3 -c 'import json,sys; c=json.load(sys.stdin); [print("%s = %s" % (k, c.get(k, "<not set>"))) for k in ["erxudp_timeout_sec", "erxudp_intra_cycle_retries", "erxudp_timeout_force_reconnect_threshold"]]'
 ```
 
-### grafana dashboard
-
-- `gcx --context cloud dashboards get cubej1-smart-meter | tail -1 > /tmp/dash.json`
-- patch script で panel-10 に refId=B/C 追加:
-  - B: `cube_j1_smart_meter_energy_forward_kwh_recovered{device_id=~"$device"}` legend="Recovered (forward)"
-  - C: `cube_j1_smart_meter_energy_reverse_kwh_recovered{device_id=~"$device"}` legend="Recovered (reverse)"
-- **新 panel-82** 追加 (= dig B 決定): `increase(cube_j1_smart_meter_cumulative_recovered_backfill_total{device_id="cubej1"}[5m])` rate、 title "Cumulative Recovery Backfill (spec 029, rate /5m)"、 panel-80 と同 row (= "Recovery & Realtime"、 y=24 で 4 段目 12x8) に並べる
+PoC で適用済 (= 6/3/6) なので all 3 keys が set されているはず。 **deploy 直前** に device config.json から該当 3 keys を **削除** (= default 化効果の純粋計測):
+```bash
+ssh lab-ub01 'adb pull /data/local/config.json /tmp/c.json && python3 -c "
+import json
+c = json.load(open(\"/tmp/c.json\"))
+for k in [\"erxudp_timeout_sec\", \"erxudp_intra_cycle_retries\", \"erxudp_timeout_force_reconnect_threshold\"]:
+    c.pop(k, None)
+json.dump(c, open(\"/tmp/c.json\", \"w\"), indent=2)
+" && adb push /tmp/c.json /data/local/config.json && adb shell pkill -f mqtt_bridge.py'
+```
 
 ## Test list (TDD 順)
 
-1. **Red→Green**: `test_publish_recovery_backfill` 拡張 3 件 (= helper generic 化)
-2. **Red→Green**: `test_apply_defaults_spec_028` 拡張 2 件 (= cumulative_recovery_backfill_enabled)
-3. **Red→Green**: `test_diag_state` 拡張 2 件 (= cumulative counter baseline + snapshot)
-4. main loop 配線 + telegraf + grafana (= 実機検証)
+1. **Red→Green**: `test_default_erxudp_timeout_sec_is_6` (= 30→6 default 変更)
+2. **Red→Green**: `test_default_erxudp_intra_cycle_retries_is_3` (= 0→3 default 変更)
+3. **Red→Green**: `test_default_erxudp_timeout_force_reconnect_threshold_is_6` (= 既存 spec 027 test 更新、 30→6)
+4. **Guard**: `test_explicit_override_preserved_for_aggressive_polling_keys` (= setdefault 標準挙動 retainment、 3 keys 同時)
+5. main loop / read_erxudp / force_reconnect 配線は既存実装互換 = 実機検証
 
 ## Verification
 
-1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 452 + 新規 ~7 = ~459 件 pass
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 458 + 新規 ~4 = ~462 件 pass (= spec 027 既存 test 更新を含む)
 2. ruff check 新規エラー無し
-3. **compose 側を先に commit + jj 5 step push** (= dig E 決定踏襲、 telegraf を bridge より先に準備)
-4. compose deploy-webhook で telegraf restart 完了待ち
-5. cube-j1-mqtt 側 commit + jj push (= main fork forward only)
-6. lab-ub01 経由 deploy (= scripts/adb_push_update.sh cube-j1.home.arpa)
-7. dashboard panel-10 patch script で refId=B/C 追加、 新 panel-82 (= cumulative backfill rate) も追加
-8. 実機 1h 観察:
-   - `/api/diag` で `cumulative_recovered_backfill_total > 0` (= tier2/4 cycle で必ず発火、 spec 028 と違って構造的に hit する!)
-   - `mosquitto_sub -h 192.168.1.151 -t 'cubej/cubej1/energy_forward_kwh_recovered_json'` で JSON 着信確認
-   - `gcx --context cloud metrics query 'cube_j1_smart_meter_energy_forward_kwh_recovered'` で過去時刻 sample 確認
-   - grafana panel-10 で Recovered (forward) / Recovered (reverse) 点プロット観察
-9. SC-007 (= 既存全テスト pass) 確認
+3. cube-j1-mqtt 側 commit + jj push (= main fork forward only)
+4. **Step 0 deploy 前確認** (= device config.json で 3 keys explicit override 削除)
+5. lab-ub01 経由 deploy (= adb_push_update.sh cube-j1.home.arpa)
+6. 実機 1h 観察:
+   - `/api/diag` で 3 default が新値 (= 6/3/6) 反映確認
+   - `rate(erxudp_timeouts_total[1h])` ≤ 20/h (= PoC 前 49/h から大幅改善)
+   - `last_poll_success_ts` が 5 分以内に更新継続
+   - `wisun_reconnects/h` ≤ 5/h (= 過剰 reconnect 防止)
+   - panel-1 黄色 dot (= spec 028 backfill) の密度上昇 (= PoC 5.7 倍)
 
 ## Commit 戦略
 
-- spec 028 と同じ pattern: compose 側 1 commit + cube-j1-mqtt 側 1 commit (= bg subagent 並列)
-- redact-plans.sh
-- jj git push --remote fork --bookmark main
-- compose は jj 5 step (= fetch / log / rebase / set / push)
+- compose 不要 (= telegraf 変更なし、 bridge のみ修正)
+- cube-j1-mqtt 1 commit + push (= bg subagent)、 redact-plans.sh、 jj git push --remote fork
+- Step 0 device config 削除は **deploy 直前** に挟む
 
 ## Commit message
 
-- compose: `feat(Telegraf): cube-j1 spec 029 累積系 backfill JSON consumer topics + SUFFIX dict 拡張`
-- cube-j1-mqtt: `feat(bridge): 累積系 (energy_*_kwh) 救済 frame backfill 経路追加、 publish_recovery_backfill generic 化 (spec 029)`
+`feat(bridge): polling defaults を broute-mqtt 並みに集約攻撃化 (timeout 30→6 / retries 0→3 / threshold 30→6) — spec 032 で spec 027 巻き戻し兼 reference 実装対比改善`

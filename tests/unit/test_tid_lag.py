@@ -93,11 +93,7 @@ def test_snapshot_omits_lag_keys_when_no_history():
 
 # ---------------------------------------------------------------------------
 # apply_defaults: retry default cut to 0
+# (spec 011 follow-up 2 当時の default=0 test は spec 032 で 0→3 に巻き戻し、
+#  test/unit/test_apply_defaults_spec_032.py に移管済。 spec 011 spec.md は
+#  歴史記録として残し、 ここは挙動本体の test に集中。)
 # ---------------------------------------------------------------------------
-
-def test_apply_defaults_intra_cycle_retries_default_0():
-    """spec 011 follow-up 2: 1.4 day field data still shows recovery 2%
-    and retry rate ~0.92/min ≒ メーター queue 圧迫が続いている。
-    完全停止して queue 消化させる。"""
-    cfg = mb.apply_defaults({})
-    assert cfg["erxudp_intra_cycle_retries"] == 0
