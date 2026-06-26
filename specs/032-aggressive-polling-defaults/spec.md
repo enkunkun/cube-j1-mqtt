@@ -2,7 +2,18 @@
 
 **Feature Branch**: `032-aggressive-polling-defaults`
 **Created**: 2026-06-26
-**Status**: Draft
+**Status**: **Deployed 2026-06-26** — cube `42d00805` で deploy 完了 (= compose 不要、 bridge のみ修正)。 PoC override → spec 化 → default 化 → device override 削除 で純粋計測体制成立。 1h 実機 verify 結果:
+- ✅ polling success 2 分以内更新継続 (= 沈黙ループ脱出)
+- ✅ wisun_reconnects 4/h ≤ 5/h (= threshold 6 想定通り、 暴走無し)
+- ✅ 救済率 100% (= 6/6)
+- ✅ 沈黙時間 17-25 分 → **5-8 分** (= 3 倍短縮)
+- ✅ cumulative backfill 2 件発火 (= spec 029 e2e wire 継続)
+- ⚠️ timeouts 29/h で目標 ≤ 20/h **部分未達** (= PoC 前 49/h から 40% 改善は達成)
+- ⚠️ 1h で 4 cluster (= success rate 約 30%)、 sparseness 完全解消ではない (= architectural cap が software 改善で 1/3 緩和できる、 ただし 1 分粒度連続瞬時電力には依然不足)
+
+副次成果: TDD で「spec 011/027 hidden default test」 4 件 catch + delete (= spec 027/011 既存 file + tid_lag 内に散在)、 dig 漏れを TDD で補完。 副次: `bridge_version=None` 問題 (= spec 030 候補) は `embed_git_hash.sh` 経由で自然解消、 spec 030 候補は削除可。
+
+残課題: spec 011 E (= tier batch OPC=4) と spec 011 F (= SKSCAN 固定) で追加改善可能性、 別セッションで着手。 完全解消には spec 031 (= CT hardware) も依然有効選択肢。
 **Input**: 2026-06-26 PoC で「短 timeout (= 30→6s) + 早期 force_reconnect (= 30→6) + intra-cycle retry (= 0→3)」 を device explicit override で実証、 33 分で timeouts/h 1/3 改善 + 沈黙ループ脱出 + backfill 発火率 5.7 倍を観測。 default 化で恒久反映。
 
 ## Background
