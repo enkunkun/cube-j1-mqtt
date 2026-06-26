@@ -2,7 +2,7 @@
 
 **Feature Branch**: `034-skscan-channel-mask-cache`
 **Created**: 2026-06-26
-**Status**: Draft
+**Status**: Deployed (v1) → **Disabled** (cache hit rate 0%、 設計仮説誤り。 spec 035 で別アプローチ)
 **Input**: 2026-06-26 spec 033 deploy 後 panel-1 観察で user 指摘「リカバー一部増えてるが空白多い」、 tako 合議で出た spec 011 F 候補 (= SKSCAN 固定で reconnect 時間短縮) を subagent 調査 (= file:line + BP35CX 仕様 + 方針 3 案比較) で実装方針 C (= ハイブリッド: 初回全 scan、 reconnect は単 ch mask scan + fallback) 確定。
 
 ## Background
@@ -121,3 +121,55 @@ def channel_to_mask(ch):
 - fallback (= 全 scan) は失敗時 1 度のみ実行、 fallback も失敗なら既存 SKRESET 再 retry path (= spec 017 EVENT 24/29) に委ねる
 - 関連 spec: [[spec-010-eedscan]] (= SCAN_DURATION_BASE=6 元、 spec 034 は duration 3 採用)、 [[spec-017-wisun-rejoin-backoff]] (= EVENT 24/29 rejoin trigger 互換)、 [[spec-027-base-reconnect-threshold]] / [[spec-032-aggressive-polling-defaults]] (= reconnect 頻度制御、 spec 034 は時間短縮)、 [[spec-033-all-cycle-tier1-batch]] (= 並列改善、 batch + 短縮で相乗効果)
 - 関連 memory: [[reference-tako-instantaneous-power-architectural-cap]] (= software 改善余地の最終形態として spec 034 が位置付け、 spec 011 F = SKSCAN 固定)
+
+---
+
+## v1 Phase 2 Finding (= 2026-06-27 00:37、 真 deploy 1h verify 結果)
+
+### 結果サマリ
+
+| Item | 結果 | 判定 |
+|---|---|---|
+| SC-005a (短 scan 発火) | 0 件 | ✗ |
+| SC-005b (cache hit rate ≥90%) | **0% (= 0/10)** | ✗ |
+| SC-005c (reconnect 時間短縮) | **不変** (= 全 5 reconnect が fallback 全 scan で 17-20s) | ✗ |
+| SC-005d (panel-1 sparseness 改善) | 未測定 (= spec 028/29 backfill 9 件発火で別経路改善あり) | - |
+| 副次: invariant (= bridge alive + reconnect 全部成功) | reconnects 5/h ✓、 timeouts 30/h ✓ (= spec 032 baseline 同等) | ✓ |
+| 副次: spec 028/029 backfill | 9 件発火 (= spec 033 効果継続) | ✓ |
+
+### 真因 (= bridge log 観察、 2026-06-26T15:31:48Z reconnect#1)
+
+```
+SKSCAN single-ch try (ch=57 mask=01000000)
+SKSCAN try mask=01000000 duration=3
+SKSCAN single-ch missed, falling back to full scan        ← 同秒で fail (= 0 秒)
+SKSCAN (may take up to 60s)
+SKSCAN try mask=FFFFFFFF duration=6
+SKSCAN try mask=FFFFFFFF duration=7
+SKSCAN try mask=FFFFFFFF duration=8
+SKSCAN found 1 PAN(s), selecting best LQI                  ← 17s 後 hit (= duration 8)
+```
+
+= BP35CX `SKSCAN 2 01000000 3 0` が同秒で `EVENT 22` (= scan complete、 PAN なし) を即返答。 メーターは active scan beacon request に **常時応答する設計ではなく、 全 ch sweep で偶発的に hit する**。
+
+### 仮説誤り
+
+- **誤り**: 「メーター ch 固定 → 単 ch mask scan で hit」
+- **真実**: メーター beacon timing 不定 → 単 ch では確率低い、 全 ch sweep でも duration 8 (= ~17s) でやっと hit
+- BP35CX 仕様の channel mask は機能している (= 即 EVENT 22 出る = mask 解釈は正しい)、 ただし beacon hit 率が想定外に低い
+
+### v1 仕様 disable (= 2026-06-27 00:42)
+
+- cube-j1.home.arpa `/data/local/config.json` に explicit override:
+  ```json
+  "wisun_reconnect_channel_mask_enabled": false
+  ```
+- bridge restart (= PID 28585) で旧挙動 (= spec 011 系列、 全 scan) 復帰
+- spec 034 コード自体は merged (= af0a75a)、 default `True` のまま (= 他環境で実証 chance 残し)
+
+### Next step (= spec 035 起票へ移行)
+
+- 別アプローチ: SKLL64 cached MAC + SKJOIN 直行 (= dig 過程で「方針 B」 として subagent が「risk」 評価)
+- SKSCAN 完全 skip + 既知 MAC で SKJOIN 直行 → メーター reboot 時のみ SKRESET → SKSCAN fallback
+- 期待効果: reconnect 35s → 5s = SKRESET (1s) + SKVER/SETPWD/SETRBID (3s) + SKJOIN (1s) = 5s
+- 関連: [[spec-035-skll64-cached-skjoin-direct]] (= 新規 spec、 spec 011 G)
