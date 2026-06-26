@@ -55,6 +55,9 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "power_w_recovered_backfill_total": 0,
         # spec 029: 累積系 (energy_*_kwh) recovery backfill counter.
         "cumulative_recovered_backfill_total": 0,
+        # spec 034: SKSCAN channel mask cache counters.
+        "wisun_reconnect_short_scan_total": 0,
+        "wisun_reconnect_fallback_full_scan_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
@@ -414,3 +417,47 @@ def test_cumulative_recovered_backfill_total_reflected_in_snapshot():
     state.cumulative_recovered_backfill_total += 1
     snap = state.snapshot(now=state.start_time)
     assert snap["cumulative_recovered_backfill_total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# spec 034: SKSCAN channel mask cache counters
+# ---------------------------------------------------------------------------
+
+def test_wisun_reconnect_short_scan_total_baseline_zero():
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["wisun_reconnect_short_scan_total"] == 0
+
+
+def test_on_wisun_reconnect_short_scan_increments():
+    state = make_state()
+    state.on_wisun_reconnect_short_scan()
+    state.on_wisun_reconnect_short_scan()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["wisun_reconnect_short_scan_total"] == 2
+
+
+def test_wisun_reconnect_fallback_full_scan_total_baseline_zero():
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["wisun_reconnect_fallback_full_scan_total"] == 0
+
+
+def test_on_wisun_reconnect_fallback_full_scan_increments():
+    state = make_state()
+    state.on_wisun_reconnect_fallback_full_scan()
+    snap = state.snapshot(now=state.start_time)
+    assert snap["wisun_reconnect_fallback_full_scan_total"] == 1
+
+
+def test_snapshot_includes_short_scan_total():
+    """spec 034: MQTT publish 経路保護 (feedback-diag-sensor-defs-publish)."""
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert "wisun_reconnect_short_scan_total" in snap
+
+
+def test_snapshot_includes_fallback_full_scan_total():
+    state = make_state()
+    snap = state.snapshot(now=state.start_time)
+    assert "wisun_reconnect_fallback_full_scan_total" in snap

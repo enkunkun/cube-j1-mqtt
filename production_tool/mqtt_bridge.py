@@ -207,6 +207,11 @@ def apply_defaults(cfg):
     out.setdefault("tid_mismatch_history_maxlen", 240)  # spec 028: 10 → 240 で深い遅延吸収
     out.setdefault("power_w_recovery_backfill_enabled", True)  # spec 028: 瞬時電力救済 frame backfill 経路
     out.setdefault("cumulative_recovery_backfill_enabled", True)  # spec 029: 累積系救済 frame backfill 経路
+    # spec 034: SKSCAN channel mask cache for faster reconnect (32s → 4s).
+    # enabled=False で旧挙動 (= 毎回全 scan、 spec 011 系列互換)、
+    # fallback_duration は単 ch 取り損ね時の全 scan duration (= SCAN_DURATION_BASE 既存値)。
+    out.setdefault("wisun_reconnect_channel_mask_enabled", True)
+    out.setdefault("wisun_reconnect_channel_mask_fallback_duration", 6)
     return out
 
 
@@ -1676,6 +1681,9 @@ _DIAG_SNAPSHOT_KEYS = (
     "power_w_recovered_backfill_total",
     # spec 029: 累積系 (energy_*_kwh) 救済 frame backfill counter (= 別 channel).
     "cumulative_recovered_backfill_total",
+    # spec 034: SKSCAN channel mask cache (reconnect 32s → 4s) effect metrics.
+    "wisun_reconnect_short_scan_total",
+    "wisun_reconnect_fallback_full_scan_total",
     "uptime_seconds",
     "version",
 )
@@ -2276,6 +2284,11 @@ class DiagState(object):
         self.power_w_recovered_backfill_total = 0
         # spec 029: 累積系 (energy_*_kwh) 救済 frame の backfill JSON publish 回数.
         self.cumulative_recovered_backfill_total = 0
+        # spec 034: SKSCAN channel mask cache (reconnect 32s → 4s). 単 ch mask
+        # scan で PAN 即 hit した回数 / 単 ch fail で fallback 全 scan に落ちた
+        # 回数。 cache hit rate = short / (short + fallback) を grafana 観察。
+        self.wisun_reconnect_short_scan_total = 0
+        self.wisun_reconnect_fallback_full_scan_total = 0
         # Spec 006: Wi-SUN health observability. Rolling window of recent
         # SKSENDTO→ERXUDP latencies (ms) for percentile reporting.
         self.erxudp_latency_ms_recent = collections.deque(maxlen=200)
@@ -2296,6 +2309,14 @@ class DiagState(object):
 
     def on_wisun_reconnect(self):
         self.wisun_reconnects_total += 1
+
+    def on_wisun_reconnect_short_scan(self):
+        """spec 034: 単 ch mask scan で PAN 即 hit した時 (= 32s → 4s 短縮成功)."""
+        self.wisun_reconnect_short_scan_total += 1
+
+    def on_wisun_reconnect_fallback_full_scan(self):
+        """spec 034: 単 ch fail で fallback 全 scan に落ちた時 (= chan 変動 / 雑音時)."""
+        self.wisun_reconnect_fallback_full_scan_total += 1
 
     def on_mqtt_reconnect(self):
         self.mqtt_reconnects_total += 1
@@ -2461,6 +2482,11 @@ class DiagState(object):
             # spec 029: 累積系 (energy_*_kwh) 救済 frame backfill counter.
             "cumulative_recovered_backfill_total":
                 self.cumulative_recovered_backfill_total,
+            # spec 034: SKSCAN channel mask cache effect counters.
+            "wisun_reconnect_short_scan_total":
+                self.wisun_reconnect_short_scan_total,
+            "wisun_reconnect_fallback_full_scan_total":
+                self.wisun_reconnect_fallback_full_scan_total,
             "uptime_seconds": uptime,
             "version": self.version,
         }
@@ -2636,26 +2662,44 @@ def skcommand(fd, cmd, timeout=10):
 SCAN_DURATION_BASE = 6
 SCAN_RETRY_LIMIT = 10
 
+
+def channel_to_mask(ch):
+    """spec 034: BP35CX channel 番号 (= ch33-60) を SKSCAN 2 用 32-bit
+    channel mask に変換。 ch33 = bit 0, ch60 = bit 27.
+
+    例: channel_to_mask(57) = 0x01000000 (= bit 24)
+        channel_to_mask(33) = 0x00000001
+    """
+    return 1 << (int(ch) - 33)
+
 # ---------------------------------------------------------------------------
 # SKSTACK-IP / Wi-SUN B-route connection
 # ---------------------------------------------------------------------------
 
-def skscan(fd, diag_state=None):
+def skscan(fd, channel_mask="FFFFFFFF", duration=SCAN_DURATION_BASE,
+           max_retries=None, diag_state=None):
     """Active scan with retries; returns best PAN info dict or empty dict.
+
+    `channel_mask` / `duration` / `max_retries` are spec 034 additions:
+    - `channel_mask` (= 32-bit hex string) で対象 channel 限定 (= 単 ch なら
+      `channel_to_mask(ch)` を `{:08X}.format(...)` で渡す)
+    - `duration` の初期値 (= 旧挙動は SCAN_DURATION_BASE 固定)
+    - `max_retries` (= None で旧挙動 = duration += 1 で SCAN_RETRY_LIMIT まで
+      retry、 1 なら 1 回試行で抜け = 単 ch path 用 fast fail)
 
     `diag_state` is optional. When given, its `on_scan_retry()` is invoked
     each time the scan widens its duration. Wrapped in try/except so a diag
     bug never blocks the measurement path (Constitution IV).
     """
-    duration = SCAN_DURATION_BASE
-    
+    attempt = 0
+
     while duration <= SCAN_RETRY_LIMIT:
         # Clear stale lines from previous command/scan cycle.
         termios.tcflush(fd, termios.TCIFLUSH)
 
-        log("SKSCAN try duration={}".format(duration))
+        log("SKSCAN try mask={} duration={}".format(channel_mask, duration))
         # BP35C0 style scan command: <mode> <channel_mask> <duration> <side>
-        serial_write(fd, "SKSCAN 2 FFFFFFFF {} 0\r\n".format(duration))
+        serial_write(fd, "SKSCAN 2 {} {} 0\r\n".format(channel_mask, duration))
 
         pan_list  = []
         current   = {}
@@ -2692,6 +2736,9 @@ def skscan(fd, diag_state=None):
                 diag_state.on_scan_retry()
             except Exception as e:
                 log("diag on_scan_retry error: {}".format(e))
+        attempt += 1
+        if max_retries is not None and attempt >= max_retries:
+            break
         duration += 1
 
     return {}
@@ -2726,8 +2773,19 @@ def skll64(fd, mac):
             continue
     return None
 
-def wisun_connect(fd, br_id, br_pwd, diag_state=None):
+def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
+                  fallback_duration=SCAN_DURATION_BASE, diag_state=None):
     """Full SKSTACK-IP join sequence. Returns IPv6 address of meter.
+
+    spec 034: `prefer_known_channel=True` (= reconnect path 用) で
+    diag_state.pan_channel が既知なら、 まず単 ch mask scan (duration=3
+    ≒ 4s、 max_retries=1) を試行 → 失敗なら fallback で全 scan
+    (= duration=fallback_duration) に落ちる。 初回 join (= default False)
+    では pan_channel 未知のため、 直接全 scan path に進む。
+
+    `fallback_duration` = main loop から
+    `config.get("wisun_reconnect_channel_mask_fallback_duration", 6)`
+    で渡される (= SCAN_DURATION_BASE と同値が default)。
 
     `diag_state` is forwarded to skscan and the PAN info is recorded onto it
     once a usable PAN is selected.
@@ -2752,8 +2810,33 @@ def wisun_connect(fd, br_id, br_pwd, diag_state=None):
     # Force ASCII-hex ERXUDP payload format so parser stays stable.
     skcommand(fd, "WOPT 1")
 
-    log("SKSCAN (may take up to 60s)")
-    pan = skscan(fd, diag_state=diag_state)
+    pan = None
+    known_ch = getattr(diag_state, "pan_channel", None) if diag_state else None
+    if prefer_known_channel and known_ch is not None:
+        mask = "{:08X}".format(channel_to_mask(known_ch))
+        log("SKSCAN single-ch try (ch={} mask={})".format(known_ch, mask))
+        pan = skscan(fd, channel_mask=mask, duration=3, max_retries=1,
+                     diag_state=diag_state)
+        if pan.get("Channel"):
+            if diag_state is not None:
+                try:
+                    diag_state.on_wisun_reconnect_short_scan()
+                except Exception as e:
+                    log("diag on_wisun_reconnect_short_scan error: {}".format(e))
+        else:
+            log("SKSCAN single-ch missed, falling back to full scan")
+            if diag_state is not None:
+                try:
+                    diag_state.on_wisun_reconnect_fallback_full_scan()
+                except Exception as e:
+                    log("diag on_wisun_reconnect_fallback_full_scan error: {}".format(e))
+            pan = None  # fall through to full scan below
+
+    if not pan:
+        log("SKSCAN (may take up to 60s)")
+        pan = skscan(fd, channel_mask="FFFFFFFF",
+                     duration=fallback_duration, diag_state=diag_state)
+
     if not pan.get("Channel") or not pan.get("Pan ID") or not pan.get("Addr"):
         raise RuntimeError("SKSCAN: no PAN found ({})".format(pan))
 
@@ -3690,6 +3773,9 @@ DIAG_SENSOR_DEFS = [
     ("power_w_recovered_backfill_total", "Power W Recovered Backfill", None, None, "total_increasing", "diagnostic"),
     # Spec 029: 累積系 (energy_*_kwh) 救済 frame backfill (= spec 020 v1.5 可視化完成).
     ("cumulative_recovered_backfill_total", "Cumulative Recovered Backfill", None, None, "total_increasing", "diagnostic"),
+    # Spec 034: SKSCAN channel mask cache (= reconnect 32s → 4s 短縮効果率).
+    ("wisun_reconnect_short_scan_total",    "Wi-SUN Reconnect Short Scan", None, None, "total_increasing", "diagnostic"),
+    ("wisun_reconnect_fallback_full_scan_total", "Wi-SUN Reconnect Fallback Full Scan", None, None, "total_increasing", "diagnostic"),
     # Spec 022: realtime burst mode (= Admin UI ボタンで 5 分間 5s polling).
     ("realtime_burst_started_total",     "Realtime Burst Started",     None, None, "total_increasing", "diagnostic"),
     ("realtime_burst_completed_total",   "Realtime Burst Completed",   None, None, "total_increasing", "diagnostic"),
@@ -4357,7 +4443,16 @@ def main():
                     log("WARN: serial reopen failed (continuing with original fd): {}"
                         .format(re))
             try:
-                ipv6 = wisun_connect(fd, br_id, br_pwd, diag_state=diag_state)
+                # spec 034: reconnect path で既知 pan_channel を使った単 ch mask
+                # scan (= ~4s) → 失敗時 fallback 全 scan (= 旧挙動)。
+                # `wisun_reconnect_channel_mask_enabled=False` で旧挙動互換。
+                ipv6 = wisun_connect(
+                    fd, br_id, br_pwd,
+                    prefer_known_channel=bool(cfg.get(
+                        "wisun_reconnect_channel_mask_enabled", True)),
+                    fallback_duration=int(cfg.get(
+                        "wisun_reconnect_channel_mask_fallback_duration", 6)),
+                    diag_state=diag_state)
                 log("Wi-SUN reconnected at {}".format(ipv6))
                 diag_state.consecutive_wisun_connect_failures = 0
                 try:
