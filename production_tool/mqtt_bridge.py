@@ -2855,6 +2855,20 @@ def epcs_for_tier(tier):
     return TIER1_EPCS
 
 
+def cycle_epcs_with_tier1(tier):
+    """spec 033 (= spec 011 E): 全 cycle で tier1 EPCs を含めて OPC batch.
+
+    tier2/tier3/tier4 のみ tier1 EPCs を合成 (= OPC=4 batch)、 それ以外
+    (= tier1 / 未知 tier fallback) は TIER1_EPCS のみ返す = 重複 EPC 送信
+    回避 (= ECHONET Lite 重複 EPC 仕様グレー、 BP35CX/メーター動作未検証)。
+    mismatch 発火時 100% spec 028 backfill 対象、 [[feedback-cycle-counter-reconnect-tier4]]
+    構造的問題も解決。
+    """
+    if tier in ("tier2", "tier3", "tier4"):
+        return list(TIER1_EPCS) + list(epcs_for_tier(tier))
+    return list(TIER1_EPCS)
+
+
 def should_republish_discovery(now, last_publish_ts, pending, interval_sec):
     """spec 016: True iff a reconnect is pending, the interval has elapsed,
     or no publish has ever been recorded.
@@ -4080,7 +4094,8 @@ def main():
                 # 累積値などの skip 分を補完。 cycle counter は進めない。
                 _catchup_tiers = ["tier4", "tier3", "tier2", "tier1"]
                 tier = _catchup_tiers[4 - catchup_remaining]
-                cycle_epcs = epcs_for_tier(tier)
+                # spec 033: 全 cycle で tier1 EPCs を batch (= mismatch 100% backfill 対象).
+                cycle_epcs = cycle_epcs_with_tier1(tier)
                 catchup_remaining -= 1
                 last_normal_poll_start = last_poll_start
             elif _rt_mode == "burst":
@@ -4098,7 +4113,9 @@ def main():
                 tier = decide_epc_tier(
                     normal_cycle_count,
                     tier4_every=int(cfg.get("epc_tier4_every", 30)))
-                cycle_epcs = epcs_for_tier(tier)
+                # spec 033: 全 cycle で tier1 EPCs を batch (= mismatch 100% backfill 対象、
+                # [[feedback-cycle-counter-reconnect-tier4]] 構造的問題解消).
+                cycle_epcs = cycle_epcs_with_tier1(tier)
                 normal_cycle_count += 1
                 last_normal_poll_start = last_poll_start
             # In probe mode, schedule the next cycle at the tight probe

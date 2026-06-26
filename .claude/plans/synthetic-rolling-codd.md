@@ -1,112 +1,97 @@
-# Plan: spec 032 Aggressive Polling Defaults (= broute-mqtt 並み短 timeout + 早期 reconnect + retry 増)
+# Plan: spec 033 All-Cycle Tier1 Batch (= spec 011 E: 全 cycle で tier1 EPCs を OPC batch)
 
 ## Context
 
-2026-06-26 subagent 調査で他社 OSS 4 実装 (= hsakoh/broute-mqtt 等) との対比で **cube-j1-mqtt が保守的すぎる** ことが判明:
-- `erxudp_timeout_sec=30s` (broute-mqtt 5s の 6 倍)
-- `erxudp_intra_cycle_retries=0` (broute-mqtt 3)
-- `erxudp_timeout_force_reconnect_threshold=30` (broute-mqtt 数分復帰、 cube は 30 分死)
+spec 032 deploy 1h verify で「沈黙時間 3 倍短縮 + timeouts 40% 改善」 達成、 ただし **spec 028 backfill 1h で 0 件発火** (= mismatch 6 件全部 tier2/3/4 cycle 偶発)、 「panel-1 黄色 dot」 見えない継続。 真因 = cube-j1-mqtt は **排他 1 tier 送信** で tier2/3/4 cycle mismatch の `m` に `power_w` 不在 → spec 028 backfill skip + [[feedback-cycle-counter-reconnect-tier4]] 構造的問題 (= reconnect 直後 cycle 0 = tier4 で必ず skip)。
 
-同日 device override PoC (= 30→6 / 0→3 / 30→6) で 33 分実証:
-- last_poll_success_ts: 28 分前 (= 沈黙) → **2 分前** ✅
-- timeouts/h rate: 49/h → **18/h** (= 約 1/3 改善)
-- backfill 発火率: 5.7 倍
-- reconnect 頻度: ほぼ同等 (= polling 健全化で reconnect 必要性自体減少)
+subagent reference 調査で「broute-mqtt は OPC=4 batch (= 70s 周期 1 frame で複数 EPC まとめ取得)」 確認、 cube-j1-mqtt も batch 化で改善余地大。 spec 033 = **「全 cycle で tier1 (= 0xE7/0xE8) を必ず含めて OPC batch」** で mismatch 発火時 100% spec 028 backfill 対象化、 構造的問題解決。
 
-tako 「architectural cap」 結論 (= 2026-06-26 5 agent 合議、 spec 031 へ pivot しかけた) を user 反論「Nature Remo E が成立してる」 + reference 実装調査 + PoC で **完全反証**。 spec 011 D 系の改善余地が実証済、 default 化で恒久反映。
+完成後の見込み: spec 028 backfill 発火率 = mismatch 発火率 (= 偶発依存解消)、 panel-1 黄色 dot が必ず plot される。
 
 ## Approach
 
-最小実装 (= config 3 default 変更だけ、 main loop / read_erxudp / force_reconnect 既存実装互換):
+### v1 MVP の構成
 
-1. **`apply_defaults`** 3 行変更:
-   - line 122: `erxudp_timeout_force_reconnect_threshold` 30 → 6
-   - line 146: `erxudp_timeout_sec` 30 → 6
-   - line 147: `erxudp_intra_cycle_retries` 0 → 3
-2. **既存 spec 023/025 burst 専用 default** 維持 (= burst 中だけ別値、 base のみ変更)
-3. **Step 0**: device config.json で PoC override (= 3 keys explicit) を削除 (= default 化効果の純粋計測)
-4. **tier batch** は **別 spec 011 E に分離** (= 既存構造変更要、 spec 032 とは独立進行可)
+1. **新 pure helper `cycle_epcs_with_tier1(tier)`** を `epcs_for_tier` の隣 (= 約 line 2856) に追加
+2. **main loop の cycle_epcs 設定 3 箇所統一**: line 4083 + 4090 + 4101 を `cycle_epcs = cycle_epcs_with_tier1(tier)` 経由に変更
+3. **PROBE cycle (= line 4076)** は変更しない (= 既存挙動完全保護)
 
-### 設計上の判断 (dig 待ち)
+### 設計上の判断 (dig round 1 で確定済)
 
-- **counter naming**: 既存 `erxudp_timeout_sec` / `erxudp_intra_cycle_retries` / `erxudp_timeout_force_reconnect_threshold` をそのまま使用、 rename しない
-- **default 値 6 / 3 / 6 の根拠**: broute-mqtt (= reference) の 5s/3retry を踏襲、 ただし threshold は **6 cycle = 6 分 ≒ 反応性 + 安定性の中間** で 6 採用 (= broute-mqtt 直接対応値なし、 cube-j1 60s 周期ベースで判断)
-- **PoC 33 分の小サンプル制約**: 1 週間運用で再評価 (= SC-005)
-- **kill switch**: `setdefault` 標準挙動で device explicit override は尊重 (= 旧値復帰可、 緊急時 escape hatch)
-- **spec 027 巻き戻し**: spec 027 で 5→30 にした threshold を 30→6 で巻き戻し、 spec 027 v2 (= wall-clock + health probe + 段階的 recovery) の **代替** 位置付け = 単純 threshold 調整で済むなら大規模再設計不要
+- **OPC=4 batch は既存 `build_el_get` / `send_el_get` / `decode_measurements` 全部対応済** (= subagent 調査 + grep 確認)、 新規実装不要
+- **tier1 cycle path の `cycle_epcs_with_tier1("tier1")` = `[0xE7, 0xE8]`** (= 既存 TIER1_EPCS と同等、 重複なし)
+- **send_history.record は list 対応** (= ring に 4 EPC list 保存、 spec 020 v1.5 lookup_latest fallback とも整合、 変更不要)
+- **`m` dict は EPC 単位 key で複数 entries 含む可能性** (= 既存 decode_measurements が parse_el_response の loop で全 EPC parse)、 publish_measurements も既存通り key 単位で publish
+- **trade-off**: MQTT publish 件数 微増 (= tier2/3/4 cycle で tier1 EPCs 2 件追加 publish)、 既存 telegraf pipeline で問題なし
+- **既存 spec 011 C tier rotation 思想完全保護**: tier2/3/4 の rotation 周期 (= 5/60/30) 不変、 ただし tier1 を全 cycle 含めて情報密度向上 (= spec 011 C 「tier1 = real-time」 意図に完全合致)
+- **dig A 決定 — 未知 tier 重複処理**: tier1 cycle と **同じ path にマージ** (= `if tier in ("tier1",): return list(TIER1_EPCS)` ではなく、 `epcs_for_tier(tier)` の戻り値が TIER1_EPCS と同一 (= 未知 tier fallback 含む) なら重複追加しない判定)。 シンプル実装: tier2/3/4 のいずれかのみ batch、 それ以外は単 tier1。 ECHONET Lite 重複 EPC risk (= BP35CX / メーター動作未検証) 回避
+- **dig B 決定 — kill switch**: **不要**、 spec 033 は spec 011 C tier rotation 強化として完全置換 (= rollback config 不要、 YAGNI、 spec 028/029/032 の「新機能 escape hatch」 とは性質が違う、 既存挙動の認識ずれ修正)
 
 ## Files to modify
 
 ### `production_tool/mqtt_bridge.py`
 
-3 行変更:
-```python
-# line 122
-out.setdefault("erxudp_timeout_force_reconnect_threshold", 6)  # 30 → 6 (spec 032)
-# line 146
-out.setdefault("erxudp_timeout_sec", 6)  # 30 → 6 (spec 032)
-# line 147
-out.setdefault("erxudp_intra_cycle_retries", 3)  # 0 → 3 (spec 032)
-```
+1. **`cycle_epcs_with_tier1` 新 pure helper** (= `epcs_for_tier` 直後、 約 line 2856、 dig A 決定で未知 tier 重複ゼロ化):
+   ```python
+   def cycle_epcs_with_tier1(tier):
+       """spec 033 (= spec 011 E): 全 cycle で tier1 EPCs を含めて OPC batch.
 
-### `tests/unit/test_apply_defaults_spec_032.py` (= 新規、 dig A 決定)
+       tier2/tier3/tier4 のみ tier1 EPCs を合成、 それ以外 (= tier1 / 未知 tier
+       fallback) は TIER1_EPCS のみ返す = 重複 EPC 送信回避 (= ECHONET Lite
+       重複 EPC グレーゾーン、 BP35CX/メーター動作未検証 risk 回避)。
+       1 frame で OPC=4 まとめ取得 = mismatch 発火時 100% spec 028 backfill 対象、
+       [[feedback-cycle-counter-reconnect-tier4]] 構造的問題も解決。
+       """
+       if tier in ("tier2", "tier3", "tier4"):
+           return list(TIER1_EPCS) + list(epcs_for_tier(tier))
+       return list(TIER1_EPCS)
+   ```
 
-spec 027 pattern 踏襲、 spec 単位 1 file:
-- `test_default_erxudp_timeout_sec_is_6` (= 30→6 default)
-- `test_default_erxudp_intra_cycle_retries_is_3` (= 0→3 default)
-- `test_default_erxudp_timeout_force_reconnect_threshold_is_6` (= 30→6 default)
-- `test_explicit_override_preserved_for_aggressive_polling_keys` (= 全 3 keys の override 維持 guard)
+2. **main loop の cycle_epcs 設定統一** (= line 4083 + 4090 + 4101):
+   - line 4083: `cycle_epcs = cycle_epcs_with_tier1(tier)`
+   - line 4090: `cycle_epcs = cycle_epcs_with_tier1("tier1")` (= 結果 list(TIER1_EPCS) と同等)
+   - line 4101: `cycle_epcs = cycle_epcs_with_tier1(tier)`
 
-### spec 027 既存 test の扱い (= dig B 決定)
+   line 4076 (= PROBE) は変更しない。
 
-**delete**: `tests/unit/test_apply_defaults_force_reconnect_threshold.py` を完全削除。 spec 032 で default 巻き戻し済 = spec 027 test も意味失う、 codebase クリーン化。 spec 027 spec.md は **歴史記録として残す** (= delete しない、 「2026-06-25 deploy → 2026-06-26 spec 032 で巻き戻し」 の経緯記録)。
+### `tests/unit/test_cycle_epcs_with_tier1.py` (= 新規)
 
-## Step 0: 着手前確認 + PoC override 削除
-
-```bash
-ssh lab-ub01 'adb shell cat /data/local/config.json' \
-  | python3 -c 'import json,sys; c=json.load(sys.stdin); [print("%s = %s" % (k, c.get(k, "<not set>"))) for k in ["erxudp_timeout_sec", "erxudp_intra_cycle_retries", "erxudp_timeout_force_reconnect_threshold"]]'
-```
-
-PoC で適用済 (= 6/3/6) なので all 3 keys が set されているはず。 **deploy 直前** に device config.json から該当 3 keys を **削除** (= default 化効果の純粋計測):
-```bash
-ssh lab-ub01 'adb pull /data/local/config.json /tmp/c.json && python3 -c "
-import json
-c = json.load(open(\"/tmp/c.json\"))
-for k in [\"erxudp_timeout_sec\", \"erxudp_intra_cycle_retries\", \"erxudp_timeout_force_reconnect_threshold\"]:
-    c.pop(k, None)
-json.dump(c, open(\"/tmp/c.json\", \"w\"), indent=2)
-" && adb push /tmp/c.json /data/local/config.json && adb shell pkill -f mqtt_bridge.py'
-```
+6 件 (= dig A で未知 tier guard test 1 件追加):
+- `test_tier1_returns_tier1_epcs_only` (= ["tier1"] → [0xE7, 0xE8])
+- `test_tier2_returns_tier1_plus_tier2_epcs` (= ["tier2"] → [0xE7, 0xE8, 0xE0, 0xE3])
+- `test_tier3_returns_tier1_plus_tier3_epcs` (= [0xE7, 0xE8, 0xD3, 0xE1])
+- `test_tier4_returns_tier1_plus_tier4_epcs` (= [0xE7, 0xE8, 0xEA, 0xEB])
+- `test_unknown_tier_returns_tier1_only_no_duplication` (= ["unknown"] → [0xE7, 0xE8]、 重複ゼロ guard)
+- `test_returns_list_not_tuple` (= 既存 list 慣習保護、 mutable 操作可能)
 
 ## Test list (TDD 順)
 
-1. **Red→Green**: `test_default_erxudp_timeout_sec_is_6` (= 30→6 default 変更)
-2. **Red→Green**: `test_default_erxudp_intra_cycle_retries_is_3` (= 0→3 default 変更)
-3. **Red→Green**: `test_default_erxudp_timeout_force_reconnect_threshold_is_6` (= 既存 spec 027 test 更新、 30→6)
-4. **Guard**: `test_explicit_override_preserved_for_aggressive_polling_keys` (= setdefault 標準挙動 retainment、 3 keys 同時)
-5. main loop / read_erxudp / force_reconnect 配線は既存実装互換 = 実機検証
+1. **Red→Green**: `test_tier1_returns_tier1_epcs_only` (= 既存挙動互換)
+2. **Red→Green**: `test_tier2_returns_tier1_plus_tier2_epcs` (= spec 033 core)
+3. **Red→Green**: `test_tier3_returns_tier1_plus_tier3_epcs`
+4. **Red→Green**: `test_tier4_returns_tier1_plus_tier4_epcs`
+5. **Guard**: `test_returns_list_not_tuple`
+6. main loop 配線 = 実機検証 (= SC-003 で「mismatch 発火 → spec 028 backfill 100% 発火」 確認)
 
 ## Verification
 
-1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 458 + 新規 ~4 = ~462 件 pass (= spec 027 既存 test 更新を含む)
+1. `.venv/bin/pytest -q --ignore=tests/benchmark` で 既存 457 + 新規 5 = ~462 件 pass
 2. ruff check 新規エラー無し
-3. cube-j1-mqtt 側 commit + jj push (= main fork forward only)
-4. **Step 0 deploy 前確認** (= device config.json で 3 keys explicit override 削除)
-5. lab-ub01 経由 deploy (= adb_push_update.sh cube-j1.home.arpa)
-6. 実機 1h 観察:
-   - `/api/diag` で 3 default が新値 (= 6/3/6) 反映確認
-   - `rate(erxudp_timeouts_total[1h])` ≤ 20/h (= PoC 前 49/h から大幅改善)
-   - `last_poll_success_ts` が 5 分以内に更新継続
-   - `wisun_reconnects/h` ≤ 5/h (= 過剰 reconnect 防止)
-   - panel-1 黄色 dot (= spec 028 backfill) の密度上昇 (= PoC 5.7 倍)
+3. cube-j1-mqtt 1 commit + jj push --remote fork (= forward only)
+4. lab-ub01 経由 deploy (= adb_push_update.sh cube-j1.home.arpa)
+5. 実機 1h 観察:
+   - `/api/diag` で `power_w_recovered_backfill_total` が mismatch 発火と同期 (= 発火率 = mismatch 発火率)
+   - panel-1 黄色 dot が 1h 内 plot (= spec 032 1h で 0 件 → spec 033 で >= 1 件期待)
+   - polling 安定度 (= timeouts/h / reconnects/h) は spec 032 と同等以上維持
+6. SC-004 (= 1 週間 long-term 観察) は別セッションで継続
 
 ## Commit 戦略
 
-- compose 不要 (= telegraf 変更なし、 bridge のみ修正)
-- cube-j1-mqtt 1 commit + push (= bg subagent)、 redact-plans.sh、 jj git push --remote fork
-- Step 0 device config 削除は **deploy 直前** に挟む
+- compose 不要 (= telegraf 変更なし)
+- cube-j1-mqtt 1 commit + push (= 私が直接、 subagent rate limit risk 回避)
+- redact-plans.sh
+- jj git push --remote fork --bookmark main で forward only
 
 ## Commit message
 
-`feat(bridge): polling defaults を broute-mqtt 並みに集約攻撃化 (timeout 30→6 / retries 0→3 / threshold 30→6) — spec 032 で spec 027 巻き戻し兼 reference 実装対比改善`
+`feat(bridge): 全 cycle で tier1 EPCs を OPC batch 含めて mismatch 発火時 100% spec 028 backfill 対象化 (spec 033 = spec 011 E)`
