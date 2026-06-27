@@ -2,7 +2,7 @@
 
 **Feature Branch**: `036-bp35a1-spec-doc-alignment`
 **Created**: 2026-06-27
-**Status**: In Progress (= TDD Red→Green 完了、 deploy + SC verify 待ち)
+**Status**: Deployed (= commit 14fc3c20 / 2026-06-27 deploy 完了、 SC-001/002/003/005 達成、 SC-004 は 30 日 grafana query で別途確認)
 **Input**: 2026-06-27 audit (= [[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-2 + P-NEW-7。 ROHM 認証付き DL で取得した BP35A1 公式 SK コマンドリファレンス Ver 1.3.2 (2020.5 改訂) と bridge コードの初の系統的突き合わせで判明したドキュメントレベル誤記 2 件。
 
 ## Background
