@@ -2711,8 +2711,12 @@ def skcommand(fd, cmd, timeout=10):
 # Scan settings
 # ---------------------------------------------------------------------------
 
-# ROHM SKSCAN duration: scan dwell time = (192 * 2^duration + 1) symbol times.
-# duration=4 → 約 8 秒、 5 → 16 秒、 6 → 32 秒、 7 → 64 秒。
+# ROHM SKSCAN duration: 1 ch あたり dwell time = 0.0096 * (2^duration + 1) 秒
+# (= 960 symbols at 100 kbps GFSK = IEEE 802.15.4 aBaseSuperframeDuration、
+#    BP35A1 公式リファレンス Ver 1.3.2 p.20)。
+# 全 28 ch スキャンの理論換算: duration=4 → 約 4.6 秒、 5 → 8.9 秒、
+# 6 → 17.5 秒、 7 → 34.7 秒。 実機 BP35C0 EVER 1.5.2 では beacon 応答待ち
+# overhead 等で 1-2 倍の実時間が観測される (= duration=6 で実測 17-32 秒)。
 # 4 は最小推奨だが弱信号環境では PAN を取りこぼし scan_retries が嵩む。
 # 6 にすると初回 scan が 32 秒、 LQI 推定精度も上がる。
 SCAN_DURATION_BASE = 6
@@ -3923,14 +3927,15 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_latency_p50_ms",  "ERXUDP Latency p50",  "ms", None,        "measurement",      "diagnostic"),
     ("erxudp_latency_p95_ms",  "ERXUDP Latency p95",  "ms", None,        "measurement",      "diagnostic"),
     ("erxudp_latency_max_ms",  "ERXUDP Latency Max",  "ms", None,        "measurement",      "diagnostic"),
-    ("sk_event_22_total",      "SK EVENT 22 (PANA OK)",       None, None, "total_increasing", "diagnostic"),
-    ("sk_event_24_total",      "SK EVENT 24 (PANA Failed)",   None, None, "total_increasing", "diagnostic"),
-    ("sk_event_25_total",      "SK EVENT 25 (PANA Done)",     None, None, "total_increasing", "diagnostic"),
-    ("sk_event_26_total",      "SK EVENT 26 (Re-auth)",       None, None, "total_increasing", "diagnostic"),
-    ("sk_event_28_total",      "SK EVENT 28 (Session End)",   None, None, "total_increasing", "diagnostic"),
-    ("sk_event_29_total",      "SK EVENT 29 (Session Timeout)", None, None, "total_increasing", "diagnostic"),
-    ("sk_event_32_total",      "SK EVENT 32 (Scan Done)",     None, None, "total_increasing", "diagnostic"),
-    ("sk_event_33_total",      "SK EVENT 33 (Scan Started)",  None, None, "total_increasing", "diagnostic"),
+    # spec 036: SK EVENT ラベルは BP35A1 公式リファレンス Ver 1.3.2 p.51 に整合。
+    ("sk_event_22_total",      "SK EVENT 22 (Active Scan Done)",                       None, None, "total_increasing", "diagnostic"),
+    ("sk_event_24_total",      "SK EVENT 24 (PANA Failed)",                            None, None, "total_increasing", "diagnostic"),
+    ("sk_event_25_total",      "SK EVENT 25 (PANA Done)",                              None, None, "total_increasing", "diagnostic"),
+    ("sk_event_26_total",      "SK EVENT 26 (Session Termination Requested by Peer)",  None, None, "total_increasing", "diagnostic"),
+    ("sk_event_28_total",      "SK EVENT 28 (Session Termination Timeout)",            None, None, "total_increasing", "diagnostic"),
+    ("sk_event_29_total",      "SK EVENT 29 (Session Lifetime Expired)",               None, None, "total_increasing", "diagnostic"),
+    ("sk_event_32_total",      "SK EVENT 32 (ARIB Transmit Limit Hit)",                None, None, "total_increasing", "diagnostic"),
+    ("sk_event_33_total",      "SK EVENT 33 (ARIB Transmit Limit Released)",           None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),

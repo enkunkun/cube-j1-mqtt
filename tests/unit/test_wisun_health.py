@@ -203,3 +203,85 @@ def test_read_erxudp_handles_missing_diag_state(monkeypatch):
 
     data = mb.read_erxudp(_FakeFd(lines), timeout=2)
     assert data is not None
+
+
+# ---------------------------------------------------------------------------
+# spec 036: BP35A1 SKSTACK-IP 公式仕様整合 (= EVENT ラベル誤記訂正)
+# ---------------------------------------------------------------------------
+# 公式 BP35A1 コマンドリファレンス Ver 1.3.2 p.51 (= docs/vendor/bp35a1-skstack-ip/
+# bp35a1_commandmanual_tr-j.pdf) に従い、 DIAG_SENSOR_DEFS のラベル文字列が
+# 公式仕様の意味と整合していることを assert する。 過去の誤記
+# ("PANA OK", "Re-auth", "Scan Done", "Scan Started", "Session End",
+# "Session Timeout") の混入を防止する regression test。
+
+
+def _diag_label(metric_name):
+    """DIAG_SENSOR_DEFS から metric_name に対応するラベル文字列を抽出。"""
+    for entry in mb.DIAG_SENSOR_DEFS:
+        if entry[0] == metric_name:
+            return entry[1]
+    raise AssertionError(
+        "metric {} not found in DIAG_SENSOR_DEFS".format(metric_name))
+
+
+def test_diag_label_event_22_is_active_scan_done():
+    """EVENT 0x22 = アクティブスキャン完了 (公式 p.51)、 "PANA OK" は誤記。"""
+    label = _diag_label("sk_event_22_total")
+    assert "Active Scan" in label, label
+    assert "PANA OK" not in label, label
+
+
+def test_diag_label_event_26_is_session_termination_requested():
+    """EVENT 0x26 = 接続相手からセッション終了要求を受信 (公式 p.51)、 "Re-auth" は誤記。"""
+    label = _diag_label("sk_event_26_total")
+    assert "Session Termination" in label, label
+    assert "Re-auth" not in label, label
+
+
+def test_diag_label_event_28_is_session_termination_timeout():
+    """EVENT 0x28 = セッション終了要求への応答が無く timeout (公式 p.51)。"""
+    label = _diag_label("sk_event_28_total")
+    assert "Session Termination Timeout" in label, label
+
+
+def test_diag_label_event_29_is_session_lifetime_expired():
+    """EVENT 0x29 = セッションのライフタイム経過 (公式 p.51)。"""
+    label = _diag_label("sk_event_29_total")
+    assert "Session Lifetime Expired" in label, label
+
+
+def test_diag_label_event_32_is_arib_transmit_limit_hit():
+    """EVENT 0x32 = ARIB108 送信総和時間制限の発動 (公式 p.51)、 "Scan Done" は誤記。"""
+    label = _diag_label("sk_event_32_total")
+    assert "ARIB Transmit Limit Hit" in label, label
+    assert "Scan Done" not in label, label
+
+
+def test_diag_label_event_33_is_arib_transmit_limit_released():
+    """EVENT 0x33 = ARIB108 送信総和時間制限の解除 (公式 p.51)、 "Scan Started" は誤記。"""
+    label = _diag_label("sk_event_33_total")
+    assert "ARIB Transmit Limit Released" in label, label
+    assert "Scan Started" not in label, label
+
+
+def test_classify_sk_line_event_26():
+    """EVENT 26 (= 相手からセッション終了要求受信) の classify。"""
+    assert mb.classify_sk_line("EVENT 26 FE80::1") == ("event", "26")
+
+
+def test_classify_sk_line_event_33():
+    """EVENT 33 (= ARIB 送信制限解除) の classify。"""
+    assert mb.classify_sk_line("EVENT 33") == ("event", "33")
+
+
+def test_on_sk_event_increments_26_32_33():
+    """EVENT 26/32/33 の on_sk_event で sk_event_NN_total が increment される。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_sk_event("26")
+    diag.on_sk_event("32")
+    diag.on_sk_event("32")
+    diag.on_sk_event("33")
+    snap = diag.snapshot(time.time())
+    assert snap["sk_event_26_total"] == 1
+    assert snap["sk_event_32_total"] == 2
+    assert snap["sk_event_33_total"] == 1

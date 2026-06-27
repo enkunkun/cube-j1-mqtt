@@ -4,7 +4,7 @@
 - **bridge**: `production_tool/mqtt_bridge.py` (= 4606 行、 SK ASCII コマンド使用)
 - **公式仕様**: `docs/vendor/bp35a1-skstack-ip/bp35a1_commandmanual_tr-j.pdf` (= Ver 1.3.2、 2020.5 改訂、 2024 配布、 66 ページ)
 - **実機 firmware**: EVER 1.5.2 (= SKSTACK-IP for BP35A1 / BP35C0 共通)
-- **status**: in progress (= P-NEW-2 / P-NEW-7 を spec 036 で解消中、 残 7 件 open)
+- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036 (commit b50cf89、 2026-06-27 deploy 完了、 SC-001/002/003 達成、 SC-004 は 30 日 grafana query 待ち)、 残 7 件 (= P-NEW-1/3/4/5/6/8/9) open
 
 ## 0. 背景
 
