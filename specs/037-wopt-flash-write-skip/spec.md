@@ -2,7 +2,7 @@
 
 **Feature Branch**: `037-wopt-flash-write-skip`
 **Created**: 2026-06-27
-**Status**: In Progress (= TDD Red→Green 完了、 510 件 pytest pass、 deploy + SC verify 待ち)
+**Status**: Deployed (= commit 7cca9c0 / 2026-06-27 deploy 完了、 SC-001/002/003 達成 = 実機 ROPT=01 で WOPT 1 skip 動作実証、 SC-004 の 7 日カウント観察は別途)
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-1。 BP35A1 公式 Ver 1.3.2 p.41 で WOPT は「設定時に一度だけ実行するように」 と明示されているが、 bridge は `_wisun_init_sequence` で **reconnect 毎に** WOPT 1 を発行していた。
 
 ## Background
