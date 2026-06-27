@@ -285,3 +285,80 @@ def test_on_sk_event_increments_26_32_33():
     assert snap["sk_event_26_total"] == 1
     assert snap["sk_event_32_total"] == 2
     assert snap["sk_event_33_total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# spec 037: WOPT FLASH 書込み寿命対策 (= ROPT 確認で WOPT skip)
+# ---------------------------------------------------------------------------
+# 公式 BP35A1 Ver 1.3.2 p.41 で WOPT は FLASH 書込み 10,000 回制限あり、
+# p.42 の ROPT で現在値を読み bit0=1 なら WOPT 1 を skip して FLASH 寿命を
+# 延命する。 ropt() helper は応答形式が「OK <MODE:2 桁 hex>」 で skcommand
+# の break 条件 (= 完全一致 "OK") では parse 不可能なため専用 helper として
+# 実装。
+
+
+def _fake_readline_factory(lines):
+    """Return a fake serial_readline that pops lines one at a time."""
+    def fake_readline(fd, timeout=None):
+        return lines.pop(0) if lines else None
+    return fake_readline
+
+
+def test_ropt_parses_mode_01(monkeypatch):
+    """ROPT 応答 'OK 01' で bit0=1 を返す。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["OK 01"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    assert mb.ropt(_FakeFd([])) == 1
+
+
+def test_ropt_parses_mode_00(monkeypatch):
+    """ROPT 応答 'OK 00' で bit0=0 を返す。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["OK 00"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    assert mb.ropt(_FakeFd([])) == 0
+
+
+def test_ropt_raises_on_fail(monkeypatch):
+    """ROPT FAIL ER10 で RuntimeError を raise。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["FAIL ER10"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    with pytest.raises(RuntimeError):
+        mb.ropt(_FakeFd([]))
+
+
+def test_ropt_raises_on_timeout(monkeypatch):
+    """ROPT 応答なし (= 全 None) で RuntimeError を raise。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory([]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    with pytest.raises(RuntimeError):
+        mb.ropt(_FakeFd([]), timeout=0.5)
+
+
+def test_on_wopt_skip_increments():
+    """DiagState.on_wopt_skip() で wopt_write_skipped_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_wopt_skip()
+    diag.on_wopt_skip()
+    snap = diag.snapshot(time.time())
+    assert snap["wopt_write_skipped_total"] == 2
+
+
+def test_on_wopt_write_increments():
+    """DiagState.on_wopt_write() で wopt_write_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_wopt_write()
+    snap = diag.snapshot(time.time())
+    assert snap["wopt_write_total"] == 1
+
+
+def test_diag_label_wopt_skipped_exists():
+    """spec 037 で追加する wopt_write_skipped_total / wopt_write_total の
+    ラベルが DIAG_SENSOR_DEFS に登録されている。"""
+    skipped_label = _diag_label("wopt_write_skipped_total")
+    write_label = _diag_label("wopt_write_total")
+    assert "Skipped" in skipped_label or "skip" in skipped_label.lower(), skipped_label
+    assert "WOPT" in write_label, write_label

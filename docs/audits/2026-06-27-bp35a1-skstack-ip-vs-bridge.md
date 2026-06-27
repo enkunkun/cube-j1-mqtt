@@ -4,7 +4,7 @@
 - **bridge**: `production_tool/mqtt_bridge.py` (= 4606 行、 SK ASCII コマンド使用)
 - **公式仕様**: `docs/vendor/bp35a1-skstack-ip/bp35a1_commandmanual_tr-j.pdf` (= Ver 1.3.2、 2020.5 改訂、 2024 配布、 66 ページ)
 - **実機 firmware**: EVER 1.5.2 (= SKSTACK-IP for BP35A1 / BP35C0 共通)
-- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036 (commit 14fc3c20、 2026-06-27 deploy 完了、 SC-001〜005 全達成: SC-004 は 30 日 query で `cube_j1_smart_meter_sk_event_32_total` / `_33_total` ともに 0 件 = ARIB 360s/h 上限に未到達で bridge 設計通り運用中、 sanity check で同期間 sk_event_22_total = 333 件 = bridge 通常稼働確認)、 残 7 件 (= P-NEW-1/3/4/5/6/8/9) open
+- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036 (commit 14fc3c20)、 P-NEW-1 を spec 037 で in progress (= TDD Green、 deploy 待ち)、 残 6 件 (= P-NEW-3/4/5/6/8/9) open
 
 ## 0. 背景
 

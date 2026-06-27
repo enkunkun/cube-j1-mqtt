@@ -2315,6 +2315,9 @@ class DiagState(object):
         # / _PUBLISHED_SK_ERROR_CODES are emitted by snapshot().
         self.sk_event_counts = {}
         self.sk_error_counts = {}
+        # spec 037: WOPT FLASH 書込み寿命対策 (= ROPT 確認で WOPT skip)。
+        self.wopt_skip_count = 0
+        self.wopt_write_count = 0
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2456,6 +2459,12 @@ class DiagState(object):
         key = str(error_code).upper()
         self.sk_error_counts[key] = self.sk_error_counts.get(key, 0) + 1
 
+    def on_wopt_skip(self):
+        self.wopt_skip_count += 1
+
+    def on_wopt_write(self):
+        self.wopt_write_count += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2595,6 +2604,10 @@ class DiagState(object):
             n = self.sk_error_counts.get(code, 0)
             if n > 0:
                 out["sk_error_ER{}_total".format(code)] = n
+        # spec 037: WOPT FLASH 書込み寿命対策。 0 でも常時 publish (= skip が
+        # 機能しているかを観測可能にするため、 zero-omit pattern からは外す)。
+        out["wopt_write_skipped_total"] = self.wopt_skip_count
+        out["wopt_write_total"] = self.wopt_write_count
         return out
 
 # ---------------------------------------------------------------------------
@@ -2706,6 +2719,30 @@ def skcommand(fd, cmd, timeout=10):
         t.join(timeout=1)
         led_rgb(*orig_led)
     return lines
+
+
+def ropt(fd, timeout=3):
+    """Read current WOPT MODE via ROPT. Returns int 0-0xFF. Raises on failure.
+
+    ROPT response format (BP35A1 Ver 1.3.2 p.42): "OK <MODE:2 桁 hex>".
+    skcommand cannot parse this because its break condition is exact "OK"
+    string match. spec 037 で WOPT FLASH 書込み寿命対策の判定に使用。
+    """
+    serial_write(fd, "ROPT\r\n")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
+        if line is None:
+            continue
+        if line.startswith("OK"):
+            parts = line.split()
+            if len(parts) >= 2:
+                return int(parts[1], 16)
+            raise RuntimeError("ROPT malformed response: {!r}".format(line))
+        if line.startswith("FAIL"):
+            raise RuntimeError("ROPT failed: {}".format(line))
+    raise RuntimeError("ROPT timeout")
+
 
 # ---------------------------------------------------------------------------
 # Scan settings
@@ -2833,12 +2870,16 @@ def skll64(fd, mac):
             continue
     return None
 
-def _wisun_init_sequence(fd, br_id, br_pwd):
+def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
     """spec 035: SKRESET + identity + credential 設定を helper 化。
 
     既存 wisun_connect 先頭の冪等な init を抽出、 cached SKJOIN 失敗時の
     fallback 経路で 2 度目の clean state init にも再利用 (= EVENT 24 後の
     BP35CX internal state 残留 risk 回避)。
+
+    spec 037: WOPT は FLASH 書込み 10,000 回制限 (BP35A1 Ver 1.3.2 p.41) の
+    対策で、 ROPT で現在値を読み bit0=1 なら skip する。 diag_state 引数は
+    skip/write のカウント記録用 (= None なら無視、 既存呼出互換)。
     """
     log("SKRESET")
     skcommand(fd, "SKRESET", timeout=5)
@@ -2858,7 +2899,23 @@ def _wisun_init_sequence(fd, br_id, br_pwd):
     skcommand(fd, "SKSETRBID {}".format(br_id))
 
     # Force ASCII-hex ERXUDP payload format so parser stays stable.
-    skcommand(fd, "WOPT 1")
+    # spec 037: WOPT 1 を毎回発行すると FLASH 寿命 10,000 回を消費するため、
+    # ROPT で bit0=1 なら skip。 ROPT 失敗時は安全側で WOPT 1 を発行。
+    try:
+        current_wopt = ropt(fd)
+        if (current_wopt & 1) == 1:
+            log("WOPT 1 skip (ROPT={:02X})".format(current_wopt))
+            if diag_state is not None:
+                diag_state.on_wopt_skip()
+        else:
+            skcommand(fd, "WOPT 1")
+            if diag_state is not None:
+                diag_state.on_wopt_write()
+    except Exception as e:
+        log("ROPT failed ({}), fallback to WOPT 1".format(e))
+        skcommand(fd, "WOPT 1")
+        if diag_state is not None:
+            diag_state.on_wopt_write()
 
 
 def _wait_skjoin_event25(fd, pan, ipv6, timeout):
@@ -2920,7 +2977,7 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
     `diag_state` is forwarded to skscan and the PAN info is recorded onto it
     once a usable PAN is selected.
     """
-    _wisun_init_sequence(fd, br_id, br_pwd)
+    _wisun_init_sequence(fd, br_id, br_pwd, diag_state=diag_state)
 
     # spec 035: cached SKJOIN 直行 path (= SKSCAN/SKLL64 完全 skip)
     if prefer_cached_join and diag_state is not None:
@@ -2961,7 +3018,7 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
                 except Exception as e:
                     log("diag on_skjoin_failure error: {}".format(e))
             log("SKJOIN cached failed, re-init + SKSCAN fallback")
-            _wisun_init_sequence(fd, br_id, br_pwd)
+            _wisun_init_sequence(fd, br_id, br_pwd, diag_state=diag_state)
 
     pan = None
     known_ch = getattr(diag_state, "pan_channel", None) if diag_state else None
@@ -3936,6 +3993,9 @@ DIAG_SENSOR_DEFS = [
     ("sk_event_29_total",      "SK EVENT 29 (Session Lifetime Expired)",               None, None, "total_increasing", "diagnostic"),
     ("sk_event_32_total",      "SK EVENT 32 (ARIB Transmit Limit Hit)",                None, None, "total_increasing", "diagnostic"),
     ("sk_event_33_total",      "SK EVENT 33 (ARIB Transmit Limit Released)",           None, None, "total_increasing", "diagnostic"),
+    # spec 037: WOPT FLASH 書込み寿命 10,000 回制限対策の観測点 (= BP35A1 Ver 1.3.2 p.41)。
+    ("wopt_write_skipped_total", "WOPT Write Skipped (= FLASH 寿命対策)",               None, None, "total_increasing", "diagnostic"),
+    ("wopt_write_total",         "WOPT Write Count",                                    None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),

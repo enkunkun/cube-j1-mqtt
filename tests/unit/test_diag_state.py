@@ -61,6 +61,10 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 035: SKLL64 cached + SKJOIN 直行 counters.
         "wisun_reconnect_cached_skjoin_total": 0,
         "wisun_reconnect_cached_skjoin_fallback_total": 0,
+        # spec 037: WOPT FLASH 書込み寿命対策 (= ROPT で skip カウント)。
+        # zero でも常時 publish (= skip が機能しているかの観測点)。
+        "wopt_write_skipped_total": 0,
+        "wopt_write_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
