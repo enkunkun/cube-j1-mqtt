@@ -2,7 +2,47 @@
 
 **Feature Branch**: `041-silent-death-watchdog`
 **Created**: 2026-06-28
-**Status**: Draft
+**Status**: Phase 2a Deployed (= 2026-06-28 04:22 JST、 lab-ub01 上 cron `*/5 * * * *` で `~/bin/cube-j1-watchdog.sh` 自動実行、 dry run で `alive pid=21822` 検知成功 + kill -9 simulation で「init 自動 restart 経由で alive 検知」 確認。 Phase 2b (= stderr redirect) + Phase 2c (= heartbeat) は次セッション or 次回 silent death 再発時に対応)
+
+## Phase 2a 実装記録 (= 2026-06-28 04:22 JST)
+
+### root cause 仮説 (= mqtt_ha_bridge.rc 全文確認後)
+
+`/system/etc/init/mqtt_ha_bridge.rc` は 5 行 minimal config:
+
+```
+service mqtt_ha_bridge /usr/bin/python /data/local/mqtt_bridge.py
+    class late_start
+    user root
+    group root
+    seclabel u:r:shell:s0
+```
+
+- `oneshot` flag なし → Android init のデフォルト挙動 = 自動 restart 有効
+- `respawn limit` 上書きなし → デフォルト 4 秒以内に 4 回 crash で **一時停止 (= 諦め state)**
+
+24h 沈黙の最有力仮説: 18:44:41 EEDSCAN 直後に Python uncaught exception → process exit → init が短時間に複数回 restart 試行 → respawn limit 到達 → init は state を `running` と保ったまま実際は process 起動を停止。 SELinux audit `denied { read } for /data/local/mqtt_bridge.py` が permissive モードで動いていることが dmesg から確認できる。
+
+### Phase 2a deploy 詳細
+
+- lab-ub01: `~/bin/cube-j1-watchdog.sh` (= 933 bytes、 chmod +x)
+- crontab append: `*/5 * * * * ~/bin/cube-j1-watchdog.sh >> ~/.cube-j1-watchdog.log 2>&1 # cube-j1 silent death watchdog (spec 041)`
+- 既存 crontab (= yahoo-keepalive) との衝突なし
+- script logic: adb connect (idempotent) → pgrep -f mqtt_bridge.py → 0 件なら stop + start mqtt_ha_bridge + 10s 後 verify
+
+### Phase 2a 動作確認
+
+- dry run: `2026-06-28T04:21:58+00:00 alive pid=21822` ✅
+- kill -9 simulation: `2026-06-28T04:22:14+00:00 alive pid=22015` = **init が自動 restart して新 pid を取得**、 watchdog 自身は restart 不要だった (= 単発 kill では init で十分)
+- 真の zombie state 検知は次回 silent death 再発時に実証 (= 1 件/24h+ の低頻度事象)
+
+### Phase 2a → 2b/2c の繰り越し
+
+- Phase 2b (= stderr redirect): bridge 内 `sys.excepthook` で traceback 記録、 次回 silent death の root cause 究明に必要
+- Phase 2c (= heartbeat): bridge main loop で `/data/local/mqtt_bridge.heartbeat` touch + watchdog で `mtime > 180s` 検知、 (D) deadlock 対応
+- どちらも当面は Phase 2a の cron + pgrep ベースで「死亡検知 + restart」 までは確保済なので、 緊急性低い
+
+
 **Input**: 2026-06-28 03:46 (JST) に bridge が **24h 沈黙** (= 2026-06-27 03:44 EEDSCAN OK 直後から process 不在) していたことを発見。 `init.svc.mqtt_ha_bridge = running` だが pgrep 0 件 = silent zombie 状態。 spec 037 deploy 後の独立した死亡で、 traceback / stderr 記録なし、 発見は偶然 (= log grep しようとして気付いた)。 この種の slient death を確実に検知 + 自動 restart する仕組みが必要。
 
 ## Background
