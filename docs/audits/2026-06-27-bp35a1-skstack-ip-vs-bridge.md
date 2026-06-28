@@ -4,7 +4,7 @@
 - **bridge**: `production_tool/mqtt_bridge.py` (= 4606 行、 SK ASCII コマンド使用)
 - **公式仕様**: `docs/vendor/bp35a1-skstack-ip/bp35a1_commandmanual_tr-j.pdf` (= Ver 1.3.2、 2020.5 改訂、 2024 配布、 66 ページ)
 - **実機 firmware**: EVER 1.5.2 (= SKSTACK-IP for BP35A1 / BP35C0 共通)
-- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036 (commit 14fc3c20)、 P-NEW-1 resolved by spec 037 (commit 7cca9c0、 2026-06-27 deploy 完了、 実機 ROPT=01 確認で WOPT skip 動作実証 = FLASH 寿命 10,000 回制限の消費停止、 SC-004 の 7 日カウント観察は別途)、 残 6 件 (= P-NEW-3/4/5/6/8/9) open
+- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036 (commit 14fc3c20)、 P-NEW-1 resolved by spec 037 (commit 7cca9c0、 2026-06-27 deploy 完了、 実機 ROPT=01 確認で WOPT skip 動作実証 = FLASH 寿命 10,000 回制限の消費停止、 SC-004 の 7 日カウント観察は別途)、 P-NEW-3 + P-NEW-5 Phase 1 観察中 (commit c4a8ac5 / 2026-06-28 03:17 deploy = EVENT 21/27 publish 拡張、 12h/24h cron 集計待ち、 spec 038/040)、 **P-NEW-4 Closed (= bridge アーキテクチャ非互換 / 2026-06-28、 spec 039 = SKSAVE + SFF=1 deploy 直後 revert commit 30a515d)** - SKRESET 後 SFF が常に 0 でクリアされる仕様 (公式 p.36) + reconnect 毎 SKSAVE で FLASH 寿命 13 日消費の重大 regression、 詳細 = specs/039-sksave-sff-reconnect-skip/spec.md + memory feedback-bp35a1-skreset-clears-sksreg-non-product、 spec 041 (= silent death watchdog) 2026-06-28 起票、 残 P-NEW-6/8/9 open
 
 ## 0. 背景
 
