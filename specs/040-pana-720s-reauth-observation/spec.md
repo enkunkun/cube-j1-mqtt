@@ -2,7 +2,13 @@
 
 **Feature Branch**: `040-pana-720s-reauth-observation`
 **Created**: 2026-06-28
-**Status**: Phase 1 観察中 (= commit c4a8ac5 / 2026-06-28 03:17 deploy 済、 EVENT 27 観測ツール組み込み完了、 24h cron trigger 待ち = 2026-06-29 03:33 JST 集計)
+**Status**: **Phase 1 判定保留 (= 観察基盤の既存 bug で判定不可、 spec 044 fix 後に再評価) / 2026-06-30 JST**
+
+deploy から 42h 経過で `sk_event_27_total` = 0 件、 `sk_event_25_total` = 0 件。 ただし bridge log で `wisun_joined` event 51 件 = SKJOIN 51 回成功なのに sk_event_25_total = 0 = **bridge 既存 bug** (= `_wait_skjoin_event25` で on_sk_event 未呼出、 [[feedback-bridge-skjoin-event25-not-counted]] に詳細) で SKJOIN 文脈の EVENT が metric 計上されない設計欠落判明。
+
+= 「PANA 720s 自動再認証周期 vs 12 分周期 erxudp_timeout の相関」 を sk_event_25_total ベースで判定する **観察基盤の前提崩壊**。 spec 044 (= bug 修正) deploy 後に Phase 1 再観察 = 24h 経過後に再評価。
+
+audit findings P-NEW-5 = **未確定 (= spec 044 待ち)**、 spec 040 自体は draft 継続。
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-5。 BP35A1 公式 Ver 1.3.2 p.9 で S16 (= PANA セッションライフタイム) のデフォルトは 900 秒、 p.14 で 80% 経過時に PaC が SKREJOIN を自動実行、 つまり接続後 **720 秒 (= 12 分) ごと**に自動再認証が走る。 memory [[feedback-erxudp-timeouts-periodic-pana]] で「erxudp_timeouts 30 件/h baseline + 10-11 分周期」 と観測された周期は、 この自動再認証と一致する仮説あり。
 
 ## Background

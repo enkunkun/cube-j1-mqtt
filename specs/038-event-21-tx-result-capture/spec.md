@@ -2,7 +2,13 @@
 
 **Feature Branch**: `038-event-21-tx-result-capture`
 **Created**: 2026-06-28
-**Status**: Phase 1 観察中 (= commit c4a8ac5 / 2026-06-28 03:17 deploy 済、 12h cron trigger 待ち = 2026-06-28 15:37 JST 集計、 24h は spec 040 cron に統合 = 2026-06-29 03:33 JST)
+**Status**: **Closed (= Phase 1 観察結果で ROI 0 確定) / 2026-06-30 JST**
+
+deploy から 42h 経過で `sk_event_21_total` = **0 件** = EVENT 21 PARAM=0/1/2 が一度も発火していない (= gcx --context cloud metrics query 'cube_j1_smart_meter_sk_event_21_total{device_id="cubej1"}' で vector empty 確認)。 spec.md の ROI 判断基準では「0 件 / 12h → spec close」 該当、 42h 観察で確定。
+
+ERXUDP timeout は同期間 1046 件累計と発火継続中 = ERXUDP timeout 主因は **TX 失敗ではなく RX 待ち (= メーター応答無し or 遅延)** ことが確定 ([[feedback-phase1-event21-zero-erxudp-rx-dominant]] に詳細)。 audit findings P-NEW-3 = Closed (= bridge アーキテクチャ非互換ではないが effect ゼロが実証)。
+
+仮説の前提 (= 「ERXUDP timeout の一部は EVENT 21 PARAM=1 で 1-2s 以内に通知されていた」) は否定。 software 改善余地 0、 spec 042 (= SKADDNBR) / spec 044 (= EVENT 25 metric bug fix) など別 spec で残課題に対応。
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-3。 BP35A1 公式 Ver 1.3.2 p.51 で SKSENDTO 後の送信結果は EVENT 0x21 (PARAM=0/1/2) で 1-2 秒以内に通知されるが、 bridge は完全 ignore (= `grep "EVENT.*21"` 0 件) で常に ERXUDP 待ち 30s timeout に依存している。
 
 ## Background
