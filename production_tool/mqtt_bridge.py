@@ -1699,7 +1699,7 @@ _DIAG_SNAPSHOT_KEYS = (
 # Spec 006: Wi-SUN health observability. EVENT and FAIL ids that we expose
 # as named counters. Anything outside this list is still counted in memory
 # (sk_event_counts) but not published — keeps HA discovery noise-free.
-_PUBLISHED_SK_EVENT_IDS = ("22", "24", "25", "26", "28", "29", "32", "33")
+_PUBLISHED_SK_EVENT_IDS = ("21", "22", "24", "25", "26", "27", "28", "29", "32", "33")
 _PUBLISHED_SK_ERROR_CODES = ("05", "09", "10")
 
 
@@ -3985,10 +3985,13 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_latency_p95_ms",  "ERXUDP Latency p95",  "ms", None,        "measurement",      "diagnostic"),
     ("erxudp_latency_max_ms",  "ERXUDP Latency Max",  "ms", None,        "measurement",      "diagnostic"),
     # spec 036: SK EVENT ラベルは BP35A1 公式リファレンス Ver 1.3.2 p.51 に整合。
+    # spec 038/040: EVENT 21 (= TX Result Notification) + EVENT 27 (= Session Termination Done) Phase 1 観察追加。
+    ("sk_event_21_total",      "SK EVENT 21 (TX Result Notification)",                 None, None, "total_increasing", "diagnostic"),
     ("sk_event_22_total",      "SK EVENT 22 (Active Scan Done)",                       None, None, "total_increasing", "diagnostic"),
     ("sk_event_24_total",      "SK EVENT 24 (PANA Failed)",                            None, None, "total_increasing", "diagnostic"),
     ("sk_event_25_total",      "SK EVENT 25 (PANA Done)",                              None, None, "total_increasing", "diagnostic"),
     ("sk_event_26_total",      "SK EVENT 26 (Session Termination Requested by Peer)",  None, None, "total_increasing", "diagnostic"),
+    ("sk_event_27_total",      "SK EVENT 27 (Session Termination Done)",               None, None, "total_increasing", "diagnostic"),
     ("sk_event_28_total",      "SK EVENT 28 (Session Termination Timeout)",            None, None, "total_increasing", "diagnostic"),
     ("sk_event_29_total",      "SK EVENT 29 (Session Lifetime Expired)",               None, None, "total_increasing", "diagnostic"),
     ("sk_event_32_total",      "SK EVENT 32 (ARIB Transmit Limit Hit)",                None, None, "total_increasing", "diagnostic"),

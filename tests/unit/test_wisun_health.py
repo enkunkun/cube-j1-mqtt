@@ -288,6 +288,61 @@ def test_on_sk_event_increments_26_32_33():
 
 
 # ---------------------------------------------------------------------------
+# spec 038/040: EVENT 21 (= UDP 送信結果通知) / EVENT 27 (= セッション終了完了)
+# Phase 1 観察追加 (= PARAM 区別なし最小化、 公式 BP35A1 Ver 1.3.2 p.51)
+# ---------------------------------------------------------------------------
+# spec 038 (P-NEW-3) は EVENT 21 PARAM=0/1/2 完全 ignore を改修するが、
+# Phase 1 では「件数だけ」 観測して ROI を確定 (= 1h で 0 件なら spec close、
+# 多数なら PARAM 区別 Phase 2 へ)。 spec 040 (P-NEW-5) は PANA 720s 自動再認証
+# 周期と erxudp_timeout の相関を見るため EVENT 27 (= セッション終了完了) を
+# 観察追加。 どちらも _PUBLISHED_SK_EVENT_IDS に id を入れるだけで snapshot
+# に publish される。
+
+
+def test_published_sk_event_ids_contains_21_and_27():
+    """spec 038/040 観察用: _PUBLISHED_SK_EVENT_IDS に 21 / 27 が含まれる。"""
+    assert "21" in mb._PUBLISHED_SK_EVENT_IDS
+    assert "27" in mb._PUBLISHED_SK_EVENT_IDS
+
+
+def test_diag_label_event_21_is_tx_result_notification():
+    """EVENT 0x21 = UDP 送信結果通知 (= TX Result、 公式 p.51)。"""
+    label = _diag_label("sk_event_21_total")
+    assert "TX Result" in label, label
+
+
+def test_diag_label_event_27_is_session_termination_done():
+    """EVENT 0x27 = セッション終了完了 (公式 p.51)、 26 (= 要求) と 28 (= timeout) と区別。"""
+    label = _diag_label("sk_event_27_total")
+    assert "Session Termination" in label, label
+    assert "Done" in label, label
+
+
+def test_classify_sk_line_event_21_with_param():
+    """EVENT 21 は "EVENT 21 <ipv6> <PARAM>" 形式、 classify は id のみ返す (= PARAM 切り捨て)。"""
+    assert mb.classify_sk_line("EVENT 21 FE80::1 1") == ("event", "21")
+    assert mb.classify_sk_line("EVENT 21 FE80::1 0") == ("event", "21")
+    assert mb.classify_sk_line("EVENT 21 FE80::1 2") == ("event", "21")
+
+
+def test_classify_sk_line_event_27():
+    """EVENT 27 (= セッション終了完了) の classify。"""
+    assert mb.classify_sk_line("EVENT 27 FE80::1") == ("event", "27")
+
+
+def test_on_sk_event_increments_21_27_snapshot():
+    """EVENT 21/27 の on_sk_event で sk_event_NN_total が snapshot に publish される。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_sk_event("21")
+    diag.on_sk_event("21")
+    diag.on_sk_event("21")
+    diag.on_sk_event("27")
+    snap = diag.snapshot(time.time())
+    assert snap["sk_event_21_total"] == 3
+    assert snap["sk_event_27_total"] == 1
+
+
+# ---------------------------------------------------------------------------
 # spec 037: WOPT FLASH 書込み寿命対策 (= ROPT 確認で WOPT skip)
 # ---------------------------------------------------------------------------
 # 公式 BP35A1 Ver 1.3.2 p.41 で WOPT は FLASH 書込み 10,000 回制限あり、
