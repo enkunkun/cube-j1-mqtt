@@ -2318,6 +2318,9 @@ class DiagState(object):
         # spec 037: WOPT FLASH 書込み寿命対策 (= ROPT 確認で WOPT skip)。
         self.wopt_skip_count = 0
         self.wopt_write_count = 0
+        # spec 039: SFF=1 で S02/S03 SKSREG set を skip した回数 + SKSAVE 発行回数。
+        self.sff_autoload_used_count = 0
+        self.sksave_count = 0
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2465,6 +2468,14 @@ class DiagState(object):
     def on_wopt_write(self):
         self.wopt_write_count += 1
 
+    def on_sff_autoload_used(self):
+        """spec 039: SFF=1 で S02/S03 の SKSREG set を skip した時に発火。"""
+        self.sff_autoload_used_count += 1
+
+    def on_sksave_issued(self):
+        """spec 039: SKSAVE で FLASH 永続化した時に発火 (= SFF=0 → 1 の遷移時)。"""
+        self.sksave_count += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2608,6 +2619,10 @@ class DiagState(object):
         # 機能しているかを観測可能にするため、 zero-omit pattern からは外す)。
         out["wopt_write_skipped_total"] = self.wopt_skip_count
         out["wopt_write_total"] = self.wopt_write_count
+        # spec 039: SFF=1 autoload + SKSAVE 永続化の counter。 同じく zero-omit せず
+        # 0 でも publish して観測可能化。
+        out["sff_autoload_used_total"] = self.sff_autoload_used_count
+        out["sksave_total"] = self.sksave_count
         return out
 
 # ---------------------------------------------------------------------------
@@ -2742,6 +2757,107 @@ def ropt(fd, timeout=3):
         if line.startswith("FAIL"):
             raise RuntimeError("ROPT failed: {}".format(line))
     raise RuntimeError("ROPT timeout")
+
+
+def sksreg_read(fd, reg, timeout=2):
+    """Read current SKSREG <reg> value. Returns int. Raises on failure.
+
+    SKSREG read response (BP35A1 Ver 1.3.2 p.8): "ESREG <VAL>" or
+    "ESREG <reg> <VAL>" followed by "OK". 両 pattern を受け入れる
+    (= 最終トークンを VAL として採用)。 spec 039 で SFF / S02 / S03 の
+    永続化状態を読み取り、 SKSAVE / SKSREG SET の skip 判定に使用。
+    """
+    serial_write(fd, "SKSREG {}\r\n".format(reg))
+    deadline = time.time() + timeout
+    value = None
+    while time.time() < deadline:
+        line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
+        if line is None:
+            continue
+        if line.startswith("ESREG"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    value = int(parts[-1], 16)
+                except ValueError:
+                    raise RuntimeError(
+                        "SKSREG {} malformed ESREG: {!r}".format(reg, line))
+            continue
+        if line.startswith("OK"):
+            if value is not None:
+                return value
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1], 16)
+                except ValueError:
+                    raise RuntimeError(
+                        "SKSREG {} malformed OK: {!r}".format(reg, line))
+            raise RuntimeError(
+                "SKSREG {} response missing value: {!r}".format(reg, line))
+        if line.startswith("FAIL"):
+            raise RuntimeError("SKSREG {} failed: {}".format(reg, line))
+    raise RuntimeError("SKSREG {} timeout".format(reg))
+
+
+def sksave(fd, timeout=3):
+    """Persist current SKSAVE-eligible registers (S02/S03/S0A/SFF/WOPT/WUART)
+    to FLASH. Returns None on success. Raises on failure.
+
+    SKSAVE response (BP35A1 Ver 1.3.2 p.31): "OK" or "FAIL ER<code>".
+    FLASH 書込み 10,000 回制限あり、 spec 037 WOPT と同じ FLASH 領域を
+    共有するため idempotent な発行 (= SFF/S02/S03 がすでに目標値ならば
+    skip) で寿命を保護する。
+    """
+    serial_write(fd, "SKSAVE\r\n")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        line = serial_readline(fd, timeout=max(0.5, deadline - time.time()))
+        if line is None:
+            continue
+        if line.startswith("OK"):
+            return
+        if line.startswith("FAIL"):
+            raise RuntimeError("SKSAVE failed: {}".format(line))
+    raise RuntimeError("SKSAVE timeout")
+
+
+def sksreg_s2_s3_set_with_skip(fd, target_ch_hex, target_pan_id, diag_state=None):
+    """spec 039: S02 (channel) / S03 (PAN ID) を idempotent に set。
+
+    SFF=1 で起動時 autoload された現在値が target と一致なら SKSREG set を
+    skip、 不一致なら SKSREG SET + SKSAVE で永続化更新 (= 次回 autoload 復元値
+    更新)。 cached path / full scan path 双方で使用。 read 失敗時は safe-side
+    で SKSREG SET にフォールバック (= 既存挙動維持、 SKSAVE は呼ばず regression
+    risk 0)。
+    """
+    skipped = False
+    try:
+        current_ch = sksreg_read(fd, "S02")
+        current_pid = sksreg_read(fd, "S03")
+        target_ch_int = int(target_ch_hex, 16)
+        target_pid_int = int(target_pan_id, 16)
+        if current_ch == target_ch_int and current_pid == target_pid_int:
+            log("SFF autoload OK (S02=0x{:02X} S03=0x{:04X}), skip SKSREG set".format(
+                current_ch, current_pid))
+            if diag_state is not None:
+                diag_state.on_sff_autoload_used()
+            skipped = True
+    except Exception as e:
+        log("SFF autoload check failed ({}), falling back to SKSREG set".format(e))
+
+    if skipped:
+        return
+
+    skcommand(fd, "SKSREG S2 {}".format(target_ch_hex))
+    skcommand(fd, "SKSREG S3 {}".format(target_pan_id))
+    try:
+        sksave(fd)
+        if diag_state is not None:
+            diag_state.on_sksave_issued()
+        log("SKSAVE: S02/S03 永続化 (= 次回 SFF autoload 復元値更新)")
+    except Exception as e:
+        log("SKSAVE failed ({}), 永続化 skip (= 次回 autoload 値旧のまま)".format(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2917,6 +3033,24 @@ def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
         if diag_state is not None:
             diag_state.on_wopt_write()
 
+    # spec 039: SFF=1 を idempotent に確認 + 必要時のみ SKSAVE。 SFF=1 で起動時
+    # に S02/S03 が autoload されるため、 wisun_connect 内の SKSREG S2/S3 set を
+    # skip 可能になる (= 床値 ~9s → ~7-8s 短縮の前提)。 公式 BP35A1 Ver 1.3.2
+    # p.31/32。 既に 1 なら no-op、 0 なら SKSREG SFF 1 + SKSAVE で FLASH 永続化
+    # (= FLASH 書込みは初回 deploy 時の 1 回のみ、 以降は skip で寿命保護)。
+    try:
+        current_sff = sksreg_read(fd, "SFF")
+        if current_sff == 1:
+            log("SFF=1 already set (= autoload 有効)")
+        else:
+            log("SFF=0 → set 1 + SKSAVE (= autoload 有効化)")
+            skcommand(fd, "SKSREG SFF 1")
+            sksave(fd)
+            if diag_state is not None:
+                diag_state.on_sksave_issued()
+    except Exception as e:
+        log("SFF check failed ({}), continue without SFF autoload".format(e))
+
 
 def _wait_skjoin_event25(fd, pan, ipv6, timeout):
     """spec 035: SKJOIN 発行後の EVENT 25/24 待ち loop を helper 化。
@@ -2991,8 +3125,8 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
             cached_succeeded = False
             try:
                 ch_hex = "{:02X}".format(int(cached_ch))
-                skcommand(fd, "SKSREG S2 {}".format(ch_hex))
-                skcommand(fd, "SKSREG S3 {}".format(cached_pid))
+                # spec 039: SFF=1 復元値が一致なら SKSREG set 全部 skip。
+                sksreg_s2_s3_set_with_skip(fd, ch_hex, cached_pid, diag_state)
                 serial_write(fd, "SKJOIN {}\r\n".format(cached_ipv6))
                 cached_pan = {"Channel": ch_hex, "Pan ID": cached_pid,
                               "Addr": cached_mac}
@@ -3070,8 +3204,8 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
         except Exception as e:
             log("diag on_skll64 error: {}".format(e))
 
-    skcommand(fd, "SKSREG S2 {}".format(channel))
-    skcommand(fd, "SKSREG S3 {}".format(pan_id))
+    # spec 039: SFF=1 復元値が一致なら SKSREG set 全部 skip、 不一致なら更新 + SKSAVE。
+    sksreg_s2_s3_set_with_skip(fd, channel, pan_id, diag_state)
 
     log("SKJOIN {}".format(ipv6))
     serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
@@ -3999,6 +4133,9 @@ DIAG_SENSOR_DEFS = [
     # spec 037: WOPT FLASH 書込み寿命 10,000 回制限対策の観測点 (= BP35A1 Ver 1.3.2 p.41)。
     ("wopt_write_skipped_total", "WOPT Write Skipped (= FLASH 寿命対策)",               None, None, "total_increasing", "diagnostic"),
     ("wopt_write_total",         "WOPT Write Count",                                    None, None, "total_increasing", "diagnostic"),
+    # spec 039: SFF=1 + SKSAVE で reconnect 床値突破 (= BP35A1 Ver 1.3.2 p.31/32、 S2/S3 skip)。
+    ("sff_autoload_used_total",  "SFF Autoload Used (= S2/S3 skip)",                    None, None, "total_increasing", "diagnostic"),
+    ("sksave_total",             "SKSAVE Issued Count",                                 None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),

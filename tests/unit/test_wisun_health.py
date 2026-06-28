@@ -417,3 +417,90 @@ def test_diag_label_wopt_skipped_exists():
     write_label = _diag_label("wopt_write_total")
     assert "Skipped" in skipped_label or "skip" in skipped_label.lower(), skipped_label
     assert "WOPT" in write_label, write_label
+
+
+# ---------------------------------------------------------------------------
+# spec 039: SKSAVE + SFF=1 で reconnect 床値 ~9s → ~7-8s 突破 (= S2/S3 skip)
+# ---------------------------------------------------------------------------
+# 公式 BP35A1 Ver 1.3.2 p.31/32 で SKSAVE / SFF レジスタによる FLASH 永続化
+# 機構が提供されている。 SFF=1 を一度 SKSAVE すれば、 以降の bridge 起動時に
+# S02 channel / S03 PAN ID / S0A pairing ID / WOPT が自動復元される。
+# sksreg_read() は SKSREG <reg> の応答 (= ESREG <VAL> または ESREG <reg> <VAL>
+# + OK の 2 行 sequence) を解析する専用 helper、 sksave() は SKSAVE 発行で
+# OK / FAIL を返す helper。 spec 037 ropt() と同じ pattern。
+
+
+def test_sksreg_read_parses_esreg_val_pattern(monkeypatch):
+    """SKSREG SFF 応答 'ESREG 1' + 'OK' で値 1 を返す (= 公式 p.8 ESREG+<VAL> 形式)。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["ESREG 1", "OK"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    assert mb.sksreg_read(_FakeFd([]), "SFF") == 1
+
+
+def test_sksreg_read_parses_esreg_reg_val_pattern(monkeypatch):
+    """SKSREG S02 応答 'ESREG S02 27' + 'OK' で値 0x27 を返す (= reg 含む 3 トークン形式)。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["ESREG S02 27", "OK"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    assert mb.sksreg_read(_FakeFd([]), "S02") == 0x27
+
+
+def test_sksreg_read_raises_on_fail(monkeypatch):
+    """SKSREG FAIL で RuntimeError を raise。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["FAIL ER10"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    with pytest.raises(RuntimeError):
+        mb.sksreg_read(_FakeFd([]), "SFF")
+
+
+def test_sksreg_read_raises_on_timeout(monkeypatch):
+    """SKSREG 応答なしで RuntimeError を raise。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory([]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    with pytest.raises(RuntimeError):
+        mb.sksreg_read(_FakeFd([]), "SFF", timeout=0.3)
+
+
+def test_sksave_returns_on_ok(monkeypatch):
+    """SKSAVE 応答 'OK' で例外無く返る。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["OK"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    mb.sksave(_FakeFd([]))
+
+
+def test_sksave_raises_on_fail(monkeypatch):
+    """SKSAVE FAIL で RuntimeError を raise。"""
+    monkeypatch.setattr(mb, "serial_readline",
+                        _fake_readline_factory(["FAIL ER04"]))
+    monkeypatch.setattr(mb, "serial_write", lambda fd, data: None)
+    with pytest.raises(RuntimeError):
+        mb.sksave(_FakeFd([]))
+
+
+def test_on_sff_autoload_used_increments():
+    """DiagState.on_sff_autoload_used() で sff_autoload_used_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_sff_autoload_used()
+    diag.on_sff_autoload_used()
+    snap = diag.snapshot(time.time())
+    assert snap["sff_autoload_used_total"] == 2
+
+
+def test_on_sksave_issued_increments():
+    """DiagState.on_sksave_issued() で sksave_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_sksave_issued()
+    snap = diag.snapshot(time.time())
+    assert snap["sksave_total"] == 1
+
+
+def test_diag_label_sff_autoload_used_exists():
+    """spec 039: sff_autoload_used_total / sksave_total の DIAG_SENSOR_DEFS 登録確認。"""
+    used_label = _diag_label("sff_autoload_used_total")
+    save_label = _diag_label("sksave_total")
+    assert "SFF" in used_label or "Autoload" in used_label, used_label
+    assert "SKSAVE" in save_label, save_label

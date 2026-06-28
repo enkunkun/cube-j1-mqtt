@@ -2,7 +2,7 @@
 
 **Feature Branch**: `040-pana-720s-reauth-observation`
 **Created**: 2026-06-28
-**Status**: Phase 1 観察待ち
+**Status**: Phase 1 観察中 (= commit c4a8ac5 / 2026-06-28 03:17 deploy 済、 EVENT 27 観測ツール組み込み完了、 24h cron trigger 待ち = 2026-06-29 03:33 JST 集計)
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-5。 BP35A1 公式 Ver 1.3.2 p.9 で S16 (= PANA セッションライフタイム) のデフォルトは 900 秒、 p.14 で 80% 経過時に PaC が SKREJOIN を自動実行、 つまり接続後 **720 秒 (= 12 分) ごと**に自動再認証が走る。 memory [[feedback-erxudp-timeouts-periodic-pana]] で「erxudp_timeouts 30 件/h baseline + 10-11 分周期」 と観測された周期は、 この自動再認証と一致する仮説あり。
 
 ## Background
