@@ -65,9 +65,6 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # zero でも常時 publish (= skip が機能しているかの観測点)。
         "wopt_write_skipped_total": 0,
         "wopt_write_total": 0,
-        # spec 039: SFF=1 autoload + SKSAVE 永続化 counter (= 0 でも常時 publish)。
-        "sff_autoload_used_total": 0,
-        "sksave_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }

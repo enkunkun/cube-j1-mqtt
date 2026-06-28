@@ -2,7 +2,44 @@
 
 **Feature Branch**: `039-sksave-sff-reconnect-skip`
 **Created**: 2026-06-28
-**Status**: Phase 2 実装中 (= dig 完了 / 2026-06-28 03:25 JST、 決定 3 件確定: SKSAVE タイミング = 起動時 SFF=1 確認 + 必要時のみ SKSAVE / SFF 状態確認 = SKSREG SFF 読み取り / WOPT 統合 = spec 037 独立運用)
+**Status**: **Closed (= 設計前提崩壊で revert) / 2026-06-28 04:00 JST**
+
+## 失敗の根本原因 (= 即時 revert 理由)
+
+公式 BP35A1 Ver 1.3.2 p.36 SKRESET 説明:
+> 「プロトコル・スタックの内部状態を初期化します。 **すべての内部変数が初期値に戻ります**」
+
+bridge は `_wisun_init_sequence` で必ず SKRESET を実行する設計 (= spec 035 reconnect path / spec 017 PANA fail 後の再 init 等で前提)。 SKRESET 後の SFF レジスタは常に 0 で、 SKSAVE 直後に永続化した SFF=1 値は SKRESET で消える = **SFF オートロードは bridge アーキテクチャ上機能しない**。
+
+実機 log (= 2026-06-28 03:57-03:59) で実証:
+- 03:57:20 SFF=0 → set 1 + SKSAVE (= autoload 有効化)
+- 03:58:50 bridge restart 後 **再度 SFF=0 検出** → SKSAVE 再発火
+
+**WOPT (spec 037) との挙動差**: WOPT は「プロダクト設定コマンド (公式 p.41-43 別カテゴリ)」 で SKRESET の「内部変数」 範囲外、 一方 SFF は通常 SKSREG レジスタで SKRESET でクリアされる。 dig 段階で仕様の categorization 違いを見落としていた。
+
+**FLASH 寿命影響 (= revert 必須の根拠)**:
+
+reconnect 30 件/h baseline (= [[feedback-erxudp-timeouts-periodic-pana]]) → 720 件/日 → **13 日で FLASH 書込み 10,000 回到達** = spec 037 WOPT 寿命対策の効果を完全に打ち消す重大 regression。
+
+**Revert 範囲** (= commit ee07949 を c4a8ac5 状態に restore):
+- `production_tool/mqtt_bridge.py`: helper 3 つ (sksreg_read / sksave / sksreg_s2_s3_set_with_skip) + DiagState 拡張 + DIAG_SENSOR_DEFS + _wisun_init_sequence の SFF set + wisun_connect の sksreg_s2_s3_set_with_skip 呼び出し全部削除
+- `tests/unit/test_wisun_health.py`: spec 039 test 9 件削除
+- `tests/unit/test_diag_state.py`: 期待 snapshot dict から sff_autoload_used_total / sksave_total 削除
+- `specs/039-...md`: 本ファイル (= 失敗記録として残置)
+
+**audit findings 連動**: P-NEW-4 status を「Closed (= bridge アーキテクチャ非互換)」 に変更、 spec 039 番号は再利用しない。
+
+**将来の代替案** (= 検討するが新 spec として):
+- (1) SKRESET を skip する起動 path = 既存 spec 017/035 設計と衝突、 非現実的
+- (2) cube-j1 ハード power cycle で SFF オートロード発火 = adb reboot 不可、 物理リセットのみ、 非現実的
+- (3) SKSCAN 結果を bridge memory にキャッシュ = 既に spec 035 SKLL64 cached でカバー済
+- **結論**: SKRESET を介する bridge では SFF=1 永続化機構は使えない、 spec 039 アプローチは物理的に不可能
+
+---
+
+## (以下は revert 前の原本 spec、 失敗の根拠分析として残置)
+
+**Input (= 原本)**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-4。 BP35A1 公式 Ver 1.3.2 p.10/31/32 で SKSAVE/SKLOAD/SFF レジスタによる FLASH 永続化機構が提供されているが、 bridge は SKSAVE/SKLOAD/SFF/S0A を全て未使用 (= grep 0 件)。 memory [[feedback-bp35cx-reconnect-floor-11s]] で確定した reconnect 床値 11s のうち WOPT/SKSREG S2/S3 分の ~6s を SFF=1 オートロードで省略すれば床値 ~5s 達成。
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-4。 BP35A1 公式 Ver 1.3.2 p.10/31/32 で SKSAVE/SKLOAD/SFF レジスタによる FLASH 永続化機構が提供されているが、 bridge は SKSAVE/SKLOAD/SFF/S0A を全て未使用 (= grep 0 件)。 memory [[feedback-bp35cx-reconnect-floor-11s]] で確定した reconnect 床値 11s のうち WOPT/SKSREG S2/S3 分の ~6s を SFF=1 オートロードで省略すれば床値 ~5s 達成。
 
 ## Background
