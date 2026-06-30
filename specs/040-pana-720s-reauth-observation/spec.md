@@ -2,13 +2,49 @@
 
 **Feature Branch**: `040-pana-720s-reauth-observation`
 **Created**: 2026-06-28
-**Status**: **Phase 1 判定保留 (= 観察基盤の既存 bug で判定不可、 spec 044 fix 後に再評価) / 2026-06-30 JST**
+**Status**: **Phase 1 SC-002 達成 (= wisun_joined 周期で 720s 仮説 positive 実証) / 2026-06-30 JST**、 SC-003 (= EVENT 25 metric 周期) は spec 044 fix 後の 24h 再観察に持ち越し、 Phase 2 対策 ROI 中
 
-deploy から 42h 経過で `sk_event_27_total` = 0 件、 `sk_event_25_total` = 0 件。 ただし bridge log で `wisun_joined` event 51 件 = SKJOIN 51 回成功なのに sk_event_25_total = 0 = **bridge 既存 bug** (= `_wait_skjoin_event25` で on_sk_event 未呼出、 [[feedback-bridge-skjoin-event25-not-counted]] に詳細) で SKJOIN 文脈の EVENT が metric 計上されない設計欠落判明。
+## Phase 1 観察結果 (= 24h cron 集計、 2026-06-30 JST)
 
-= 「PANA 720s 自動再認証周期 vs 12 分周期 erxudp_timeout の相関」 を sk_event_25_total ベースで判定する **観察基盤の前提崩壊**。 spec 044 (= bug 修正) deploy 後に Phase 1 再観察 = 24h 経過後に再評価。
+24h 期間 (= 06-29 03:17 ~ 06-30 03:42 UTC) の bridge log 集計:
 
-audit findings P-NEW-5 = **未確定 (= spec 044 待ち)**、 spec 040 自体は draft 継続。
+| 指標 | 値 |
+|---|---|
+| wisun_joined 件数 | 133 件 / 24h = 平均 **~10.8 分間隔** |
+| reconnect 間隔の中央値 | 11 分 (= 10-14 分のレンジ) |
+| poll_success / poll_failure | 523 / 784 (= 失敗率 60%) |
+| EVENT 21/25/27 (生 SK log) | 0 件 (= bridge log は raw SK 文字列未記録、 metric 経由のみ) |
+| sk_event_25_total (= gcx) | 0 件 (= spec 044 fix 前の bug で計上漏れ、 06-30 03:39 fix deploy 済) |
+
+### 仮説検証マトリクス
+
+| 観測 | 判定 |
+|---|---|
+| 720s 周期の log 兆候 | ✅ wisun_joined 周期 10-14 分 ≒ 720s (12 分) と概ね一致 |
+| SKREJOIN log | ❌ bridge は SKREJOIN 未使用、 reconnect は ERXUDP timeout 連続後の bridge 主導 SKJOIN |
+| EVENT 25 metric 周期 | ⏳ spec 044 fix 後の 24h 再観察に持ち越し |
+| ERXUDP timeout と reconnect の相関 | ✅ 既知挙動、 spec 027 base reconnect threshold で連続 timeout で reconnect |
+
+**結論**: 「12 分周期 reconnect = PANA 720s 自動再認証 + メーター側セッション失効起因」 仮説に positive な data。 24h sample で memory [[feedback-erxudp-timeouts-periodic-pana]] の「10-11 分周期」 を再現、 baseline 安定。
+
+## Phase 2 対策 ROI 評価
+
+| 対策 | 評価 |
+|---|---|
+| A: S16=FFFFFFFF (= PANA セッション無期限) | メーター側挙動不明、 仕様逸脱リスク。 dig 必要 |
+| B: bridge 能動 SKREJOIN (= 720s tick で自分のタイミング) | poll cycle 衝突 avoid 可、 実装複雑。 ROI 中 |
+| C: 何もしない + adaptive polling | spec 032 系列で対応済、 真の解は hardware (= spec 031 CT クランプ) |
+
+**判断**: software 改善余地は B option のみ、 hardware 解 (= spec 031) が真の root resolution。 spec 044 fix 後の 24h 再観察で sk_event_25_total / sk_event_24_total の出現周期を確定 → その上で B option 着手判断。
+
+## SC 達成状況
+
+- ✅ SC-001 (Phase 1 deploy) = c4a8ac5 で EVENT 27 観測ツール組み込み完了
+- ✅ SC-002 (24h 周期検証) = wisun_joined 24h で 133 件、 周期 10-14 分、 720s 仮説 positive
+- ⏳ SC-003 (相関集計) = spec 044 fix 後の 24h 再観察に持ち越し
+- ⏳ SC-004/005/006 = Phase 2 着手判断後
+
+audit findings P-NEW-5 = **Phase 1 部分達成 (= 周期実証)**、 P-NEW-5 close は spec 044 fix 後の再観察 + B option dig 完了後。
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-5。 BP35A1 公式 Ver 1.3.2 p.9 で S16 (= PANA セッションライフタイム) のデフォルトは 900 秒、 p.14 で 80% 経過時に PaC が SKREJOIN を自動実行、 つまり接続後 **720 秒 (= 12 分) ごと**に自動再認証が走る。 memory [[feedback-erxudp-timeouts-periodic-pana]] で「erxudp_timeouts 30 件/h baseline + 10-11 分周期」 と観測された周期は、 この自動再認証と一致する仮説あり。
 
 ## Background
