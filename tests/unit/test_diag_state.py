@@ -72,6 +72,9 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "sk_event_21_param0_total": 0,
         "sk_event_21_param1_total": 0,
         "sk_event_21_param2_total": 0,
+        # spec 040 Phase 2a: S17=0 設定 counter (= 0 でも常時 publish)。
+        # last_event_25_seconds は last_event_25_ts=None で omit (= 別 test で検証済)。
+        "s17_off_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }

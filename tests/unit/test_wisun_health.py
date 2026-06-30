@@ -555,3 +555,62 @@ def test_diag_label_sk_event_21_param_exists():
     assert "Success" in p0 or "PARAM=0" in p0, p0
     assert "Fail" in p1 or "PARAM=1" in p1, p1
     assert "Retry" in p2 or "PARAM=2" in p2, p2
+
+
+# ---------------------------------------------------------------------------
+# spec 040 Phase 2a: S17=0 + EVENT 25 ts 観測基盤 (= 能動 SKREJOIN の前段)
+# ---------------------------------------------------------------------------
+# 公式 BP35A1 Ver 1.3.2 S17 (= 自動再認証フラグ、 default=1) を 0 に設定して
+# PaC 側の 720s 自動 SKREJOIN を抑制、 bridge が EVENT 25 経過時間を観測 +
+# 次セッションで main loop が能動 SKREJOIN を発火する (= Phase 2b で実装)。
+# S17 は通常 SKSREG なので SKRESET でクリア (= memory feedback-bp35a1-skreset-clears-sksreg-non-product 通り)、
+# _wisun_init_sequence で毎回再設定の idempotent pattern、 SKSAVE 不要 (= FLASH 寿命影響 0)。
+
+
+def test_on_s17_off_set_increments():
+    """DiagState.on_s17_off_set() で s17_off_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_s17_off_set()
+    diag.on_s17_off_set()
+    snap = diag.snapshot(time.time())
+    assert snap["s17_off_total"] == 2
+
+
+def test_last_event_25_ts_recorded_on_event_25(monkeypatch):
+    """_wait_skjoin_event25 で EVENT 25 受信時に diag_state.last_event_25_ts が now() で set される。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    lines = ["EVENT 25 FE80::1"]
+    monkeypatch.setattr(mb, "serial_readline",
+                        lambda fd, timeout=None: lines.pop(0) if lines else None)
+    _mock_led_and_logger(monkeypatch)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    before = time.time()
+    result = mb._wait_skjoin_event25(_FakeFd([]), pan, "FE80::1",
+                                     timeout=2, diag_state=diag)
+    after = time.time()
+    assert result is True
+    assert diag.last_event_25_ts is not None
+    assert before <= diag.last_event_25_ts <= after
+
+
+def test_last_event_25_seconds_in_snapshot():
+    """DiagState.last_event_25_ts set 時 snapshot に last_event_25_seconds が出る (= now - ts)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = 1500.0
+    snap = diag.snapshot(now=1610.0)
+    assert snap["last_event_25_seconds"] == 110
+
+
+def test_last_event_25_seconds_omitted_when_none():
+    """last_event_25_ts = None なら snapshot から omit (= unknown)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    snap = diag.snapshot(now=1610.0)
+    assert "last_event_25_seconds" not in snap
+
+
+def test_diag_label_s17_off_and_last_event_25():
+    """DIAG_SENSOR_DEFS に spec 040 Phase 2a の 2 件登録確認。"""
+    s17_label = _diag_label("s17_off_total")
+    ts_label = _diag_label("last_event_25_seconds")
+    assert "S17" in s17_label, s17_label
+    assert "EVENT 25" in ts_label or "Last" in ts_label, ts_label

@@ -2,7 +2,67 @@
 
 **Feature Branch**: `040-pana-720s-reauth-observation`
 **Created**: 2026-06-28
-**Status**: **Phase 1 SC-002 達成 (= wisun_joined 周期で 720s 仮説 positive 実証) / 2026-06-30 JST**、 SC-003 (= EVENT 25 metric 周期) は spec 044 fix 後の 24h 再観察に持ち越し、 Phase 2 対策 ROI 中
+**Status**: **Phase 2 設計確定 + 実装中 / 2026-07-01 JST**、 Phase 1 SC-002 達成済 (= wisun_joined 周期で 720s 仮説 positive 実証)、 dig 完了 (= 対策 C + 発火タイミング A + poll skip 採用)
+
+## Phase 2 設計確定 (= dig 2026-07-01 JST)
+
+### dig 決定事項 (= 3 件)
+
+| 確認事項 | 決定 | 理由 |
+|---|---|---|
+| **対策方針** | (C) **S17=0 + bridge 能動 SKREJOIN** | タイミング完全制御、 自動再認証 race 回避。 (B) 先回りは「先回り直後に PaC 自動発火」 競合あり、 (A) S16 max は PAA 仕様逸脱 |
+| **発火タイミング** | **直近 EVENT 25 + 600s 経過 + 次 poll_success 直後 idle** | poll 衝突 0 = 安全側。 600s = 720s (= PAA 80%) より早期、 PAA 自動 termination 前に確実 SKREJOIN |
+| **SKREJOIN 中の poll** | **skip + EVENT 25 待ち** | spec 035 cached path で 7s 想定 = 1 cycle (60s) 中の 7s 停止 = 実害小、 失敗時は既存 reconnect (= pending_wisun_rejoin) path に fallback |
+
+### S17 = SKSREG レジスタ = SKRESET でクリア (= spec 039 教訓踏襲)
+
+S17 は通常の SKSREG レジスタなので公式 BP35A1 Ver 1.3.2 p.36 SKRESET で初期値 (= 1) に戻る (= [[feedback-bp35a1-skreset-clears-sksreg-non-product]])。 bridge 起動毎に `_wisun_init_sequence` で **`SKSREG S17 0` を毎回発行**、 SKSAVE は不要 (= FLASH 寿命影響 0)。
+
+## 実装計画
+
+### bridge 改修
+
+1. `_wisun_init_sequence` 末尾に `SKSREG S17 0` 発行 + DiagState.on_s17_off_set() counter
+2. DiagState 拡張: `last_event_25_ts` (= EVENT 25 受信時に now() set)、 `skrejoin_active` (= bool flag、 main loop の poll skip 判定用)、 `skrejoin_total_count` / `skrejoin_fail_count`、 `s17_off_count`
+3. read_erxudp の EVENT 25 hook (= spec 044 で追加した `on_sk_event("25")`) に **now() 記録** を追加 = `last_event_25_ts = now()`
+4. _wait_skjoin_event25 でも同じ (= SKJOIN 直後の初期 EVENT 25 で ts 記録)
+5. main loop に SKREJOIN tick logic:
+   - 各 cycle 先頭で check: `now - last_event_25_ts > 600s` AND `not skrejoin_active`
+   - 成立 + 直前 poll_success 直後 idle 確認 → SKREJOIN 発火
+   - skrejoin_active = True で poll skip
+   - EVENT 25 待ち = `_wait_skjoin_event25(fd, ..., diag_state)` 流用
+   - 成功で skrejoin_active = False + count inc
+   - 失敗で skrejoin_fail_count + pending_wisun_rejoin = True で既存 reconnect path 発火
+
+### DIAG_SENSOR_DEFS 拡張 (= 5 件)
+
+```python
+("s17_off_total",           "S17 Off Set Count (= PaC auto reauth disabled)",      ...),
+("skrejoin_total",          "SKREJOIN Active Count",                                ...),
+("skrejoin_fail_total",     "SKREJOIN Fail Count",                                  ...),
+("last_event_25_seconds",   "Seconds Since Last EVENT 25",                          "s", None, "measurement", "diagnostic"),
+("skrejoin_active",         "SKREJOIN In Progress",                                 None, None, None, "diagnostic"),
+```
+
+### compose/telegraf.conf 拡張 (= CLAUDE.md ルール遵守)
+
+5 件 metric topic 同時追加。
+
+### regression test
+
+- `_wisun_init_sequence` で S17=0 発行確認
+- DiagState.on_s17_off_set() / on_skrejoin_active() / on_skrejoin_success() / on_skrejoin_fail() counter
+- last_event_25_ts 設定 = read_erxudp EVENT 25 / _wait_skjoin_event25 経由
+- main loop SKREJOIN tick logic は integration 寄り、 deploy 後 admin UI 確認に委ねる
+
+## SC
+
+- **SC-001 (Phase 2 設計)**: ✅ dig 完了、 対策 C 確定
+- **SC-002 (実装)**: TDD pass + ruff
+- **SC-003 (deploy)**: bridge `/api/diag` で `s17_off_total ≥ 1` + `last_event_25_seconds < 700` 確認
+- **SC-004 (動作実証)**: 24h で `skrejoin_total ≥ 100` (= 平均 12 分間隔 = 24h で 120 件、 ±20% で許容)
+- **SC-005 (gap 解消)**: 24h で wisun_joined 件数が 133 件 → ~10 件以下に低下 (= reconnect の大半が能動 SKREJOIN に置換)
+- **SC-006 (gap 時間)**: Grafana で power_w の visual gap 時間中央値が 30-60s → 10s 以下に短縮
 
 ## Phase 1 観察結果 (= 24h cron 集計、 2026-06-30 JST)
 

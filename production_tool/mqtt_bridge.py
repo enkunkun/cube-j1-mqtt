@@ -2324,6 +2324,10 @@ class DiagState(object):
         # spec 038 Phase 2: EVENT 21 (= TX Result Notification) PARAM 別 count。
         # PARAM=0 成功 / 1 失敗 (= CSMA/ARIB/Ack) / 2 自動再送、 公式 p.51。
         self.sk_event_21_param_counts = [0, 0, 0]
+        # spec 040 Phase 2a: S17=0 (= PaC 自動再認証抑制) 設定回数 + 直近 EVENT 25
+        # 受信 epoch ts (= 能動 SKREJOIN tick の base time、 None で未受信)。
+        self.s17_off_count = 0
+        self.last_event_25_ts = None
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2486,6 +2490,10 @@ class DiagState(object):
         if isinstance(param, int) and 0 <= param <= 2:
             self.sk_event_21_param_counts[param] += 1
 
+    def on_s17_off_set(self):
+        """spec 040 Phase 2a: SKSREG S17 0 発行 (= PaC 自動再認証抑制) 時に発火。"""
+        self.s17_off_count += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2638,6 +2646,12 @@ class DiagState(object):
         out["sk_event_21_param0_total"] = self.sk_event_21_param_counts[0]
         out["sk_event_21_param1_total"] = self.sk_event_21_param_counts[1]
         out["sk_event_21_param2_total"] = self.sk_event_21_param_counts[2]
+        # spec 040 Phase 2a: S17=0 設定 counter (= 起動毎に 1 件以上) +
+        # 直近 EVENT 25 経過秒 (= Phase 2b 能動 SKREJOIN tick の判定 base)。
+        # last_event_25_ts が None (= 未受信 = bridge 起動直後) なら omit。
+        out["s17_off_total"] = self.s17_off_count
+        if self.last_event_25_ts is not None:
+            out["last_event_25_seconds"] = int(now - self.last_event_25_ts)
         return out
 
 # ---------------------------------------------------------------------------
@@ -2975,6 +2989,18 @@ def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
         if diag_state is not None:
             diag_state.on_wopt_write()
 
+    # spec 040 Phase 2a: S17=0 (= PaC 自動再認証抑制) を毎回発行。 S17 は通常
+    # SKSREG レジスタで SKRESET でクリアされる ([[feedback-bp35a1-skreset-clears-sksreg-non-product]])、
+    # SKSAVE は不要 (= 揮発で OK、 FLASH 寿命影響 0)。 Phase 2b で main loop が
+    # 能動 SKREJOIN を発火するための前提設定。
+    try:
+        skcommand(fd, "SKSREG S17 0")
+        if diag_state is not None:
+            diag_state.on_s17_off_set()
+        log("S17=0 set (= PaC auto reauth disabled、 spec 040 Phase 2a)")
+    except Exception as e:
+        log("SKSREG S17 0 failed ({}), continue (= 自動再認証は default S17=1 で継続)".format(e))
+
 
 def _wait_skjoin_event25(fd, pan, ipv6, timeout, diag_state=None):
     """spec 035: SKJOIN 発行後の EVENT 25/24 待ち loop を helper 化。
@@ -3008,6 +3034,9 @@ def _wait_skjoin_event25(fd, pan, ipv6, timeout, diag_state=None):
                 if diag_state is not None:
                     try:
                         diag_state.on_sk_event("25")
+                        # spec 040 Phase 2a: 直近 EVENT 25 受信 ts を記録
+                        # (= 能動 SKREJOIN tick の base time)。
+                        diag_state.last_event_25_ts = time.time()
                     except Exception as e:
                         log("diag on_sk_event(25) error: {}".format(e))
                 return True
@@ -3547,6 +3576,11 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                                 diag_state.on_sk_event_21_param(int(parts[3]))
                             except (ValueError, IndexError):
                                 pass
+                    # spec 040 Phase 2a: ERXUDP wait 中の EVENT 25 (= SKREJOIN
+                    # 成功通知 or PAA 側からの再認証完了通知) も last_event_25_ts
+                    # を更新、 main loop の能動 SKREJOIN tick base time として使用。
+                    if value == "25":
+                        diag_state.last_event_25_ts = time.time()
                 except Exception as e:
                     log("diag on_sk_event error: {}".format(e))
             continue
@@ -4095,6 +4129,9 @@ DIAG_SENSOR_DEFS = [
     ("sk_event_21_param0_total", "SK EVENT 21 PARAM=0 (TX Success)",                    None, None, "total_increasing", "diagnostic"),
     ("sk_event_21_param1_total", "SK EVENT 21 PARAM=1 (TX Fail = CSMA/ARIB/Ack)",       None, None, "total_increasing", "diagnostic"),
     ("sk_event_21_param2_total", "SK EVENT 21 PARAM=2 (TX Auto-Retry)",                 None, None, "total_increasing", "diagnostic"),
+    # spec 040 Phase 2a: S17=0 設定 + 直近 EVENT 25 経過秒 (= 能動 SKREJOIN tick base、 BP35A1 Ver 1.3.2 p.9)。
+    ("s17_off_total",            "S17 Off Set Count (= PaC auto reauth disabled)",      None, None, "total_increasing", "diagnostic"),
+    ("last_event_25_seconds",    "Seconds Since Last EVENT 25",                         "s",  None, "measurement",      "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
