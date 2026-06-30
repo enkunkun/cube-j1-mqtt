@@ -614,3 +614,124 @@ def test_diag_label_s17_off_and_last_event_25():
     ts_label = _diag_label("last_event_25_seconds")
     assert "S17" in s17_label, s17_label
     assert "EVENT 25" in ts_label or "Last" in ts_label, ts_label
+
+
+# ---------------------------------------------------------------------------
+# spec 040 Phase 2b: main loop 能動 SKREJOIN tick logic
+# ---------------------------------------------------------------------------
+# Phase 2a で S17=0 + last_event_25_ts 観測基盤を deploy 済、 Phase 2b で
+# main loop の poll_success 完了後に「直近 EVENT 25 から SKREJOIN_TICK_SECONDS
+# (= 600s) 経過 + skrejoin_active False」 条件成立で能動 SKREJOIN 発火。
+# SKREJOIN は skcommand 発行 → _wait_skjoin_event25 で EVENT 25 待ち、 成功で
+# counter inc + last_event_25_ts 自動更新 (= spec 044 hook 経由)、 失敗で
+# pending_wisun_rejoin = True で既存 reconnect path に fallback。
+
+
+def test_skrejoin_active_initial_false():
+    """DiagState.skrejoin_active の初期値は False。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    assert diag.skrejoin_active is False
+
+
+def test_on_skrejoin_success_increments():
+    """DiagState.on_skrejoin_success() で skrejoin_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_skrejoin_success()
+    diag.on_skrejoin_success()
+    snap = diag.snapshot(time.time())
+    assert snap["skrejoin_total"] == 2
+
+
+def test_on_skrejoin_fail_increments():
+    """DiagState.on_skrejoin_fail() で skrejoin_fail_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_skrejoin_fail()
+    snap = diag.snapshot(time.time())
+    assert snap["skrejoin_fail_total"] == 1
+
+
+def test_diag_label_skrejoin_exists():
+    """DIAG_SENSOR_DEFS に spec 040 Phase 2b の 2 件登録確認。"""
+    total = _diag_label("skrejoin_total")
+    fail = _diag_label("skrejoin_fail_total")
+    assert "SKREJOIN" in total, total
+    assert "SKREJOIN" in fail or "Fail" in fail, fail
+
+
+def test_skrejoin_tick_success(monkeypatch):
+    """skrejoin_tick 成功 path: skcommand + EVENT 25 受信で skrejoin_total inc。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = time.time() - 700  # 700s 経過
+    skcommand_calls = []
+    monkeypatch.setattr(mb, "skcommand",
+                        lambda fd, cmd, **kw: skcommand_calls.append(cmd))
+    monkeypatch.setattr(mb, "_wait_skjoin_event25",
+                        lambda fd, pan, ipv6, timeout, diag_state=None: True)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    result = mb.skrejoin_tick(_FakeFd([]), diag, pan, "FE80::1")
+    assert result is True
+    assert "SKREJOIN" in skcommand_calls
+    assert diag.skrejoin_count == 1
+    assert diag.skrejoin_fail_count == 0
+    assert diag.skrejoin_active is False  # finally で False に戻る
+    assert diag.pending_wisun_rejoin is False
+
+
+def test_skrejoin_tick_fail_event25_timeout(monkeypatch):
+    """skrejoin_tick 失敗 path: _wait_skjoin_event25 が False で fallback 発動。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = time.time() - 700
+    monkeypatch.setattr(mb, "skcommand", lambda fd, cmd, **kw: None)
+    monkeypatch.setattr(mb, "_wait_skjoin_event25",
+                        lambda fd, pan, ipv6, timeout, diag_state=None: False)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    result = mb.skrejoin_tick(_FakeFd([]), diag, pan, "FE80::1")
+    assert result is False
+    assert diag.skrejoin_count == 0
+    assert diag.skrejoin_fail_count == 1
+    assert diag.skrejoin_active is False
+    assert diag.pending_wisun_rejoin is True  # fallback で既存 reconnect 起動
+
+
+def test_skrejoin_tick_fail_exception(monkeypatch):
+    """skrejoin_tick 例外 path: skcommand が throw でも fail counter + fallback。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = time.time() - 700
+    def raise_exc(fd, cmd, **kw):
+        raise RuntimeError("skcommand failed")
+    monkeypatch.setattr(mb, "skcommand", raise_exc)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    result = mb.skrejoin_tick(_FakeFd([]), diag, pan, "FE80::1")
+    assert result is False
+    assert diag.skrejoin_fail_count == 1
+    assert diag.skrejoin_active is False
+    assert diag.pending_wisun_rejoin is True
+
+
+def test_should_fire_skrejoin_below_threshold():
+    """should_fire_skrejoin: last_event_25 から 300s なら False (= 600s threshold 未満)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = time.time() - 300
+    assert mb.should_fire_skrejoin(diag, time.time()) is False
+
+
+def test_should_fire_skrejoin_above_threshold():
+    """should_fire_skrejoin: last_event_25 から 650s なら True (= 600s threshold 超過)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = time.time() - 650
+    assert mb.should_fire_skrejoin(diag, time.time()) is True
+
+
+def test_should_fire_skrejoin_active_already():
+    """should_fire_skrejoin: skrejoin_active=True なら False (= 二重発火防止)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.last_event_25_ts = time.time() - 700
+    diag.skrejoin_active = True
+    assert mb.should_fire_skrejoin(diag, time.time()) is False
+
+
+def test_should_fire_skrejoin_no_event_25_yet():
+    """should_fire_skrejoin: last_event_25_ts=None なら False (= 起動直後等)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    assert diag.last_event_25_ts is None
+    assert mb.should_fire_skrejoin(diag, time.time()) is False

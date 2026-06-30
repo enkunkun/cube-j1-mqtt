@@ -2328,6 +2328,11 @@ class DiagState(object):
         # 受信 epoch ts (= 能動 SKREJOIN tick の base time、 None で未受信)。
         self.s17_off_count = 0
         self.last_event_25_ts = None
+        # spec 040 Phase 2b: 能動 SKREJOIN 発火 / 失敗回数 + 発火中 flag
+        # (= main loop poll skip 判定、 二重発火防止)。
+        self.skrejoin_count = 0
+        self.skrejoin_fail_count = 0
+        self.skrejoin_active = False
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2494,6 +2499,15 @@ class DiagState(object):
         """spec 040 Phase 2a: SKSREG S17 0 発行 (= PaC 自動再認証抑制) 時に発火。"""
         self.s17_off_count += 1
 
+    def on_skrejoin_success(self):
+        """spec 040 Phase 2b: 能動 SKREJOIN 成功時 (= EVENT 25 受信) に発火。"""
+        self.skrejoin_count += 1
+
+    def on_skrejoin_fail(self):
+        """spec 040 Phase 2b: 能動 SKREJOIN 失敗時 (= EVENT 24 / timeout / exception)
+        に発火、 既存 reconnect path に fallback (= pending_wisun_rejoin=True)。"""
+        self.skrejoin_fail_count += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2652,6 +2666,10 @@ class DiagState(object):
         out["s17_off_total"] = self.s17_off_count
         if self.last_event_25_ts is not None:
             out["last_event_25_seconds"] = int(now - self.last_event_25_ts)
+        # spec 040 Phase 2b: 能動 SKREJOIN 発火 / 失敗 counter (= 常時 publish、
+        # 0 でも reconnect 経由 reauth が支配的なケースの観測点)。
+        out["skrejoin_total"] = self.skrejoin_count
+        out["skrejoin_fail_total"] = self.skrejoin_fail_count
         return out
 
 # ---------------------------------------------------------------------------
@@ -3000,6 +3018,62 @@ def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
         log("S17=0 set (= PaC auto reauth disabled、 spec 040 Phase 2a)")
     except Exception as e:
         log("SKSREG S17 0 failed ({}), continue (= 自動再認証は default S17=1 で継続)".format(e))
+
+
+# spec 040 Phase 2b: 能動 SKREJOIN 発火の threshold (= last EVENT 25 からの経過秒)。
+# 公式 BP35A1 Ver 1.3.2 p.14 で「PaC は PAA が指定したセッションライフタイムの
+# 80% (= 720s) で自動的に SKREJOIN を実行」 = PAA セッション終了要請発火前に
+# 確実に再認証完了させるため 600s = 安全マージン 120s で設定。
+SKREJOIN_TICK_SECONDS = 600
+
+
+def should_fire_skrejoin(diag_state, now):
+    """spec 040 Phase 2b: 能動 SKREJOIN 発火条件判定。
+
+    条件: last_event_25_ts は記録済 (= 初回 SKJOIN 後) AND 経過秒が
+    SKREJOIN_TICK_SECONDS を超過 AND 既存 skrejoin_active=False (= 二重発火防止)。
+    main loop の poll_success 直後で判定 → True なら skrejoin_tick 発火。
+    """
+    if diag_state.last_event_25_ts is None:
+        return False
+    if diag_state.skrejoin_active:
+        return False
+    return (now - diag_state.last_event_25_ts) > SKREJOIN_TICK_SECONDS
+
+
+def skrejoin_tick(fd, diag_state, pan, ipv6):
+    """spec 040 Phase 2b: 能動 SKREJOIN 発火 + EVENT 25 待ち。
+
+    SKREJOIN 公式仕様 (= BP35A1 Ver 1.3.2 p.14): SKJOIN 後の任意のタイミングで
+    再認証を発行可能、 成功で暗号キー + セッションライフタイム更新。 失敗時は
+    既存 reconnect path に fallback (= pending_wisun_rejoin=True、 main loop が
+    次 cycle で wisun_connect 再実行)。
+
+    diag_state.skrejoin_active を try/finally で必ず False 復帰 (= 例外でも
+    flag が True で stuck しないよう保証)。 成功で last_event_25_ts は
+    _wait_skjoin_event25 hook 経由で自動更新済。
+    """
+    diag_state.skrejoin_active = True
+    try:
+        elapsed = int(time.time() - diag_state.last_event_25_ts)
+        log("能動 SKREJOIN 発火 (last_event_25_seconds={})".format(elapsed))
+        skcommand(fd, "SKREJOIN", timeout=2)
+        if _wait_skjoin_event25(fd, pan, ipv6, timeout=30, diag_state=diag_state):
+            diag_state.on_skrejoin_success()
+            log("能動 SKREJOIN 成功")
+            return True
+        else:
+            diag_state.on_skrejoin_fail()
+            diag_state.pending_wisun_rejoin = True
+            log("能動 SKREJOIN 失敗 (= EVENT 24 or timeout)、 既存 reconnect path に fallback")
+            return False
+    except Exception as e:
+        diag_state.on_skrejoin_fail()
+        diag_state.pending_wisun_rejoin = True
+        log("能動 SKREJOIN 例外 ({}), 既存 reconnect path に fallback".format(e))
+        return False
+    finally:
+        diag_state.skrejoin_active = False
 
 
 def _wait_skjoin_event25(fd, pan, ipv6, timeout, diag_state=None):
@@ -4132,6 +4206,9 @@ DIAG_SENSOR_DEFS = [
     # spec 040 Phase 2a: S17=0 設定 + 直近 EVENT 25 経過秒 (= 能動 SKREJOIN tick base、 BP35A1 Ver 1.3.2 p.9)。
     ("s17_off_total",            "S17 Off Set Count (= PaC auto reauth disabled)",      None, None, "total_increasing", "diagnostic"),
     ("last_event_25_seconds",    "Seconds Since Last EVENT 25",                         "s",  None, "measurement",      "diagnostic"),
+    # spec 040 Phase 2b: 能動 SKREJOIN 発火 / 失敗 counter (= BP35A1 Ver 1.3.2 p.14、 720s reauth 衝突回避)。
+    ("skrejoin_total",           "SKREJOIN Active Count",                               None, None, "total_increasing", "diagnostic"),
+    ("skrejoin_fail_total",      "SKREJOIN Fail Count (= fallback to reconnect)",       None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
@@ -4662,6 +4739,23 @@ def main():
                         diag_state.on_poll_success(now)
                     except Exception as e:
                         log("diag on_poll_success error: {}".format(e))
+                    # spec 040 Phase 2b: poll_success 直後 idle で能動 SKREJOIN
+                    # 判定 (= last EVENT 25 から SKREJOIN_TICK_SECONDS 超過)、
+                    # 成立で SKREJOIN 発火 + EVENT 25 待ち。 失敗時は
+                    # pending_wisun_rejoin=True で次 cycle の reconnect path に
+                    # fallback。 cached pan info は diag_state から組み立て。
+                    if cfg.get("skrejoin_tick_enabled", True) and \
+                            should_fire_skrejoin(diag_state, time.time()):
+                        try:
+                            _pan = {
+                                "Pan ID": diag_state.pan_id,
+                                "Channel": "{:02X}".format(diag_state.pan_channel)
+                                if diag_state.pan_channel is not None else None,
+                                "Addr": diag_state.mac,
+                            }
+                            skrejoin_tick(fd, diag_state, _pan, ipv6)
+                        except Exception as e:
+                            log("skrejoin_tick exception ({}), continue main loop".format(e))
                 else:
                     emit_poll_failure(LOGGER, reason="erxudp_timeout")
                     try:
