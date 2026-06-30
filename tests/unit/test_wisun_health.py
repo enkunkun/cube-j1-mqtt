@@ -417,3 +417,61 @@ def test_diag_label_wopt_skipped_exists():
     write_label = _diag_label("wopt_write_total")
     assert "Skipped" in skipped_label or "skip" in skipped_label.lower(), skipped_label
     assert "WOPT" in write_label, write_label
+
+
+# ---------------------------------------------------------------------------
+# spec 044: _wait_skjoin_event25 で EVENT 25/24 を on_sk_event に渡す
+# ---------------------------------------------------------------------------
+# spec 035 で抽出された _wait_skjoin_event25 が spec 006 の on_sk_event hook を
+# 踏襲せず、 SKJOIN 文脈で発火する EVENT 25/24 が metric 計上対象外だった
+# (= 2026-06-30 spec 038/040 Phase 1 観察で発見、 sk_event_25_total = 0 件 vs
+# wisun_joined log 51 件の不一致が証拠)。 spec 044 で diag_state 引数追加 +
+# EVENT 25/24 受信時に on_sk_event を呼ぶ修正。
+
+
+def _mock_led_and_logger(monkeypatch):
+    """spec 044 test 用 LED + threading + LOGGER の no-op mock。"""
+    monkeypatch.setattr(mb, "led_read", lambda: (0, 0, 0))
+    monkeypatch.setattr(mb, "led_rgb", lambda r, g, b: None)
+    monkeypatch.setattr(mb, "_led_blink", lambda *args: None)
+    monkeypatch.setattr(mb, "LOGGER", None)
+
+
+def test_wait_skjoin_event25_calls_on_sk_event_on_event_25(monkeypatch):
+    """spec 044: SKJOIN 成功時の EVENT 25 で diag_state.on_sk_event('25') を呼ぶ。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    lines = ["EVENT 25 FE80::1"]
+    monkeypatch.setattr(mb, "serial_readline",
+                        lambda fd, timeout=None: lines.pop(0) if lines else None)
+    _mock_led_and_logger(monkeypatch)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    result = mb._wait_skjoin_event25(_FakeFd([]), pan, "FE80::1",
+                                     timeout=2, diag_state=diag)
+    assert result is True
+    assert diag.sk_event_counts.get("25") == 1
+
+
+def test_wait_skjoin_event25_calls_on_sk_event_on_event_24(monkeypatch):
+    """spec 044: PANA failure 時の EVENT 24 で diag_state.on_sk_event('24') を呼ぶ。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    lines = ["EVENT 24 FE80::1"]
+    monkeypatch.setattr(mb, "serial_readline",
+                        lambda fd, timeout=None: lines.pop(0) if lines else None)
+    _mock_led_and_logger(monkeypatch)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    result = mb._wait_skjoin_event25(_FakeFd([]), pan, "FE80::1",
+                                     timeout=2, diag_state=diag)
+    assert result is False
+    assert diag.sk_event_counts.get("24") == 1
+
+
+def test_wait_skjoin_event25_diag_state_none_safe(monkeypatch):
+    """spec 044: diag_state=None でも既存挙動互換 (= 例外なく動く)。"""
+    lines = ["EVENT 25 FE80::1"]
+    monkeypatch.setattr(mb, "serial_readline",
+                        lambda fd, timeout=None: lines.pop(0) if lines else None)
+    _mock_led_and_logger(monkeypatch)
+    pan = {"Pan ID": "D4E3", "Channel": "27", "Addr": "001C64000B03D4E3"}
+    # diag_state 省略 (= 既存呼出 spec 035 互換)
+    result = mb._wait_skjoin_event25(_FakeFd([]), pan, "FE80::1", timeout=2)
+    assert result is True

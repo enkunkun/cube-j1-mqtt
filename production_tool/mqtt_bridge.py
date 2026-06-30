@@ -2918,13 +2918,17 @@ def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
             diag_state.on_wopt_write()
 
 
-def _wait_skjoin_event25(fd, pan, ipv6, timeout):
+def _wait_skjoin_event25(fd, pan, ipv6, timeout, diag_state=None):
     """spec 035: SKJOIN 発行後の EVENT 25/24 待ち loop を helper 化。
 
     戻り値: True (= EVENT 25 接続成功) / False (= EVENT 24 PANA fail or
     timeout = 呼出側で fallback or raise 判定)。 LED blink 副作用込み。
     cached path = timeout=30 (= 早諦め fallback)、 full path = timeout=90
     (= 既存挙動互換)。
+
+    spec 044: diag_state を受け取り、 EVENT 25/24 受信時に on_sk_event を呼ぶ
+    (= spec 006 metric 観測 hook を SKJOIN 文脈にも反映、 spec 035 抽出時に
+    漏れていた hook の補填)。 diag_state=None で既存呼出互換。
     """
     orig_led = led_read()
     stop_event = threading.Event()
@@ -2943,11 +2947,21 @@ def _wait_skjoin_event25(fd, pan, ipv6, timeout):
                     emit_wisun_joined(LOGGER, pan=pan, ipv6=ipv6)
                 else:
                     log("SKJOIN: connected")
+                if diag_state is not None:
+                    try:
+                        diag_state.on_sk_event("25")
+                    except Exception as e:
+                        log("diag on_sk_event(25) error: {}".format(e))
                 return True
             if "EVENT 24" in line:
                 if LOGGER is not None:
                     emit_wisun_join_failed(LOGGER,
                                            reason="PANA authentication failed (EVENT 24)")
+                if diag_state is not None:
+                    try:
+                        diag_state.on_sk_event("24")
+                    except Exception as e:
+                        log("diag on_sk_event(24) error: {}".format(e))
                 return False
         return False  # timeout
     finally:
@@ -2996,7 +3010,8 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
                 serial_write(fd, "SKJOIN {}\r\n".format(cached_ipv6))
                 cached_pan = {"Channel": ch_hex, "Pan ID": cached_pid,
                               "Addr": cached_mac}
-                if _wait_skjoin_event25(fd, cached_pan, cached_ipv6, timeout=30):
+                if _wait_skjoin_event25(fd, cached_pan, cached_ipv6,
+                                        timeout=30, diag_state=diag_state):
                     cached_succeeded = True
             except Exception as e:
                 log("SKJOIN cached path raised: {} - falling back".format(e))
@@ -3076,7 +3091,7 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
     log("SKJOIN {}".format(ipv6))
     serial_write(fd, "SKJOIN {}\r\n".format(ipv6))
 
-    if _wait_skjoin_event25(fd, pan, ipv6, timeout=90):
+    if _wait_skjoin_event25(fd, pan, ipv6, timeout=90, diag_state=diag_state):
         if diag_state is not None:
             try:
                 diag_state.on_skjoin_success()  # spec 035: reset failure counter
