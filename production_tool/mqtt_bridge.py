@@ -2318,6 +2318,9 @@ class DiagState(object):
         # spec 037: WOPT FLASH 書込み寿命対策 (= ROPT 確認で WOPT skip)。
         self.wopt_skip_count = 0
         self.wopt_write_count = 0
+        # spec 042: SKADDNBR (= IP 層ネイバーキャッシュ登録) 発行成功 / 失敗回数。
+        self.skaddnbr_count = 0
+        self.skaddnbr_fail_count = 0
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2465,6 +2468,14 @@ class DiagState(object):
     def on_wopt_write(self):
         self.wopt_write_count += 1
 
+    def on_skaddnbr_success(self):
+        """spec 042: SKADDNBR (= IP 層ネイバーキャッシュ登録) 発行成功時に発火。"""
+        self.skaddnbr_count += 1
+
+    def on_skaddnbr_fail(self):
+        """spec 042: SKADDNBR 発行失敗時に発火 (= 安全側 continue、 観測点)。"""
+        self.skaddnbr_fail_count += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2608,6 +2619,10 @@ class DiagState(object):
         # 機能しているかを観測可能にするため、 zero-omit pattern からは外す)。
         out["wopt_write_skipped_total"] = self.wopt_skip_count
         out["wopt_write_total"] = self.wopt_write_count
+        # spec 042: SKADDNBR 発行 counter。 同じく 0 でも常時 publish (= deploy
+        # 後すぐに発行件数 > 0 となることが期待される観測点)。
+        out["skaddnbr_total"] = self.skaddnbr_count
+        out["skaddnbr_fail_total"] = self.skaddnbr_fail_count
         return out
 
 # ---------------------------------------------------------------------------
@@ -2719,6 +2734,34 @@ def skcommand(fd, cmd, timeout=10):
         t.join(timeout=1)
         led_rgb(*orig_led)
     return lines
+
+
+def _add_neighbor_cache(fd, ipv6, mac, diag_state=None):
+    """spec 042: SKADDNBR で IP 層ネイバーキャッシュに Reachable 状態で登録。
+
+    公式 BP35A1 Ver 1.3.2 p.29: 「指定した IPv6 アドレスと MAC アドレス情報を
+    IP 層のネイバーキャッシュに Reachable 状態で登録、 アドレス要請を省略して
+    直接 IP パケットを出力」。 SKJOIN 成功直後に呼ぶことで初回 SKSENDTO の
+    Neighbor Solicitation (= 1-2s 追加) を省略する。 失敗時は安全側 continue
+    (= 次の SKSENDTO は通常 Neighbor Solicitation で解決)、 throw しない。
+    SKRESET でクリアされる L3 ネイバーキャッシュなので毎回 SKJOIN 後に再登録
+    する揮発前提設計、 spec 039 SKSAVE のような構造的問題なし。
+    """
+    try:
+        skcommand(fd, "SKADDNBR {} {}".format(ipv6, mac))
+        log("SKADDNBR OK ({} {})".format(ipv6, mac))
+        if diag_state is not None:
+            try:
+                diag_state.on_skaddnbr_success()
+            except Exception as e:
+                log("diag on_skaddnbr_success error: {}".format(e))
+    except Exception as e:
+        log("SKADDNBR failed ({}), continue".format(e))
+        if diag_state is not None:
+            try:
+                diag_state.on_skaddnbr_fail()
+            except Exception as e2:
+                log("diag on_skaddnbr_fail error: {}".format(e2))
 
 
 def ropt(fd, timeout=3):
@@ -3023,6 +3066,8 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
                         diag_state.on_wisun_reconnect_cached_skjoin()
                     except Exception as e:
                         log("diag on_skjoin_success error: {}".format(e))
+                # spec 042: SKJOIN 成功後 SKADDNBR で初回 SKSENDTO 1-2s 短縮。
+                _add_neighbor_cache(fd, cached_ipv6, cached_mac, diag_state)
                 return cached_ipv6
 
             # cached path 失敗 → counter + invalidate + re-init for clean state
@@ -3097,6 +3142,8 @@ def wisun_connect(fd, br_id, br_pwd, prefer_known_channel=False,
                 diag_state.on_skjoin_success()  # spec 035: reset failure counter
             except Exception as e:
                 log("diag on_skjoin_success error: {}".format(e))
+        # spec 042: SKJOIN 成功後 SKADDNBR で初回 SKSENDTO 1-2s 短縮。
+        _add_neighbor_cache(fd, ipv6, mac, diag_state)
         return ipv6
     # EVENT 24 PANA fail or timeout
     raise RuntimeError("SKJOIN: PANA authentication failed or timeout")
@@ -4014,6 +4061,9 @@ DIAG_SENSOR_DEFS = [
     # spec 037: WOPT FLASH 書込み寿命 10,000 回制限対策の観測点 (= BP35A1 Ver 1.3.2 p.41)。
     ("wopt_write_skipped_total", "WOPT Write Skipped (= FLASH 寿命対策)",               None, None, "total_increasing", "diagnostic"),
     ("wopt_write_total",         "WOPT Write Count",                                    None, None, "total_increasing", "diagnostic"),
+    # spec 042: SKADDNBR で IP 層ネイバーキャッシュ登録 (= BP35A1 Ver 1.3.2 p.29、 初回 SKSENDTO 1-2s 短縮)。
+    ("skaddnbr_total",           "SKADDNBR Neighbor Cache Add",                         None, None, "total_increasing", "diagnostic"),
+    ("skaddnbr_fail_total",      "SKADDNBR Fail Count",                                 None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),

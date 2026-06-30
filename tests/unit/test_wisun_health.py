@@ -475,3 +475,38 @@ def test_wait_skjoin_event25_diag_state_none_safe(monkeypatch):
     # diag_state 省略 (= 既存呼出 spec 035 互換)
     result = mb._wait_skjoin_event25(_FakeFd([]), pan, "FE80::1", timeout=2)
     assert result is True
+
+
+# ---------------------------------------------------------------------------
+# spec 042: SKADDNBR で IP 層ネイバーキャッシュ登録 = 初回 SKSENDTO 1-2s 短縮
+# ---------------------------------------------------------------------------
+# 公式 BP35A1 Ver 1.3.2 p.29 で SKADDNBR は「指定した IPv6 アドレスと MAC
+# アドレスを IP 層のネイバーキャッシュに Reachable 状態で登録、 アドレス要請を
+# 省略して直接 IP パケットを出力」 と明示。 bridge は SKJOIN 後に毎回打つ揮発
+# 前提で、 spec 039 のような SKRESET クリア問題なし。 DiagState で発行成功 /
+# 失敗回数を counter 化、 SKADDNBR 自体は skcommand 直接呼出で OK ("OK"/"FAIL")。
+
+
+def test_on_skaddnbr_success_increments():
+    """DiagState.on_skaddnbr_success() で skaddnbr_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_skaddnbr_success()
+    diag.on_skaddnbr_success()
+    snap = diag.snapshot(time.time())
+    assert snap["skaddnbr_total"] == 2
+
+
+def test_on_skaddnbr_fail_increments():
+    """DiagState.on_skaddnbr_fail() で skaddnbr_fail_total が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_skaddnbr_fail()
+    snap = diag.snapshot(time.time())
+    assert snap["skaddnbr_fail_total"] == 1
+
+
+def test_diag_label_skaddnbr_exists():
+    """spec 042: skaddnbr_total / skaddnbr_fail_total の DIAG_SENSOR_DEFS 登録確認。"""
+    total_label = _diag_label("skaddnbr_total")
+    fail_label = _diag_label("skaddnbr_fail_total")
+    assert "SKADDNBR" in total_label or "Neighbor" in total_label, total_label
+    assert "SKADDNBR" in fail_label or "Fail" in fail_label, fail_label

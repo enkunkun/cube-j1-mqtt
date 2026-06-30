@@ -2,7 +2,7 @@
 
 **Feature Branch**: `042-skaddnbr-neighbor-cache`
 **Created**: 2026-06-28
-**Status**: Draft
+**Status**: Phase 2 Implemented (= 2026-06-30 JST、 commit 完了、 cube-j1 adb 接続不可 (= 物理 power cycle 待ち) で deploy 保留中、 user 復旧確認後に spec 044 と同梱 deploy 予定)
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-8。 BP35A1 公式 Ver 1.3.2 p.29 で SKADDNBR は「IP 層のネイバーキャッシュに Reachable 状態で登録、 アドレス要請を省略して直接 IP パケットを出力」 と明示されているが、 bridge は未使用 (= grep 0 件)。 初回 SKSENDTO で Neighbor Solicitation が発生し 1-2s 追加。
 
 ## Background
