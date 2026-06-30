@@ -735,3 +735,60 @@ def test_should_fire_skrejoin_no_event_25_yet():
     diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
     assert diag.last_event_25_ts is None
     assert mb.should_fire_skrejoin(diag, time.time()) is False
+
+
+# ---------------------------------------------------------------------------
+# spec 046: current_r_a (= 0xE8) 救済 frame backfill 拡張 (= spec 028 pattern)
+# ---------------------------------------------------------------------------
+# spec 028 (= power_w / 0xE7) と同 ERXUDP フレームに含まれる 0xE8 (= 瞬時電流)
+# を別 counter + 別 topic で backfill 化、 Grafana で current_r_a の visual gap
+# も power_w 同様に救済点でプロット可能化。 publish_recovery_backfill helper
+# (= 既存) を counter_attr 指定で再利用、 RECOVERY_BACKFILL_KEYS は変更せず
+# 新 CURRENT_BACKFILL_KEYS を別 frozenset で追加する pattern (= spec 029 と同形)。
+
+
+def test_current_backfill_keys_defined():
+    """spec 046: CURRENT_BACKFILL_KEYS が current_r_a / current_t_a を含む。"""
+    assert hasattr(mb, "CURRENT_BACKFILL_KEYS")
+    assert "current_r_a" in mb.CURRENT_BACKFILL_KEYS
+    assert "current_t_a" in mb.CURRENT_BACKFILL_KEYS
+
+
+def test_recovery_backfill_keys_unchanged():
+    """spec 046 で RECOVERY_BACKFILL_KEYS (= spec 028) は変更しない (= backward compat)。"""
+    assert mb.RECOVERY_BACKFILL_KEYS == frozenset(("power_w",))
+
+
+def test_current_r_a_recovered_backfill_count_initial_zero():
+    """DiagState.current_r_a_recovered_backfill_count の初期値は 0。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    assert diag.current_r_a_recovered_backfill_count == 0
+    snap = diag.snapshot(time.time())
+    assert snap["current_r_a_recovered_backfill_total"] == 0
+
+
+def test_diag_label_current_r_a_recovered_backfill_exists():
+    """spec 046: DIAG_SENSOR_DEFS に current_r_a_recovered_backfill_total 登録確認。"""
+    label = _diag_label("current_r_a_recovered_backfill_total")
+    assert "Current" in label or "0xE8" in label, label
+
+
+def test_publish_recovery_backfill_increments_current_counter():
+    """publish_recovery_backfill を current_r_a 含む m + counter_attr 指定で呼ぶと
+    counter が inc (= spec 029 と同 pattern)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    published = []
+    class FakeMqtt:
+        def publish(self, topic, payload, retain=False):
+            published.append((topic, payload))
+    mb.publish_recovery_backfill(
+        FakeMqtt(), "cubej",
+        {"current_r_a": 7.0, "current_t_a": None},  # None は skip
+        send_ts=1700000000.0,
+        diag_state=diag,
+        counter_attr="current_r_a_recovered_backfill_count",
+    )
+    # current_t_a = None は publish_recovery_backfill 内で skip 済
+    assert len(published) == 1
+    assert "current_r_a_recovered_json" in published[0][0]
+    assert diag.current_r_a_recovered_backfill_count == 1

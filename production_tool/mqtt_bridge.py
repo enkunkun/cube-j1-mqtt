@@ -2333,6 +2333,9 @@ class DiagState(object):
         self.skrejoin_count = 0
         self.skrejoin_fail_count = 0
         self.skrejoin_active = False
+        # spec 046: current_r_a (= 0xE8) 救済 frame backfill 件数 counter。
+        # publish_recovery_backfill helper の counter_attr 引数で inc。
+        self.current_r_a_recovered_backfill_count = 0
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2670,6 +2673,9 @@ class DiagState(object):
         # 0 でも reconnect 経由 reauth が支配的なケースの観測点)。
         out["skrejoin_total"] = self.skrejoin_count
         out["skrejoin_fail_total"] = self.skrejoin_fail_count
+        # spec 046: current_r_a (= 0xE8) 救済 frame backfill counter。
+        out["current_r_a_recovered_backfill_total"] = (
+            self.current_r_a_recovered_backfill_count)
         return out
 
 # ---------------------------------------------------------------------------
@@ -4209,6 +4215,9 @@ DIAG_SENSOR_DEFS = [
     # spec 040 Phase 2b: 能動 SKREJOIN 発火 / 失敗 counter (= BP35A1 Ver 1.3.2 p.14、 720s reauth 衝突回避)。
     ("skrejoin_total",           "SKREJOIN Active Count",                               None, None, "total_increasing", "diagnostic"),
     ("skrejoin_fail_total",      "SKREJOIN Fail Count (= fallback to reconnect)",       None, None, "total_increasing", "diagnostic"),
+    # spec 046: current_r_a (= 0xE8) 救済 frame backfill (= spec 028 と同 ECHONET フレーム、 別 counter)。
+    ("current_r_a_recovered_backfill_total",
+     "Current R-A Recovered Backfill (= 0xE8)",                                         None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
@@ -4349,6 +4358,13 @@ CUMULATIVE_BACKFILL_KEYS = frozenset((
     "energy_forward_kwh", "energy_reverse_kwh",
     "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh",
 ))
+
+# spec 046: 電流 (= 0xE8) の救済 frame backfill。 spec 028 (= power_w / 0xE7)
+# と同 ECHONET フレームに含まれるため遅延応答救済時に同時 publish 可能、 別
+# counter (= current_r_a_recovered_backfill_total) で観測解像度を保つ。
+# current_t_a (= T 相、 単相 2 線式メーターでは null) は publish_recovery_backfill
+# 内 None ガードで skip 済、 安全に含めて OK。
+CURRENT_BACKFILL_KEYS = frozenset(("current_r_a", "current_t_a"))
 
 
 def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None,
@@ -4732,6 +4748,19 @@ def main():
                                         _late_ts, diag_state,
                                         counter_attr=(
                                             "cumulative_recovered_backfill_total"))
+                            # spec 046: 電流 (= 0xE8) も同 ERXUDP フレームから
+                            # 救済可能、 別 topic + 別 counter で backfill publish、
+                            # Grafana で current_r_a の visual gap も埋める。
+                            if cfg.get("current_r_a_recovery_backfill_enabled", True):
+                                _m_cur_bf = dict(
+                                    (k, v) for k, v in m.items()
+                                    if k in CURRENT_BACKFILL_KEYS)
+                                if _m_cur_bf:
+                                    publish_recovery_backfill(
+                                        mqtt, device_id, _m_cur_bf,
+                                        _late_ts, diag_state,
+                                        counter_attr=(
+                                            "current_r_a_recovered_backfill_count"))
                         else:
                             publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)

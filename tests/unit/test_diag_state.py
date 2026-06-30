@@ -78,6 +78,8 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 040 Phase 2b: 能動 SKREJOIN 発火 / 失敗 counter (= 0 でも常時 publish)。
         "skrejoin_total": 0,
         "skrejoin_fail_total": 0,
+        # spec 046: current_r_a (= 0xE8) 救済 frame backfill counter (= 0 でも publish)。
+        "current_r_a_recovered_backfill_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
