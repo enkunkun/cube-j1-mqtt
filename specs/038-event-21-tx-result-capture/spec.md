@@ -2,13 +2,18 @@
 
 **Feature Branch**: `038-event-21-tx-result-capture`
 **Created**: 2026-06-28
-**Status**: **Closed (= Phase 1 観察結果で ROI 0 確定) / 2026-06-30 JST**
+**Status**: **🚫 Reopened (= Phase 1 結論誤り判明) / 2026-06-30 JST**
 
-deploy から 42h 経過で `sk_event_21_total` = **0 件** = EVENT 21 PARAM=0/1/2 が一度も発火していない (= gcx --context cloud metrics query 'cube_j1_smart_meter_sk_event_21_total{device_id="cubej1"}' で vector empty 確認)。 spec.md の ROI 判断基準では「0 件 / 12h → spec close」 該当、 42h 観察で確定。
+旧 Status「Closed (= ROI 0 確定)」 を撤回。 gcx で `sk_event_21_total` = vector empty を「0 件発火」 と判断したが、 同日後の bridge `/api/diag` 直接 snapshot 確認で **`sk_event_21_total = 67 件 / 24h`** 計上判明 = 約 2.8 件/h、 memory baseline `erxudp_timeouts` 30 件/h の 約 10% ペースで発火している。
 
-ERXUDP timeout は同期間 1046 件累計と発火継続中 = ERXUDP timeout 主因は **TX 失敗ではなく RX 待ち (= メーター応答無し or 遅延)** ことが確定 ([[feedback-phase1-event21-zero-erxudp-rx-dominant]] に詳細)。 audit findings P-NEW-3 = Closed (= bridge アーキテクチャ非互換ではないが effect ゼロが実証)。
+root cause = `compose/telegraf/telegraf.conf` の topics 明示列挙に `sk_event_21_total` 未登録 = telegraf 段で MQTT → Prometheus drop。 2026-06-30 compose commit 0ba5dba1 で fix、 telegraf 自動 restart 後 5-10 分で Prometheus 反映見込み。
 
-仮説の前提 (= 「ERXUDP timeout の一部は EVENT 21 PARAM=1 で 1-2s 以内に通知されていた」) は否定。 software 改善余地 0、 spec 042 (= SKADDNBR) / spec 044 (= EVENT 25 metric bug fix) など別 spec で残課題に対応。
+旧 Phase 1 結論を撤回後、 残課題:
+- **Phase 1 再観察** = compose fix 反映後 24h で `sk_event_21_total` の周期 + 件数を確認
+- **Phase 2 検討** = PARAM 区別 (= 0 成功 / 1 失敗 / 2 自動再送) 実装、 67 件のうち PARAM=1 (= TX 失敗) の割合次第で ROI 評価
+- audit findings P-NEW-3 = Reopened (= Phase 1 再観察後に再評価)
+
+詳細は [[feedback-phase1-event21-zero-erxudp-rx-dominant]] (= INVALIDATED 記載) と [[feedback-compose-telegraf-pipeline]] (= 遵守必須の pipeline knowledge) を参照。
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-3。 BP35A1 公式 Ver 1.3.2 p.51 で SKSENDTO 後の送信結果は EVENT 0x21 (PARAM=0/1/2) で 1-2 秒以内に通知されるが、 bridge は完全 ignore (= `grep "EVENT.*21"` 0 件) で常に ERXUDP 待ち 30s timeout に依存している。
 
 ## Background
