@@ -68,6 +68,10 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         # spec 042: SKADDNBR 発行 counter (= 0 でも常時 publish)。
         "skaddnbr_total": 0,
         "skaddnbr_fail_total": 0,
+        # spec 038 Phase 2: EVENT 21 PARAM 別 counter (= 0 でも常時 publish)。
+        "sk_event_21_param0_total": 0,
+        "sk_event_21_param1_total": 0,
+        "sk_event_21_param2_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }

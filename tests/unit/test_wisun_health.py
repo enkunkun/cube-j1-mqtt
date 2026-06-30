@@ -510,3 +510,48 @@ def test_diag_label_skaddnbr_exists():
     fail_label = _diag_label("skaddnbr_fail_total")
     assert "SKADDNBR" in total_label or "Neighbor" in total_label, total_label
     assert "SKADDNBR" in fail_label or "Fail" in fail_label, fail_label
+
+
+# ---------------------------------------------------------------------------
+# spec 038 Phase 2: EVENT 21 PARAM 区別実装 (= TX Result 0=成功 / 1=失敗 / 2=自動再送)
+# ---------------------------------------------------------------------------
+# spec 038 Phase 1 で sk_event_21_total = 82 件/24h 計上判明 (= 2026-06-30 reopen)、
+# Phase 2 で PARAM 別 counter を追加。 PARAM=1 (= TX 失敗) の割合次第で ROI 確定
+# (= 50% 以上なら即 retry 実装 = Phase 3、 10% 以下なら spec close)。 BP35A1
+# 公式 Ver 1.3.2 p.51 で EVENT 21 PARAM の意味: 0=success / 1=fail / 2=auto-retry。
+
+
+def test_on_sk_event_21_param_increments():
+    """DiagState.on_sk_event_21_param(0/1/2) で対応 counter が増加。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_sk_event_21_param(0)
+    diag.on_sk_event_21_param(0)
+    diag.on_sk_event_21_param(1)
+    diag.on_sk_event_21_param(2)
+    diag.on_sk_event_21_param(2)
+    diag.on_sk_event_21_param(2)
+    snap = diag.snapshot(time.time())
+    assert snap["sk_event_21_param0_total"] == 2
+    assert snap["sk_event_21_param1_total"] == 1
+    assert snap["sk_event_21_param2_total"] == 3
+
+
+def test_on_sk_event_21_param_invalid_ignored():
+    """範囲外の PARAM は ignore (= 防御的、 仕様外値で例外起こさない)。"""
+    diag = mb.DiagState(start_time=1000.0, version="1.0.0+test")
+    diag.on_sk_event_21_param(3)  # 仕様外
+    diag.on_sk_event_21_param(-1)
+    snap = diag.snapshot(time.time())
+    assert snap["sk_event_21_param0_total"] == 0
+    assert snap["sk_event_21_param1_total"] == 0
+    assert snap["sk_event_21_param2_total"] == 0
+
+
+def test_diag_label_sk_event_21_param_exists():
+    """spec 038 Phase 2: sk_event_21_param0/1/2_total の DIAG_SENSOR_DEFS 登録確認。"""
+    p0 = _diag_label("sk_event_21_param0_total")
+    p1 = _diag_label("sk_event_21_param1_total")
+    p2 = _diag_label("sk_event_21_param2_total")
+    assert "Success" in p0 or "PARAM=0" in p0, p0
+    assert "Fail" in p1 or "PARAM=1" in p1, p1
+    assert "Retry" in p2 or "PARAM=2" in p2, p2

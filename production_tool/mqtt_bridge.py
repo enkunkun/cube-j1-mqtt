@@ -2321,6 +2321,9 @@ class DiagState(object):
         # spec 042: SKADDNBR (= IP 層ネイバーキャッシュ登録) 発行成功 / 失敗回数。
         self.skaddnbr_count = 0
         self.skaddnbr_fail_count = 0
+        # spec 038 Phase 2: EVENT 21 (= TX Result Notification) PARAM 別 count。
+        # PARAM=0 成功 / 1 失敗 (= CSMA/ARIB/Ack) / 2 自動再送、 公式 p.51。
+        self.sk_event_21_param_counts = [0, 0, 0]
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -2476,6 +2479,13 @@ class DiagState(object):
         """spec 042: SKADDNBR 発行失敗時に発火 (= 安全側 continue、 観測点)。"""
         self.skaddnbr_fail_count += 1
 
+    def on_sk_event_21_param(self, param):
+        """spec 038 Phase 2: EVENT 21 PARAM 別 (= 0 成功 / 1 失敗 / 2 自動再送)
+        の counter を増加。 範囲外の PARAM は ignore (= 仕様外値で例外起こさない)。
+        """
+        if isinstance(param, int) and 0 <= param <= 2:
+            self.sk_event_21_param_counts[param] += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2623,6 +2633,11 @@ class DiagState(object):
         # 後すぐに発行件数 > 0 となることが期待される観測点)。
         out["skaddnbr_total"] = self.skaddnbr_count
         out["skaddnbr_fail_total"] = self.skaddnbr_fail_count
+        # spec 038 Phase 2: EVENT 21 PARAM 別 counter。 0 でも常時 publish
+        # (= PARAM=1 (TX 失敗) の割合が ROI 判定の鍵、 0 件でも publish が必要)。
+        out["sk_event_21_param0_total"] = self.sk_event_21_param_counts[0]
+        out["sk_event_21_param1_total"] = self.sk_event_21_param_counts[1]
+        out["sk_event_21_param2_total"] = self.sk_event_21_param_counts[2]
         return out
 
 # ---------------------------------------------------------------------------
@@ -3520,6 +3535,18 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                         diag_state.on_wisun_pana_fail(value)
                     else:
                         diag_state.on_sk_event(value)
+                    # spec 038 Phase 2: EVENT 21 (= TX Result Notification) は
+                    # 公式 p.51 で "EVENT 21 <SENDER_IPV6> <PARAM>" 形式、
+                    # PARAM は 0 成功 / 1 失敗 / 2 自動再送。 line を re-parse
+                    # して PARAM 別 counter を inc (= classify_sk_line は id のみ
+                    # 返す既存仕様を維持しつつ追加観測)。
+                    if value == "21":
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            try:
+                                diag_state.on_sk_event_21_param(int(parts[3]))
+                            except (ValueError, IndexError):
+                                pass
                 except Exception as e:
                     log("diag on_sk_event error: {}".format(e))
             continue
@@ -4064,6 +4091,10 @@ DIAG_SENSOR_DEFS = [
     # spec 042: SKADDNBR で IP 層ネイバーキャッシュ登録 (= BP35A1 Ver 1.3.2 p.29、 初回 SKSENDTO 1-2s 短縮)。
     ("skaddnbr_total",           "SKADDNBR Neighbor Cache Add",                         None, None, "total_increasing", "diagnostic"),
     ("skaddnbr_fail_total",      "SKADDNBR Fail Count",                                 None, None, "total_increasing", "diagnostic"),
+    # spec 038 Phase 2: EVENT 21 PARAM 別 counter (= BP35A1 Ver 1.3.2 p.51、 TX Result 0/1/2)。
+    ("sk_event_21_param0_total", "SK EVENT 21 PARAM=0 (TX Success)",                    None, None, "total_increasing", "diagnostic"),
+    ("sk_event_21_param1_total", "SK EVENT 21 PARAM=1 (TX Fail = CSMA/ARIB/Ack)",       None, None, "total_increasing", "diagnostic"),
+    ("sk_event_21_param2_total", "SK EVENT 21 PARAM=2 (TX Auto-Retry)",                 None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
