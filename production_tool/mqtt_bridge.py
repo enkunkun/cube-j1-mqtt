@@ -2336,6 +2336,11 @@ class DiagState(object):
         # spec 046: current_r_a (= 0xE8) 救済 frame backfill 件数 counter。
         # publish_recovery_backfill helper の counter_attr 引数で inc。
         self.current_r_a_recovered_backfill_count = 0
+        # spec 040 Phase 2b hotfix v4: _wait_skjoin_event25 の terminal reason
+        # を bus pattern で共有 (= "event_25" 成功 / "event_24" PANA fail /
+        # "timeout" 経過秒切れ)。 skrejoin_tick の失敗 log 精細化に使用、
+        # SKREJOIN 失敗原因 (= メーター reject vs handshake 遅延) を data で判定。
+        self.last_skjoin_terminal_reason = None
         # Most recent raw ERXUDP line as the SKSTACK printed it. Used by the
         # admin UI to inspect firmware-specific token layout (RSSI / LQI
         # placement varies across SKSTACK builds).
@@ -3081,7 +3086,11 @@ def skrejoin_tick(fd, diag_state, pan, ipv6):
         else:
             diag_state.on_skrejoin_fail()
             diag_state.pending_wisun_rejoin = True
-            log("能動 SKREJOIN 失敗 (= EVENT 24 or timeout)、 既存 reconnect path に fallback")
+            # hotfix v4: terminal reason を明示 log = メーター EVENT 24 reject
+            # (= 仕様上の壁) と timeout (= handshake 遅延) を data で分離判定。
+            reason = getattr(diag_state, "last_skjoin_terminal_reason", "unknown")
+            log("能動 SKREJOIN 失敗 (reason={}) 、 既存 reconnect path に fallback"
+                .format(reason))
             return False
     except Exception as e:
         diag_state.on_skrejoin_fail()
@@ -3127,6 +3136,8 @@ def _wait_skjoin_event25(fd, pan, ipv6, timeout, diag_state=None):
                         # spec 040 Phase 2a: 直近 EVENT 25 受信 ts を記録
                         # (= 能動 SKREJOIN tick の base time)。
                         diag_state.last_event_25_ts = time.time()
+                        # spec 040 Phase 2b hotfix v4: terminal reason bus。
+                        diag_state.last_skjoin_terminal_reason = "event_25"
                     except Exception as e:
                         log("diag on_sk_event(25) error: {}".format(e))
                 return True
@@ -3137,9 +3148,13 @@ def _wait_skjoin_event25(fd, pan, ipv6, timeout, diag_state=None):
                 if diag_state is not None:
                     try:
                         diag_state.on_sk_event("24")
+                        # spec 040 Phase 2b hotfix v4: terminal reason bus。
+                        diag_state.last_skjoin_terminal_reason = "event_24"
                     except Exception as e:
                         log("diag on_sk_event(24) error: {}".format(e))
                 return False
+        if diag_state is not None:
+            diag_state.last_skjoin_terminal_reason = "timeout"
         return False  # timeout
     finally:
         stop_event.set()
