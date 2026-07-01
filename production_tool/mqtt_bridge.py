@@ -3029,8 +3029,14 @@ def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
 # spec 040 Phase 2b: 能動 SKREJOIN 発火の threshold (= last EVENT 25 からの経過秒)。
 # 公式 BP35A1 Ver 1.3.2 p.14 で「PaC は PAA が指定したセッションライフタイムの
 # 80% (= 720s) で自動的に SKREJOIN を実行」 = PAA セッション終了要請発火前に
-# 確実に再認証完了させるため 600s = 安全マージン 120s で設定。
-SKREJOIN_TICK_SECONDS = 600
+# 確実に再認証完了させる必要。
+#
+# 初回 deploy (= f5dd4fc / c8e869b、 threshold=600s) では 8h で skrejoin_total=0
+# 判明 = 実測 reconnect 周期 11-12 分 (= wisun_joined 23:36→23:47→23:59→00:10)
+# より tick=600s (10 分) が PAA 主導 termination + reconnect + EVENT 25 hook
+# 更新に間に合わず should_fire_skrejoin 常に False に。 tick=480s (8 分) に下方
+# 修正で reconnect 周期より 3-4 分早く発火、 hotfix 後の初回 deploy で確認。
+SKREJOIN_TICK_SECONDS = 480
 
 
 def should_fire_skrejoin(diag_state, now):
