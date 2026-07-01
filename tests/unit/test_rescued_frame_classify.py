@@ -112,3 +112,58 @@ def test_on_erxudp_rescued_empty_measurement():
 
 # FR-006 (= tid_mismatch lag は got≠0 のみ記録) の test は挙動の本籍地
 # tests/unit/test_tid_lag.py 側に置いた (= test_lag_skipped_when_got_tid_zero)。
+
+
+# ---------------------------------------------------------------------------
+# rescued_measurement_is_empty: pure helper (FR-004 の判定本体)
+# ---------------------------------------------------------------------------
+
+def test_rescued_empty_when_no_keys():
+    assert mb.rescued_measurement_is_empty({}) is True
+
+
+def test_rescued_not_empty_with_power_w():
+    assert mb.rescued_measurement_is_empty({"power_w": 700}) is False
+
+
+def test_rescued_not_empty_with_cumulative():
+    assert mb.rescued_measurement_is_empty(
+        {"energy_forward_kwh": 123.4}) is False
+
+
+def test_rescued_not_empty_with_current():
+    assert mb.rescued_measurement_is_empty({"current_r_a": 7.5}) is False
+
+
+def test_rescued_empty_with_only_non_publish_keys():
+    """coefficient / unit_kwh は rescue publish 対象外 = 実 data なし扱い."""
+    assert mb.rescued_measurement_is_empty(
+        {"coefficient": 1, "unit_kwh": 0.1}) is True
+
+
+def test_rescued_empty_when_publishable_value_is_none():
+    """None 値は publish 側で skip されるため空扱い."""
+    assert mb.rescued_measurement_is_empty({"power_w": None}) is True
+
+
+# ---------------------------------------------------------------------------
+# DIAG_SENSOR_DEFS: 11 counter が HA discovery / MQTT publish 対象に載る
+# (= FR-005。 memory feedback-diag-sensor-defs-publish: 登録漏れ = publish されない)
+# ---------------------------------------------------------------------------
+
+def test_diag_sensor_defs_includes_all_rescued_counters():
+    sids = {sid for (sid, *_rest) in mb.DIAG_SENSOR_DEFS}
+    for key in (
+        "erxudp_rescued_esv_get_res_total",
+        "erxudp_rescued_esv_get_sna_total",
+        "erxudp_rescued_esv_inf_total",
+        "erxudp_rescued_esv_other_total",
+        "erxudp_rescued_tid_zero_total",
+        "erxudp_rescued_tid_ring_hit_total",
+        "erxudp_rescued_lag_lt5s_total",
+        "erxudp_rescued_lag_5to60s_total",
+        "erxudp_rescued_lag_60to300s_total",
+        "erxudp_rescued_lag_gt300s_total",
+        "erxudp_rescued_empty_measurement_total",
+    ):
+        assert key in sids, key

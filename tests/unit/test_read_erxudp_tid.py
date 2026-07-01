@@ -8,7 +8,7 @@ import time
 import mqtt_bridge as mb
 
 
-def _erxudp_line_for(tid, epc=0xE7, edt=b"\x00\x00\x01\xf4"):
+def _erxudp_line_for(tid, epc=0xE7, edt=b"\x00\x00\x01\xf4", esv=0x72):
     """Build a fake ERXUDP serial line whose ECHONET Lite TID matches *tid*.
 
     Wraps the canonical BP35CX/BP35C2 ERXUDP framing: addressing fields are
@@ -19,7 +19,7 @@ def _erxudp_line_for(tid, epc=0xE7, edt=b"\x00\x00\x01\xf4"):
     payload += bytes(bytearray([tid >> 8, tid & 0xFF]))       # TID
     payload += b"\x02\x88\x01"                                # SEOJ
     payload += b"\x05\xff\x01"                                # DEOJ
-    payload += b"\x72\x01"                                    # ESV=Get_Res, OPC=1
+    payload += bytes(bytearray([esv])) + b"\x01"              # ESV, OPC=1
     payload += bytes(bytearray([epc, len(edt)]))              # EPC, PDC
     payload += edt                                            # EDT
     hex_payload = binascii.hexlify(payload).decode("ascii").upper()
@@ -133,3 +133,69 @@ def test_read_erxudp_event_22_still_calls_on_sk_event():
     mb.read_erxudp(fd=None, timeout=1, diag_state=fake, readline=readline)
     assert fake.sk_event_calls == ["22"]
     assert fake.pana_fail_calls == []
+
+
+# ---------------------------------------------------------------------------
+# spec 047: rescue path が on_erxudp_rescued を発火する
+# ---------------------------------------------------------------------------
+
+
+def _diag_and_ring():
+    diag = mb.DiagState(start_time=time.time(), version="t")
+    ring = mb.SendHistoryRing(maxlen=16)
+    return diag, ring
+
+
+def test_rescue_ring_hit_fires_rescued_counters():
+    """got_tid≠0 の正規 ring hit: esv=get_res / ring_hit / lt5s が inc."""
+    diag, ring = _diag_and_ring()
+    ring.record(0x0010, time.time() - 1.0, [0xE7])
+    readline = _make_readline([_erxudp_line_for(0x0010)])
+    payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                             expected_tid=0x0011, readline=readline,
+                             send_history=ring)
+    assert payload is not None
+    snap = diag.snapshot(now=time.time())
+    assert snap["erxudp_rescued_esv_get_res_total"] == 1
+    assert snap["erxudp_rescued_tid_ring_hit_total"] == 1
+    assert snap["erxudp_rescued_tid_zero_total"] == 0
+    assert snap["erxudp_rescued_lag_lt5s_total"] == 1
+
+
+def test_rescue_tid_zero_fallback_fires_tid_zero_counter():
+    """got_tid=0 は lookup_latest fallback 経由 → tid_zero が inc."""
+    diag, ring = _diag_and_ring()
+    ring.record(0x0011, time.time() - 0.5, [0xE7])
+    readline = _make_readline([_erxudp_line_for(0x0000)])
+    payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                             expected_tid=0x0011, readline=readline,
+                             send_history=ring)
+    assert payload is not None
+    snap = diag.snapshot(now=time.time())
+    assert snap["erxudp_rescued_tid_zero_total"] == 1
+    assert snap["erxudp_rescued_tid_ring_hit_total"] == 0
+
+
+def test_rescue_inf_frame_classified_as_inf():
+    """ESV=0x73 (自律通知 INF) の救済 frame は esv=inf に分類 (H2 検出)."""
+    diag, ring = _diag_and_ring()
+    ring.record(0x0011, time.time() - 0.5, [0xE7])
+    readline = _make_readline([_erxudp_line_for(0x0000, esv=0x73)])
+    mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                   expected_tid=0x0011, readline=readline,
+                   send_history=ring)
+    snap = diag.snapshot(now=time.time())
+    assert snap["erxudp_rescued_esv_inf_total"] == 1
+    assert snap["erxudp_rescued_esv_get_res_total"] == 0
+
+
+def test_rescue_late_frame_falls_in_60to300s_bucket():
+    """send_ts が 70s 前 → 60to300s bucket (H3 chain 検出)."""
+    diag, ring = _diag_and_ring()
+    ring.record(0x0010, time.time() - 70.0, [0xE7])
+    readline = _make_readline([_erxudp_line_for(0x0010)])
+    mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                   expected_tid=0x0011, readline=readline,
+                   send_history=ring)
+    snap = diag.snapshot(now=time.time())
+    assert snap["erxudp_rescued_lag_60to300s_total"] == 1

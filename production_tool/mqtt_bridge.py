@@ -3837,6 +3837,16 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                             except Exception as e:
                                 log("diag on_erxudp_recovered_from_mismatch "
                                     "error: {}".format(e))
+                            # spec 047: rescued frame の ESV / TID / lag 内訳
+                            # を観測 (= H1/H2/H3 支配要因判定)。 挙動は不変。
+                            try:
+                                diag_state.on_erxudp_rescued(
+                                    classify_rescued_esv(payload),
+                                    got_tid == 0,
+                                    time.time() - send_ts_a)
+                            except Exception as e:
+                                log("diag on_erxudp_rescued error: {}"
+                                    .format(e))
                             return payload
                     if got_tid is None:
                         log("WARN: ERXUDP payload too short ({} bytes), "
@@ -4334,6 +4344,19 @@ DIAG_SENSOR_DEFS = [
     # spec 046: current_r_a (= 0xE8) 救済 frame backfill (= spec 028 と同 ECHONET フレーム、 別 counter)。
     ("current_r_a_recovered_backfill_total",
      "Current R-A Recovered Backfill (= 0xE8)",                                         None, None, "total_increasing", "diagnostic"),
+    # spec 047: rescued frame 内訳観測 (= ESV / TID / lag bucket / empty measurement)。
+    ("erxudp_rescued_esv_get_res_total",  "Rescued ESV Get_Res",         None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_esv_get_sna_total",  "Rescued ESV Get_SNA",         None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_esv_inf_total",      "Rescued ESV INF (= H2)",      None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_esv_other_total",    "Rescued ESV Other",           None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_tid_zero_total",     "Rescued TID=0 (= H1)",        None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_tid_ring_hit_total", "Rescued TID Ring Hit",        None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_lag_lt5s_total",     "Rescued Lag <5s",             None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_lag_5to60s_total",   "Rescued Lag 5-60s",           None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_lag_60to300s_total", "Rescued Lag 60-300s (= H3)",  None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_lag_gt300s_total",   "Rescued Lag >300s",           None, None, "total_increasing", "diagnostic"),
+    ("erxudp_rescued_empty_measurement_total",
+     "Rescued Empty Measurement (= H2)",                                                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
@@ -4481,6 +4504,23 @@ CUMULATIVE_BACKFILL_KEYS = frozenset((
 # current_t_a (= T 相、 単相 2 線式メーターでは null) は publish_recovery_backfill
 # 内 None ガードで skip 済、 安全に含めて OK。
 CURRENT_BACKFILL_KEYS = frozenset(("current_r_a", "current_t_a"))
+
+# spec 047 FR-004: rescued cycle で publish 可能な実 data が 1 つも取れて
+# いないかの判定対象 (= late publish + backfill 3 系統の合算)。
+_RESCUED_PUBLISHABLE_KEYS = (CUMULATIVE_PUBLISH_KEYS
+                             | RECOVERY_BACKFILL_KEYS
+                             | CUMULATIVE_BACKFILL_KEYS
+                             | CURRENT_BACKFILL_KEYS)
+
+
+def rescued_measurement_is_empty(m):
+    """spec 047 FR-004: rescued frame の decode 結果 *m* が publish 対象
+    key を 1 つも含まない (= INF 等の非 Get 応答で cycle を浪費した) か。
+    None 値は publish 側で skip されるため空扱い。"""
+    for key, value in m.items():
+        if key in _RESCUED_PUBLISHABLE_KEYS and value is not None:
+            return False
+    return True
 
 
 def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None,
@@ -4894,6 +4934,15 @@ def main():
                                         _late_ts, diag_state,
                                         counter_attr=(
                                             "current_r_a_recovered_backfill_count"))
+                            # spec 047 FR-004: rescued cycle なのに publish
+                            # 可能な実 data ゼロ (= INF 等で cycle 浪費、 H2
+                            # の直接証拠) を counter で観測。
+                            if rescued_measurement_is_empty(m):
+                                try:
+                                    diag_state.on_erxudp_rescued_empty_measurement()
+                                except Exception as e:
+                                    log("diag on_erxudp_rescued_empty_"
+                                        "measurement error: {}".format(e))
                         else:
                             publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)
