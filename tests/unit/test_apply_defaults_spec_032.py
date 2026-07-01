@@ -12,16 +12,23 @@
 import mqtt_bridge as mb
 
 
-def test_default_erxudp_timeout_sec_is_6():
+def test_default_erxudp_timeout_sec_is_8():
+    """spec 032 は 6s だったが tako 合議 (= 2026-07-01) で 8s に tuning。
+    erxudp_latency p95=4.96s / max=5.58s のメーター応答遅延で 6s では tail が
+    timeout 側へ落ちる、 8s で 1 cycle 内回収 (= spec 020 late frame 救済に
+    委ねる必要が減る)。"""
     cfg = mb.apply_defaults({})
-    assert cfg["erxudp_timeout_sec"] == 6
+    assert cfg["erxudp_timeout_sec"] == 8
 
 
-def test_default_erxudp_intra_cycle_retries_is_3():
-    """spec 011 で 0 だった default、 spec 032 で 3 に上げて短期集中 retry。
-    broute-mqtt は retry 3 / 5s 間隔で実機運用、 同 pattern 採用."""
+def test_default_erxudp_intra_cycle_retries_is_0():
+    """spec 032 は 3 に上げたが tako 合議 (= 2026-07-01) で 0 に戻す tuning。
+    実測 490 retries / 2 recovered = 0.4% 効率、 retry でメーター ECHONET
+    キューが DDoS 状態になり応答遅延を悪化させる (= p95=5s の主因仮説)。
+    0 に抑制でメーター自然応答を待つ、 spec 020 late frame 救済 (= 63 件
+    / 5h、 完璧に機能) に fallback して次 cycle で回収。"""
     cfg = mb.apply_defaults({})
-    assert cfg["erxudp_intra_cycle_retries"] == 3
+    assert cfg["erxudp_intra_cycle_retries"] == 0
 
 
 def test_default_erxudp_timeout_force_reconnect_threshold_is_6():

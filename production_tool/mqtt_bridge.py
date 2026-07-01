@@ -143,8 +143,14 @@ def apply_defaults(cfg):
     # piling up replies in the meter's ECHONET queue. With retries off,
     # the queue gets a chance to drain; retry can be opted back in via
     # config when the queue clears.
-    out.setdefault("erxudp_timeout_sec", 6)  # spec 032: 30 → 6 (broute-mqtt 5s 並み)
-    out.setdefault("erxudp_intra_cycle_retries", 3)  # spec 032: 0 → 3 (broute-mqtt 並み短期集中 retry)
+    # spec 032 aggressive polling default を tako 合議 (= 2026-07-01) で tuning:
+    # - erxudp_latency p50=3.28s / p95=4.96s / max=5.58s = メーター応答 3-5s
+    # - timeout=6s では p95 tail が timeout 側へ落ちる、 8s に延長で 1 cycle 内回収
+    # - intra_cycle_retries=3 で 490 retries / 2 recovered = 0.4% 効率 = メーター
+    #   キュー DDoS 状態、 0 に抑制で自然応答を待つ = latency 緩和 + spec 020 の
+    #   late frame 救済 (= 63 件 / 5h) で次 cycle 回収に委ねる。
+    out.setdefault("erxudp_timeout_sec", 8)  # spec 032→tako 合議: 6 → 8 (p95=5s に対応)
+    out.setdefault("erxudp_intra_cycle_retries", 0)  # spec 032→tako 合議: 3 → 0 (DDoS 解消)
     out.setdefault("erxudp_retry_backoff_sec", 2)
     # spec 012: noise-adaptive poll skip — skip normal poll when the last
     # EEDSCAN shows the PAN channel is noisy (>= threshold). Avoids the
