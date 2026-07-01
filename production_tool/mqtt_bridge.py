@@ -2342,6 +2342,16 @@ class DiagState(object):
         # spec 046: current_r_a (= 0xE8) 救済 frame backfill 件数 counter。
         # publish_recovery_backfill helper の counter_attr 引数で inc。
         self.current_r_a_recovered_backfill_count = 0
+        # spec 047: rescued frame 内訳観測 — ESV / TID / lag bucket の直交
+        # 3 軸 + measurement 空 counter。 H1 (= TID=0 誤分類) / H2 (= INF
+        # 混入) / H3 (= chain 自走) の支配要因判定用、 観測のみで挙動不変。
+        self.erxudp_rescued_esv_counts = {
+            "get_res": 0, "get_sna": 0, "inf": 0, "other": 0}
+        self.erxudp_rescued_tid_zero_total = 0
+        self.erxudp_rescued_tid_ring_hit_total = 0
+        self.erxudp_rescued_lag_bucket_counts = {
+            "lt5s": 0, "5to60s": 0, "60to300s": 0, "gt300s": 0}
+        self.erxudp_rescued_empty_measurement_total = 0
         # spec 040 Phase 2b hotfix v4: _wait_skjoin_event25 の terminal reason
         # を bus pattern で共有 (= "event_25" 成功 / "event_24" PANA fail /
         # "timeout" 経過秒切れ)。 skrejoin_tick の失敗 log 精細化に使用、
@@ -2447,6 +2457,11 @@ class DiagState(object):
 
     def on_erxudp_tid_mismatch(self, expected=None, got=None):
         self.erxudp_tid_mismatch_total += 1
+        # spec 047 FR-006: got=0 (= メーター TID echo 不良、 実機観察で
+        # mismatch の 100%) は lag が「送信 counter の値」を写すだけの
+        # ノイズになるため記録しない。 got≠0 の正規 mismatch のみ残す。
+        if got == 0:
+            return
         lag = compute_tid_lag(expected, got)
         if lag is not None:
             self.erxudp_tid_mismatch_lags_recent.append(lag)
@@ -2474,6 +2489,23 @@ class DiagState(object):
         # send_ts を main loop に渡す bus 用 (= 戻り値 tuple 化を避ける)。
         if send_ts is not None:
             self.last_recovered_send_ts = float(send_ts)
+
+    # spec 047: rescued frame 内訳観測 — read_erxudp の rescue 確定箇所から
+    # ESV 分類 / TID=0 か / lag 秒数を 1 call で受けて 3 軸 counter を inc。
+
+    def on_erxudp_rescued(self, esv_kind, tid_zero, lag_sec):
+        if esv_kind not in self.erxudp_rescued_esv_counts:
+            esv_kind = "other"
+        self.erxudp_rescued_esv_counts[esv_kind] += 1
+        if tid_zero:
+            self.erxudp_rescued_tid_zero_total += 1
+        else:
+            self.erxudp_rescued_tid_ring_hit_total += 1
+        self.erxudp_rescued_lag_bucket_counts[
+            classify_rescued_lag_bucket(lag_sec)] += 1
+
+    def on_erxudp_rescued_empty_measurement(self):
+        self.erxudp_rescued_empty_measurement_total += 1
 
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
@@ -2650,6 +2682,21 @@ class DiagState(object):
             out["erxudp_recovered_lag_p95"] = int(round(
                 _percentile(ordered_rec, 95)))
             out["erxudp_recovered_lag_max"] = int(round(ordered_rec[-1]))
+
+        # spec 047: rescued frame 内訳 counter。 比率計算 (= SC-1 の分類漏れ
+        # 検算) に 0 も必要なので zero-omit しない (= FR-005)。
+        for _kind in ("get_res", "get_sna", "inf", "other"):
+            out["erxudp_rescued_esv_{}_total".format(_kind)] = (
+                self.erxudp_rescued_esv_counts[_kind])
+        out["erxudp_rescued_tid_zero_total"] = (
+            self.erxudp_rescued_tid_zero_total)
+        out["erxudp_rescued_tid_ring_hit_total"] = (
+            self.erxudp_rescued_tid_ring_hit_total)
+        for _bucket in ("lt5s", "5to60s", "60to300s", "gt300s"):
+            out["erxudp_rescued_lag_{}_total".format(_bucket)] = (
+                self.erxudp_rescued_lag_bucket_counts[_bucket])
+        out["erxudp_rescued_empty_measurement_total"] = (
+            self.erxudp_rescued_empty_measurement_total)
 
         # Spec 006: named EVENT / ER counters. Omit zero-count entries
         # so HA discovery does not advertise sensors that have never fired.

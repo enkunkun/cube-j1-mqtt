@@ -60,12 +60,22 @@ def test_on_erxudp_tid_mismatch_skips_lag_when_none():
 
 def test_lag_deque_caps_at_100():
     s = _make_state()
+    # spec 047 FR-006: got=0 は記録対象外になったため got=1 基準で lag を作る
     for i in range(150):
-        s.on_erxudp_tid_mismatch(expected=i + 1, got=0)
+        s.on_erxudp_tid_mismatch(expected=i + 2, got=1)
     assert len(s.erxudp_tid_mismatch_lags_recent) == 100
     # 古い 50 件は drop、 直近 100 件が残る
     assert list(s.erxudp_tid_mismatch_lags_recent)[0] == 51
     assert list(s.erxudp_tid_mismatch_lags_recent)[-1] == 150
+
+
+def test_lag_skipped_when_got_tid_zero():
+    """spec 047 FR-006: got=0 (= メーター TID echo 不良) は lag が送信
+    counter の値を写すだけのノイズ — counter は増えるが lag は残さない."""
+    s = _make_state()
+    s.on_erxudp_tid_mismatch(expected=0x0123, got=0)
+    assert s.erxudp_tid_mismatch_total == 1
+    assert len(s.erxudp_tid_mismatch_lags_recent) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -75,8 +85,9 @@ def test_lag_deque_caps_at_100():
 def test_snapshot_emits_lag_p50_p95_max():
     s = _make_state()
     # lag 1, 5, 10, 20, 40, 80 を投入 → max=80, p50 ≈ 15, p95 ≈ 80
+    # (spec 047 FR-006: got=0 は skip されるため got=1 との差分で表現)
     for lag in (1, 5, 10, 20, 40, 80):
-        s.on_erxudp_tid_mismatch(expected=lag, got=0)
+        s.on_erxudp_tid_mismatch(expected=lag + 1, got=1)
     snap = s.snapshot(now=1234.0)
     assert snap["erxudp_tid_mismatch_lag_max"] == 80
     assert 10 <= snap["erxudp_tid_mismatch_lag_p50"] <= 25

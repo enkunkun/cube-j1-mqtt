@@ -80,6 +80,19 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "skrejoin_fail_total": 0,
         # spec 046: current_r_a (= 0xE8) 救済 frame backfill counter (= 0 でも publish)。
         "current_r_a_recovered_backfill_total": 0,
+        # spec 047: rescued frame 内訳 counter 11 本 (= 比率計算に 0 も必要、
+        # zero-omit しない)。
+        "erxudp_rescued_esv_get_res_total": 0,
+        "erxudp_rescued_esv_get_sna_total": 0,
+        "erxudp_rescued_esv_inf_total": 0,
+        "erxudp_rescued_esv_other_total": 0,
+        "erxudp_rescued_tid_zero_total": 0,
+        "erxudp_rescued_tid_ring_hit_total": 0,
+        "erxudp_rescued_lag_lt5s_total": 0,
+        "erxudp_rescued_lag_5to60s_total": 0,
+        "erxudp_rescued_lag_60to300s_total": 0,
+        "erxudp_rescued_lag_gt300s_total": 0,
+        "erxudp_rescued_empty_measurement_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }
