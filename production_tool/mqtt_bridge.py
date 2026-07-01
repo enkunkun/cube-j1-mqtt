@@ -3429,6 +3429,44 @@ def compute_tid_lag(expected, got, modulo=0x10000):
         return None
     return (int(expected) - int(got)) % int(modulo)
 
+def classify_rescued_esv(payload):
+    """spec 047: rescued frame の ESV 分類 (pure helper).
+
+    read_erxudp の TID mismatch 救済 path で、救済 frame の中身が
+    Get 応答 (0x72/0x52) か自律通知 (0x73 INF) かを counter で分解する
+    ための分類。 offset 10 = ESV は parse_el_response と同一。
+    len < 11 (= ESV 位置に届かない短 frame) は "other"。
+    """
+    if len(payload) < 11:
+        return "other"
+    esv = payload[10] if isinstance(payload[10], int) else ord(payload[10])
+    if esv == 0x72:
+        return "get_res"
+    if esv == 0x52:
+        return "get_sna"
+    if esv == 0x73:
+        return "inf"
+    return "other"
+
+
+def classify_rescued_lag_bucket(lag_sec):
+    """spec 047: rescued frame の遅延秒数を 4 bucket に分類 (pure helper).
+
+    境界の意味 (spec 047 FR-003):
+      lt5s     = 実質 live (H1: TID=0 quirk の即時応答疑い)
+      5to60s   = 8s timeout 直後の真の遅延応答
+      60to300s = 1 cycle 遅れ chain (H3) / メーター queue 深滞留
+      gt300s   = stale (reconnect 跨ぎ等)
+    """
+    if lag_sec < 5:
+        return "lt5s"
+    if lag_sec < 60:
+        return "5to60s"
+    if lag_sec < 300:
+        return "60to300s"
+    return "gt300s"
+
+
 def parse_el_response(data):
     """Returns dict {epc_int: bytearray}."""
     if len(data) < 12:
