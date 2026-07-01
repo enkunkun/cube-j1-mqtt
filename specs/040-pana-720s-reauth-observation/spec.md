@@ -2,7 +2,36 @@
 
 **Feature Branch**: `040-pana-720s-reauth-observation`
 **Created**: 2026-06-28
-**Status**: **Phase 2 設計確定 + 実装中 / 2026-07-01 JST**、 Phase 1 SC-002 達成済 (= wisun_joined 周期で 720s 仮説 positive 実証)、 dig 完了 (= 対策 C + 発火タイミング A + poll skip 採用)
+**Status**: **Phase 2b hotfix 4 段適用 + 24h 継続観察中 / 2026-07-01 JST**、 Phase 1 SC-002 達成済、 hotfix v4 (= cc24076c、 reason 分離 log) で失敗理由 data 化。 sample n=4 で **event_24 75% + 成功 25%**、 24h cron (= 2026-07-02 16:47 JST fire) で n=180 sample で最終判定予定
+
+## hotfix 4 段の経緯 (= 2026-07-01)
+
+| hotfix | commit | 問題 | 修正 | 結果 |
+|---|---|---|---|---|
+| v1 | 9ab5e78 | tick=600s は reconnect 660s 周期に間に合わず | 600 → 480s | 実測 480s 閾値到達確認、 発火せず |
+| v2 | 61a11743 | 判定 path が poll_success 後のみで機会喪失 | poll_success 後 → cycle 開始時 | 発火 100% (17 件)、 全 timeout=30s で失敗 |
+| v3 | ec96a7a9 | timeout=30s では handshake 遅延に足りず | 30 → 60s | 1 件失敗 41s = timeout ではなく EVENT 24 早期検知の疑い |
+| **v4** | cc24076c | 失敗理由が不明 (= timeout vs EVENT 24) | reason 分離 log | **event_24 75% + 成功 25% (n=4)** = メーター reject majority |
+
+## v4 期間 (= 07:07-07:33) の 4 発火詳細
+
+- 06:57:56 発火 → 06:58:36 失敗 (reason=event_24) = 40s
+- 07:07:48 発火 → 07:07:52 **成功** = 4s
+- 07:22:55 発火 → 07:23:34 失敗 (reason=event_24) = 39s
+- 07:32:43 発火 → 07:33:23 失敗 (reason=event_24) = 40s
+
+成功 1/4 = 25% success rate、 event_24 3/4 = 75%。
+
+## 成功条件仮説 (= 07:07 の 4s 成功)
+
+wisun_joined 直近から 480s ちょうど経過での SKREJOIN のみメーター側が受理する可能性 = PAA session lifetime が公式 default 900s より短く実測 660-720s と整合、 tick=480s は PAA が SKREJOIN を受け付ける狭い window。 遅れると PAA session termination pipeline に入って EVENT 24 reject。
+
+## 24h 観察 (= 2026-07-02 16:47 JST cron)
+
+n=180 sample で:
+- 成功率 25% 前後 → Phase 2b 継続、 spec.md status を Deployed 化
+- 成功率 <10% → Phase 2b revert 検討 (= spec 039 pattern)、 hardware (= spec 031) 待ちに帰結
+- 成功率 >50% → 特殊条件解明で hotfix v5 で成功率向上余地
 
 ## Phase 2 設計確定 (= dig 2026-07-01 JST)
 
