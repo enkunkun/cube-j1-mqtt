@@ -4544,6 +4544,23 @@ def main():
     while True:
         try:
             last_poll_start = time.time()
+            # spec 040 Phase 2b hotfix v2: cycle 開始時に能動 SKREJOIN 判定
+            # (= poll_success 直後のみに置くと poll_failure 連続 60% baseline
+            # で 480s 閾値超過しても発火機会なし、 その間に既存 reconnect path
+            # が先に発火して 12 分周期 reconnect が継続する root cause 判明)。
+            # cycle 開始時 = poll_success/failure に関係なく発火機会を確保。
+            if cfg.get("skrejoin_tick_enabled", True) and \
+                    should_fire_skrejoin(diag_state, last_poll_start):
+                try:
+                    _pan = {
+                        "Pan ID": diag_state.pan_id,
+                        "Channel": "{:02X}".format(diag_state.pan_channel)
+                        if diag_state.pan_channel is not None else None,
+                        "Addr": diag_state.mac,
+                    }
+                    skrejoin_tick(fd, diag_state, _pan, ipv6)
+                except Exception as e:
+                    log("skrejoin_tick exception ({}), continue main loop".format(e))
             # spec 016: HA discovery auto-republish on MQTT reconnect
             # (pending flag) or every discovery_republish_interval_sec.
             # Localized try/except so a republish failure can't kill the
@@ -4774,23 +4791,6 @@ def main():
                         diag_state.on_poll_success(now)
                     except Exception as e:
                         log("diag on_poll_success error: {}".format(e))
-                    # spec 040 Phase 2b: poll_success 直後 idle で能動 SKREJOIN
-                    # 判定 (= last EVENT 25 から SKREJOIN_TICK_SECONDS 超過)、
-                    # 成立で SKREJOIN 発火 + EVENT 25 待ち。 失敗時は
-                    # pending_wisun_rejoin=True で次 cycle の reconnect path に
-                    # fallback。 cached pan info は diag_state から組み立て。
-                    if cfg.get("skrejoin_tick_enabled", True) and \
-                            should_fire_skrejoin(diag_state, time.time()):
-                        try:
-                            _pan = {
-                                "Pan ID": diag_state.pan_id,
-                                "Channel": "{:02X}".format(diag_state.pan_channel)
-                                if diag_state.pan_channel is not None else None,
-                                "Addr": diag_state.mac,
-                            }
-                            skrejoin_tick(fd, diag_state, _pan, ipv6)
-                        except Exception as e:
-                            log("skrejoin_tick exception ({}), continue main loop".format(e))
                 else:
                     emit_poll_failure(LOGGER, reason="erxudp_timeout")
                     try:
