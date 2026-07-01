@@ -3070,7 +3070,11 @@ def skrejoin_tick(fd, diag_state, pan, ipv6):
         elapsed = int(time.time() - diag_state.last_event_25_ts)
         log("能動 SKREJOIN 発火 (last_event_25_seconds={})".format(elapsed))
         skcommand(fd, "SKREJOIN", timeout=2)
-        if _wait_skjoin_event25(fd, pan, ipv6, timeout=30, diag_state=diag_state):
+        # hotfix v3 (= 61a1174 の実機観察): timeout=30s では 17 件連続失敗 (=
+        # 31-33s で EVENT 25 timeout)、 SKREJOIN 再認証は cached SKJOIN より
+        # 実測長く 30s 上限 では届かない = 60s に延長。 SKJOIN full path (= 90s)
+        # と cached path (= 30s) の中間、 PANA 4-way handshake の実測余裕。
+        if _wait_skjoin_event25(fd, pan, ipv6, timeout=60, diag_state=diag_state):
             diag_state.on_skrejoin_success()
             log("能動 SKREJOIN 成功")
             return True
