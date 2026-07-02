@@ -1,6 +1,8 @@
 # spec 047 観測記録: H1/H2/H3 本判定 (deploy +6h、n=66)
 
-**Deploy**: 2026-07-02 10:35 JST、version `1.0.0+83f11fb`
+**Deploy**: 2026-07-02 10:17 JST、version `1.0.0+83f11fb`
+(= uptime_seconds の Prometheus reset 逆算による実時刻。当初 10:35 JST と誤記、
+checkpoint 13:43/16:41 の trailing 窓は全て deploy 後に収まるため判定への影響なし)
 **判定時刻**: 2026-07-02 16:42 JST (= +6h、一次判定 13:43 の +3h n=35 と比率一致)
 
 ## 6h 増分 raw data
