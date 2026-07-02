@@ -93,6 +93,8 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "erxudp_rescued_lag_60to300s_total": 0,
         "erxudp_rescued_lag_gt300s_total": 0,
         "erxudp_rescued_empty_measurement_total": 0,
+        # spec 048: INF 排除 counter (= 0 でも publish)。
+        "erxudp_inf_ignored_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }

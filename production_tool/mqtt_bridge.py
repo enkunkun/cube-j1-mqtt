@@ -2352,6 +2352,14 @@ class DiagState(object):
         self.erxudp_rescued_lag_bucket_counts = {
             "lt5s": 0, "5to60s": 0, "60to300s": 0, "gt300s": 0}
         self.erxudp_rescued_empty_measurement_total = 0
+        # spec 048: INF (= ESV 0x73 等の非 Get 応答) を rescue 対象から排除
+        # した回数 (= FR-001)。 spec 047 判定で rescued の 59% が INF と確定、
+        # deploy 後は esv_inf ≈ 0 / inf_ignored ≈ 6/h への移行が verify 信号。
+        self.erxudp_inf_ignored_total = 0
+        # spec 048 FR-003: rescue した late frame の (payload, send_ts) を
+        # stash して read を継続、 main loop が毎 cycle drain して backfill
+        # publish する。 maxlen=8 = reconnect 直後 burst 対策 (通常 0-1 件)。
+        self.pending_rescued_frames = collections.deque(maxlen=8)
         # spec 040 Phase 2b hotfix v4: _wait_skjoin_event25 の terminal reason
         # を bus pattern で共有 (= "event_25" 成功 / "event_24" PANA fail /
         # "timeout" 経過秒切れ)。 skrejoin_tick の失敗 log 精細化に使用、
@@ -2506,6 +2514,9 @@ class DiagState(object):
 
     def on_erxudp_rescued_empty_measurement(self):
         self.erxudp_rescued_empty_measurement_total += 1
+
+    def on_erxudp_inf_ignored(self):
+        self.erxudp_inf_ignored_total += 1
 
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
@@ -2697,6 +2708,8 @@ class DiagState(object):
                 self.erxudp_rescued_lag_bucket_counts[_bucket])
         out["erxudp_rescued_empty_measurement_total"] = (
             self.erxudp_rescued_empty_measurement_total)
+        # spec 048: INF 排除 counter (= 0 でも publish、 SC-1 verify 用)。
+        out["erxudp_inf_ignored_total"] = self.erxudp_inf_ignored_total
 
         # Spec 006: named EVENT / ER counters. Omit zero-count entries
         # so HA discovery does not advertise sensors that have never fired.
@@ -3729,12 +3742,15 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
 
     spec 020: when *send_history* is supplied, a TID mismatch frame whose
     TID was previously recorded in the ring buffer is RESCUED instead of
-    discarded — diag_state.on_erxudp_recovered_from_mismatch(lag, send_ts)
-    is invoked (which also stashes send_ts in diag_state.last_recovered_send_ts
-    as a bus to the caller) and the payload is returned. The caller can
-    detect a late frame by checking diag_state.last_recovered_send_ts right
-    after this call returns (then reset to None). Ring lookup miss falls
-    back to the spec 014 discard path.
+    discarded.
+
+    spec 048: rescue は即 return せず (payload, send_ts) を
+    diag_state.pending_rescued_frames に stash して expected TID を deadline
+    まで待ち続ける (= chain 断ち)。 main loop が毎 cycle drain して過去時刻
+    backfill publish する。 非 Get 応答 (= ESV 0x72/0x52 以外、 INF 等) は
+    TID check より前段で erxudp_inf_ignored_total に計上して読み飛ばす。
+    got_tid=0 の lookup_latest fallback (spec 020 v1.5) は撤去済 (= 正体が
+    100% INF と spec 047 で判明)。 Ring lookup miss は spec 014 discard path。
     """
     if readline is None:
         readline = serial_readline
@@ -3800,6 +3816,21 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
             except Exception as e:
                 log("ERXUDP hex decode error: {}".format(e))
                 continue
+            # spec 048 FR-001: ESV filter を TID check より前段に移動。
+            # INF (= 0x73、 spec 047 判定で rescued の 59% を占め全件データ
+            # ゼロ) 等の非 Get 応答は rescue 対象外 — counter だけ inc して
+            # deadline まで expected TID を待ち続ける (= cycle を潰さない)。
+            if len(payload) >= 11:
+                _esv = (payload[10] if isinstance(payload[10], int)
+                        else ord(payload[10]))
+                if _esv not in (0x72, 0x52):
+                    if diag_state is not None:
+                        try:
+                            diag_state.on_erxudp_inf_ignored()
+                        except Exception as e:
+                            log("diag on_erxudp_inf_ignored error: {}"
+                                .format(e))
+                    continue
             if expected_tid is not None:
                 got_tid = extract_el_tid(payload)
                 if got_tid != expected_tid:
@@ -3811,19 +3842,15 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                             log("diag on_erxudp_tid_mismatch error: {}"
                                 .format(e))
                     # spec 020: ring lookup で late frame 救済を試行。
-                    # send_history に hit → 過去 send 時の TID と一致、
-                    # メーター ECHONET 内部 queue 遅延応答と判定 → payload を
-                    # caller に返す + diag bus に send_ts を stash。
-                    # spec 020 v1.5: got_tid=0 (= メーター uninit response、
-                    # 実機観察で mismatch frame の 100% を占める) は通常 lookup
-                    # で hit しないので、 fallback で「直近 send への応答」 と
-                    # 仮定して lookup_latest で救済。 累積系のみ late publish
-                    # 設計のため不正確でも害は限定的 (累積値は単調増加)。
+                    # spec 048 FR-002/003: got_tid=0 の lookup_latest fallback
+                    # は撤去 (= 正体が 100% INF と spec 047 で判明、 INF は
+                    # 上の ESV filter で排除済)。 hit した late frame は
+                    # pending_rescued_frames に stash して読み続け、 自 cycle
+                    # の応答 (expected TID) を deadline まで待つ = chain 断ち。
+                    # main loop が毎 cycle drain して過去時刻 backfill publish。
                     if (send_history is not None and got_tid is not None
                             and diag_state is not None):
                         hit = send_history.lookup(got_tid)
-                        if hit is None and got_tid == 0:
-                            hit = send_history.lookup_latest()
                         if hit is not None:
                             send_ts_a, _epcs = hit
                             try:
@@ -3831,14 +3858,13 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                                     time.time() - send_ts_a,
                                     send_ts=send_ts_a)
                                 log("INFO: ERXUDP TID mismatch got={:04X} "
-                                    "recovered as late frame (send_ts ago "
-                                    "{:.1f}s)".format(
+                                    "stashed as late frame (send_ts ago "
+                                    "{:.1f}s), keep waiting".format(
                                         got_tid, time.time() - send_ts_a))
                             except Exception as e:
                                 log("diag on_erxudp_recovered_from_mismatch "
                                     "error: {}".format(e))
-                            # spec 047: rescued frame の ESV / TID / lag 内訳
-                            # を観測 (= H1/H2/H3 支配要因判定)。 挙動は不変。
+                            # spec 047: rescued frame の ESV / TID / lag 内訳観測。
                             try:
                                 diag_state.on_erxudp_rescued(
                                     classify_rescued_esv(payload),
@@ -3847,7 +3873,9 @@ def read_erxudp(fd, timeout=15, diag_state=None, expected_tid=None,
                             except Exception as e:
                                 log("diag on_erxudp_rescued error: {}"
                                     .format(e))
-                            return payload
+                            diag_state.pending_rescued_frames.append(
+                                (payload, send_ts_a))
+                            continue
                     if got_tid is None:
                         log("WARN: ERXUDP payload too short ({} bytes), "
                             "discarding".format(len(payload)))
@@ -4357,6 +4385,8 @@ DIAG_SENSOR_DEFS = [
     ("erxudp_rescued_lag_gt300s_total",   "Rescued Lag >300s",           None, None, "total_increasing", "diagnostic"),
     ("erxudp_rescued_empty_measurement_total",
      "Rescued Empty Measurement (= H2)",                                                None, None, "total_increasing", "diagnostic"),
+    # spec 048: INF (= 非 Get 応答) を rescue 対象から排除した回数。
+    ("erxudp_inf_ignored_total",          "INF Ignored (= spec 048)",    None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),

@@ -147,14 +147,16 @@ def _diag_and_ring():
 
 
 def test_rescue_ring_hit_fires_rescued_counters():
-    """got_tid≠0 の正規 ring hit: esv=get_res / ring_hit / lt5s が inc."""
+    """got_tid≠0 の正規 ring hit: esv=get_res / ring_hit / lt5s が inc。
+    spec 048: 即 return せず pending に stash して読み続ける (= 後続なしなら None)."""
     diag, ring = _diag_and_ring()
     ring.record(0x0010, time.time() - 1.0, [0xE7])
     readline = _make_readline([_erxudp_line_for(0x0010)])
     payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
                              expected_tid=0x0011, readline=readline,
                              send_history=ring)
-    assert payload is not None
+    assert payload is None
+    assert len(diag.pending_rescued_frames) == 1
     snap = diag.snapshot(now=time.time())
     assert snap["erxudp_rescued_esv_get_res_total"] == 1
     assert snap["erxudp_rescued_tid_ring_hit_total"] == 1
@@ -162,31 +164,36 @@ def test_rescue_ring_hit_fires_rescued_counters():
     assert snap["erxudp_rescued_lag_lt5s_total"] == 1
 
 
-def test_rescue_tid_zero_fallback_fires_tid_zero_counter():
-    """got_tid=0 は lookup_latest fallback 経由 → tid_zero が inc."""
+def test_tid_zero_get_res_is_discarded_not_rescued():
+    """spec 048 FR-002: lookup_latest fallback 撤去 → got_tid=0 は
+    spec 014 discard path (= spec 047 判定でこの population は 100% INF)."""
     diag, ring = _diag_and_ring()
     ring.record(0x0011, time.time() - 0.5, [0xE7])
     readline = _make_readline([_erxudp_line_for(0x0000)])
     payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
                              expected_tid=0x0011, readline=readline,
                              send_history=ring)
-    assert payload is not None
+    assert payload is None
+    assert len(diag.pending_rescued_frames) == 0
     snap = diag.snapshot(now=time.time())
-    assert snap["erxudp_rescued_tid_zero_total"] == 1
-    assert snap["erxudp_rescued_tid_ring_hit_total"] == 0
+    assert snap["erxudp_rescued_tid_zero_total"] == 0
+    assert diag.erxudp_tid_mismatch_total == 1
 
 
-def test_rescue_inf_frame_classified_as_inf():
-    """ESV=0x73 (自律通知 INF) の救済 frame は esv=inf に分類 (H2 検出)."""
+def test_inf_frame_is_ignored_not_rescued():
+    """spec 048 FR-001: ESV=0x73 (INF) は TID check より前段で排除、
+    rescue counter は動かず inf_ignored のみ inc."""
     diag, ring = _diag_and_ring()
     ring.record(0x0011, time.time() - 0.5, [0xE7])
     readline = _make_readline([_erxudp_line_for(0x0000, esv=0x73)])
-    mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
-                   expected_tid=0x0011, readline=readline,
-                   send_history=ring)
+    payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                             expected_tid=0x0011, readline=readline,
+                             send_history=ring)
+    assert payload is None
     snap = diag.snapshot(now=time.time())
-    assert snap["erxudp_rescued_esv_inf_total"] == 1
-    assert snap["erxudp_rescued_esv_get_res_total"] == 0
+    assert snap["erxudp_inf_ignored_total"] == 1
+    assert snap["erxudp_rescued_esv_inf_total"] == 0
+    assert diag.erxudp_tid_mismatch_total == 0
 
 
 def test_rescue_late_frame_falls_in_60to300s_bucket():
@@ -199,3 +206,41 @@ def test_rescue_late_frame_falls_in_60to300s_bucket():
                    send_history=ring)
     snap = diag.snapshot(now=time.time())
     assert snap["erxudp_rescued_lag_60to300s_total"] == 1
+
+
+def test_inf_then_expected_frame_returns_live():
+    """spec 048 AC-2: INF が来ても待ち続け、後続の expected TID 一致を live で返す。
+    現行 (= spec 047 まで) では INF が cycle を潰していた核心ケース."""
+    diag, ring = _diag_and_ring()
+    ring.record(0x0011, time.time() - 0.5, [0xE7])
+    readline = _make_readline([
+        _erxudp_line_for(0x0000, esv=0x73),
+        _erxudp_line_for(0x0011),
+    ])
+    payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                             expected_tid=0x0011, readline=readline,
+                             send_history=ring)
+    assert payload is not None
+    assert mb.extract_el_tid(payload) == 0x0011
+    assert diag.snapshot(now=time.time())["erxudp_inf_ignored_total"] == 1
+
+
+def test_rescue_then_expected_frame_returns_live_and_stashes():
+    """spec 048 AC-3: late frame を stash した後も読み続け、expected TID
+    一致を live で返す (= chain 断ち + 二重取得)."""
+    diag, ring = _diag_and_ring()
+    send_ts = time.time() - 70.0
+    ring.record(0x0010, send_ts, [0xE7])
+    readline = _make_readline([
+        _erxudp_line_for(0x0010),
+        _erxudp_line_for(0x0011),
+    ])
+    payload = mb.read_erxudp(fd=None, timeout=1, diag_state=diag,
+                             expected_tid=0x0011, readline=readline,
+                             send_history=ring)
+    assert payload is not None
+    assert mb.extract_el_tid(payload) == 0x0011
+    assert len(diag.pending_rescued_frames) == 1
+    stashed_payload, stashed_ts = diag.pending_rescued_frames[0]
+    assert mb.extract_el_tid(stashed_payload) == 0x0010
+    assert abs(stashed_ts - send_ts) < 0.001
