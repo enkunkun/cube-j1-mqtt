@@ -2285,13 +2285,10 @@ class DiagState(object):
         self.realtime_effective_interval_seconds = None
         # Spec 020: TID mismatch late publish recovery — counter + rolling
         # window of lag in seconds (= now - send_ts at mismatch capture)。
-        # last_recovered_send_ts は read_erxudp → main loop の bus 用 (= 戻り値
-        # tuple 化を避けるため diag_state 経由で send_ts を渡す)。 main loop
-        # は read 直後に値を参照 → None リセット、 race condition なし
-        # (main thread のみ)。
+        # spec 048 FR-007: 旧 last_recovered_send_ts bus は撤去、 rescued
+        # frame の受け渡しは pending_rescued_frames (下の spec 048 節) に一本化。
         self.erxudp_recovered_from_mismatch_total = 0
         self.erxudp_recovered_lag_seconds_recent = collections.deque(maxlen=100)
-        self.last_recovered_send_ts = None
         # spec 028: 瞬時電力 0xE7 救済 frame の backfill JSON publish 回数.
         # publish_recovery_backfill 内で直接 += 1 (= on_* method なし、 spec 020
         # last_recovered_send_ts と同じく単純 counter)。
@@ -2492,11 +2489,10 @@ class DiagState(object):
     # Spec 020: TID mismatch late publish recovery counter.
 
     def on_erxudp_recovered_from_mismatch(self, lag_sec, send_ts=None):
+        # spec 048 FR-007: send_ts 引数は互換のため残すが bus stash は撤去
+        # (= rescued frame の受け渡しは pending_rescued_frames に一本化)。
         self.erxudp_recovered_from_mismatch_total += 1
         self.erxudp_recovered_lag_seconds_recent.append(float(lag_sec))
-        # send_ts を main loop に渡す bus 用 (= 戻り値 tuple 化を避ける)。
-        if send_ts is not None:
-            self.last_recovered_send_ts = float(send_ts)
 
     # spec 047: rescued frame 内訳観測 — read_erxudp の rescue 確定箇所から
     # ESV 分類 / TID=0 か / lag 秒数を 1 call で受けて 3 軸 counter を inc。
@@ -4553,6 +4549,44 @@ def rescued_measurement_is_empty(m):
     return True
 
 
+def publish_late_frame(mqtt, device_id, m, send_ts, cfg, diag_state):
+    """spec 048 FR-004: drain された rescued frame の measurement publish。
+
+    旧 _late_ts 分岐 (= spec 020 late publish + spec 028/029/046 backfill
+    3 系統 + spec 047 空判定) の関数抽出。 live topic (現在時刻) には
+    一切流さない = data 誠実性維持。"""
+    _m_late = dict((k, v) for k, v in m.items()
+                   if k in CUMULATIVE_PUBLISH_KEYS)
+    if _m_late:
+        publish_measurements(mqtt, device_id, _m_late, timestamp=send_ts)
+    if cfg.get("power_w_recovery_backfill_enabled", True):
+        _m_bf = dict((k, v) for k, v in m.items()
+                     if k in RECOVERY_BACKFILL_KEYS)
+        if _m_bf:
+            publish_recovery_backfill(mqtt, device_id, _m_bf, send_ts,
+                                      diag_state)
+    if cfg.get("cumulative_recovery_backfill_enabled", True):
+        _m_cum_bf = dict((k, v) for k, v in m.items()
+                         if k in CUMULATIVE_BACKFILL_KEYS)
+        if _m_cum_bf:
+            publish_recovery_backfill(
+                mqtt, device_id, _m_cum_bf, send_ts, diag_state,
+                counter_attr="cumulative_recovered_backfill_total")
+    if cfg.get("current_r_a_recovery_backfill_enabled", True):
+        _m_cur_bf = dict((k, v) for k, v in m.items()
+                         if k in CURRENT_BACKFILL_KEYS)
+        if _m_cur_bf:
+            publish_recovery_backfill(
+                mqtt, device_id, _m_cur_bf, send_ts, diag_state,
+                counter_attr="current_r_a_recovered_backfill_count")
+    if rescued_measurement_is_empty(m):
+        try:
+            diag_state.on_erxudp_rescued_empty_measurement()
+        except Exception as e:
+            log("diag on_erxudp_rescued_empty_measurement error: {}"
+                .format(e))
+
+
 def publish_recovery_backfill(mqtt, device_id, m, send_ts, diag_state=None,
                               counter_attr="power_w_recovered_backfill_total"):
     """spec 028/029: 救済 frame の値を `<key>_recovered_json` topic に
@@ -4896,6 +4930,20 @@ def main():
                     except Exception as e:
                         log("diag on_erxudp_recovered_by_retry error: {}".format(e))
                 now = time.time()
+                # spec 048 FR-004: read_erxudp が stash した rescued frame を
+                # 毎 cycle drain して過去時刻 backfill publish (= data 有無に
+                # 関わらず実行、 rescue-only cycle でも実データは救う)。
+                while diag_state.pending_rescued_frames:
+                    _payload_r, _send_ts_r = (
+                        diag_state.pending_rescued_frames.popleft())
+                    try:
+                        _m_r = apply_energy_scale(
+                            decode_measurements(parse_el_response(_payload_r)),
+                            coeff, unit_kwh)
+                        publish_late_frame(mqtt, device_id, _m_r,
+                                           _send_ts_r, cfg, diag_state)
+                    except Exception as e:
+                        log("late frame drain error: {}".format(e))
                 if data:
                     try:
                         diag_state.on_erxudp_latency((now - t_send) * 1000.0)
@@ -4911,70 +4959,11 @@ def main():
                     if kind == "normal":
                         # Probe responses (0x80 only) carry no power values;
                         # publish only on real measurement cycles.
-                        # spec 020: read_erxudp が late frame 救済した場合、
-                        # diag_state.last_recovered_send_ts に send_ts が
-                        # stash されてる (bus パターン)。 累積系 EPC のみ
-                        # filter + 過去 timestamp で publish。
-                        _late_ts = diag_state.last_recovered_send_ts
-                        diag_state.last_recovered_send_ts = None
-                        if _late_ts is not None:
-                            _m_late = dict(
-                                (k, v) for k, v in m.items()
-                                if k in CUMULATIVE_PUBLISH_KEYS)
-                            if _m_late:
-                                publish_measurements(
-                                    mqtt, device_id, _m_late,
-                                    timestamp=_late_ts)
-                            # spec 028: 瞬時系 (= 0xE7) は別 topic に backfill JSON で
-                            # publish、 grafana で `power_watts_recovered` series に
-                            # 過去時刻でプロット (= HA 経路は触らない)。
-                            if cfg.get("power_w_recovery_backfill_enabled", True):
-                                _m_bf = dict(
-                                    (k, v) for k, v in m.items()
-                                    if k in RECOVERY_BACKFILL_KEYS)
-                                if _m_bf:
-                                    publish_recovery_backfill(
-                                        mqtt, device_id, _m_bf,
-                                        _late_ts, diag_state)
-                            # spec 029: 累積系 (= energy_*_kwh) も別 topic に
-                            # backfill JSON publish、 grafana panel-10 の
-                            # `*_recovered` series で救済点 plot。 既存
-                            # `_late_publish_ts` retain (= spec 020 v1.5) と
-                            # 並列存在 (= 両方残す)。
-                            if cfg.get("cumulative_recovery_backfill_enabled", True):
-                                _m_cum_bf = dict(
-                                    (k, v) for k, v in m.items()
-                                    if k in CUMULATIVE_BACKFILL_KEYS)
-                                if _m_cum_bf:
-                                    publish_recovery_backfill(
-                                        mqtt, device_id, _m_cum_bf,
-                                        _late_ts, diag_state,
-                                        counter_attr=(
-                                            "cumulative_recovered_backfill_total"))
-                            # spec 046: 電流 (= 0xE8) も同 ERXUDP フレームから
-                            # 救済可能、 別 topic + 別 counter で backfill publish、
-                            # Grafana で current_r_a の visual gap も埋める。
-                            if cfg.get("current_r_a_recovery_backfill_enabled", True):
-                                _m_cur_bf = dict(
-                                    (k, v) for k, v in m.items()
-                                    if k in CURRENT_BACKFILL_KEYS)
-                                if _m_cur_bf:
-                                    publish_recovery_backfill(
-                                        mqtt, device_id, _m_cur_bf,
-                                        _late_ts, diag_state,
-                                        counter_attr=(
-                                            "current_r_a_recovered_backfill_count"))
-                            # spec 047 FR-004: rescued cycle なのに publish
-                            # 可能な実 data ゼロ (= INF 等で cycle 浪費、 H2
-                            # の直接証拠) を counter で観測。
-                            if rescued_measurement_is_empty(m):
-                                try:
-                                    diag_state.on_erxudp_rescued_empty_measurement()
-                                except Exception as e:
-                                    log("diag on_erxudp_rescued_empty_"
-                                        "measurement error: {}".format(e))
-                        else:
-                            publish_measurements(mqtt, device_id, m)
+                        # spec 048 FR-007: 旧 _late_ts bus 分岐 (= spec 020/
+                        # 028/029/046/047) は pending_rescued_frames drain +
+                        # publish_late_frame に一本化して撤去。 ここに来る
+                        # data は expected TID 一致の live 応答のみ。
+                        publish_measurements(mqtt, device_id, m)
                     emit_poll_success(LOGGER, measurements=m)
                     try:
                         diag_state.on_poll_success(now)
