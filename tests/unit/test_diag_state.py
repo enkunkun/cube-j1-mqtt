@@ -95,6 +95,10 @@ def test_initial_snapshot_includes_zero_counters_uptime_and_version():
         "erxudp_rescued_empty_measurement_total": 0,
         # spec 048: INF 排除 counter (= 0 でも publish)。
         "erxudp_inf_ignored_total": 0,
+        # spec 049: minimal poll counter (= 0 でも publish)。
+        "noise_minimal_polls_total": 0,
+        "noise_minimal_poll_success_total": 0,
+        "noise_minimal_poll_timeout_total": 0,
         "uptime_seconds": 42,
         "version": "1.0.0+test",
     }

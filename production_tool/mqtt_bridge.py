@@ -158,6 +158,9 @@ def apply_defaults(cfg):
     out.setdefault("noise_adaptive_skip_enabled", True)
     out.setdefault("noise_skip_threshold", 100)
     out.setdefault("noise_skip_max_consecutive", 3)
+    # spec 049: noisy cycle を完全 skip でなく 0xE7 単独 (OPC=1) minimal
+    # poll に降格。 False で spec 012 の完全 skip に戻る (= kill switch)。
+    out.setdefault("noise_skip_tier1_minimal_poll_enabled", True)
     # spec 013: poll_interval default 60s + ARIB STD-T108 floor 30s.
     # Faster polling risks exceeding the 360s/hour duty cycle once
     # retries/reconnects are factored in.
@@ -2357,6 +2360,12 @@ class DiagState(object):
         # stash して read を継続、 main loop が毎 cycle drain して backfill
         # publish する。 maxlen=8 = reconnect 直後 burst 対策 (通常 0-1 件)。
         self.pending_rescued_frames = collections.deque(maxlen=8)
+        # spec 049: noisy cycle の 0xE7 単独 minimal poll 観測 counter。
+        # timeout は erxudp_timeouts_total と分離 (= FR-004、 spec 012 の
+        # reconnect storm 防止を維持しつつ noise 中の回収率を直接測る)。
+        self.noise_minimal_polls_total = 0
+        self.noise_minimal_poll_success_total = 0
+        self.noise_minimal_poll_timeout_total = 0
         # spec 040 Phase 2b hotfix v4: _wait_skjoin_event25 の terminal reason
         # を bus pattern で共有 (= "event_25" 成功 / "event_24" PANA fail /
         # "timeout" 経過秒切れ)。 skrejoin_tick の失敗 log 精細化に使用、
@@ -2513,6 +2522,17 @@ class DiagState(object):
 
     def on_erxudp_inf_ignored(self):
         self.erxudp_inf_ignored_total += 1
+
+    # spec 049: noisy cycle minimal poll 観測。
+
+    def on_noise_minimal_poll(self):
+        self.noise_minimal_polls_total += 1
+
+    def on_noise_minimal_poll_success(self):
+        self.noise_minimal_poll_success_total += 1
+
+    def on_noise_minimal_poll_timeout(self):
+        self.noise_minimal_poll_timeout_total += 1
 
     # Spec 006: Wi-SUN health observability — rolling RTT + event/error tallies.
 
@@ -2706,6 +2726,12 @@ class DiagState(object):
             self.erxudp_rescued_empty_measurement_total)
         # spec 048: INF 排除 counter (= 0 でも publish、 SC-1 verify 用)。
         out["erxudp_inf_ignored_total"] = self.erxudp_inf_ignored_total
+        # spec 049: minimal poll counter 3 本 (= 回収率計算に 0 も必要)。
+        out["noise_minimal_polls_total"] = self.noise_minimal_polls_total
+        out["noise_minimal_poll_success_total"] = (
+            self.noise_minimal_poll_success_total)
+        out["noise_minimal_poll_timeout_total"] = (
+            self.noise_minimal_poll_timeout_total)
 
         # Spec 006: named EVENT / ER counters. Omit zero-count entries
         # so HA discovery does not advertise sensors that have never fired.
@@ -3370,6 +3396,9 @@ EPCS = [0xD3, 0xE1, 0xE7, 0xE0, 0xE3, 0xE8]
 # what changes the most (power) at full rate while less-volatile data is
 # refreshed at a lower cadence.
 TIER1_EPCS = [0xE7, 0xE8]         # 瞬時電力、 瞬時電流 — real-time
+# spec 049: noisy cycle 用の最小 frame (= OPC=1)。 noise 中の airtime を
+# 最小化しつつ user 最優先軸 (= 瞬時電力) だけ回収する。
+NOISE_MINIMAL_EPCS = [0xE7]
 TIER2_EPCS = [0xE0, 0xE3]         # 積算電力量 (forward / reverse) — slow
 TIER3_EPCS = [0xD3, 0xE1]         # 係数 / 単位 — near-static
 TIER4_EPCS = [0xEA, 0xEB]         # spec 018: 定時積算電力量 fwd/rev — meter ts
@@ -3484,6 +3513,22 @@ def compute_tid_lag(expected, got, modulo=0x10000):
     if expected is None or got is None:
         return None
     return (int(expected) - int(got)) % int(modulo)
+
+def decide_noise_cycle_action(noisy, streak, max_consecutive,
+                              minimal_enabled):
+    """spec 049 FR-005: noisy 判定 cycle の扱いを決める pure helper.
+
+    Returns "normal" / "skip" / "minimal":
+      normal  = 静穏 or streak 上限到達 (= spec 012 fail-safe、 通常 poll)
+      skip    = noisy + minimal 無効 (= spec 012 の完全 skip、 kill switch)
+      minimal = noisy + minimal 有効 (= 0xE7 単独 OPC=1 の reduced poll)
+    """
+    if not noisy or streak >= max_consecutive:
+        return "normal"
+    if minimal_enabled:
+        return "minimal"
+    return "skip"
+
 
 def classify_rescued_esv(payload):
     """spec 047: rescued frame の ESV 分類 (pure helper).
@@ -4383,6 +4428,10 @@ DIAG_SENSOR_DEFS = [
      "Rescued Empty Measurement (= H2)",                                                None, None, "total_increasing", "diagnostic"),
     # spec 048: INF (= 非 Get 応答) を rescue 対象から排除した回数。
     ("erxudp_inf_ignored_total",          "INF Ignored (= spec 048)",    None, None, "total_increasing", "diagnostic"),
+    # spec 049: noisy cycle の 0xE7 単独 minimal poll 観測。
+    ("noise_minimal_polls_total",         "Noise Minimal Polls",         None, None, "total_increasing", "diagnostic"),
+    ("noise_minimal_poll_success_total",  "Noise Minimal Poll Success",  None, None, "total_increasing", "diagnostic"),
+    ("noise_minimal_poll_timeout_total",  "Noise Minimal Poll Timeout",  None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER05_total",    "SK FAIL ER05",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER09_total",    "SK FAIL ER09",                None, None, "total_increasing", "diagnostic"),
     ("sk_error_ER10_total",    "SK FAIL ER10",                None, None, "total_increasing", "diagnostic"),
@@ -4820,24 +4869,42 @@ def main():
             # spec 012: skip normal poll while the PAN channel is noisy,
             # with a fail-safe of N consecutive skips to prevent indefinite
             # silence if EEDSCAN never settles.
+            # spec 049: 完全 skip の代わりに 0xE7 単独 minimal poll に降格
+            # (= decide_noise_cycle_action、 kill switch で spec 012 挙動)。
+            _noise_minimal = False
             if kind == "normal" and cfg.get("noise_adaptive_skip_enabled", True):
-                if (eedscan_state.is_noisy(
+                _noise_action = decide_noise_cycle_action(
+                    eedscan_state.is_noisy(
                         threshold=int(cfg.get("noise_skip_threshold", 100)),
-                        pan_channel=diag_state.pan_channel)
-                        and noise_skip_streak < int(cfg.get(
-                            "noise_skip_max_consecutive", 3))):
+                        pan_channel=diag_state.pan_channel),
+                    noise_skip_streak,
+                    int(cfg.get("noise_skip_max_consecutive", 3)),
+                    cfg.get("noise_skip_tier1_minimal_poll_enabled", True))
+                if _noise_action != "normal":
                     try:
                         diag_state.on_noise_adaptive_skip()
                     except Exception as e:
                         log("diag on_noise_adaptive_skip error: {}".format(e))
                     noise_skip_streak += 1
-                    # spec 022: 起床周期も _eff_interval に統一して
-                    # burst 中の noise skip でも 5s 周期を維持。
-                    time.sleep(compute_next_poll_sleep(
-                        last_poll_start, time.time(), _eff_interval))
-                    continue
-                noise_skip_streak = 0
-            if kind == "probe":
+                    if _noise_action == "skip":
+                        # spec 022: 起床周期も _eff_interval に統一して
+                        # burst 中の noise skip でも 5s 周期を維持。
+                        time.sleep(compute_next_poll_sleep(
+                            last_poll_start, time.time(), _eff_interval))
+                        continue
+                    _noise_minimal = True
+                    try:
+                        diag_state.on_noise_minimal_poll()
+                    except Exception as e:
+                        log("diag on_noise_minimal_poll error: {}".format(e))
+                else:
+                    noise_skip_streak = 0
+            if _noise_minimal:
+                # spec 049: 0xE7 単独 OPC=1。 tier rotation / normal_cycle_count
+                # / last_normal_poll_start は進めない (= 既存 skip と同じ扱い、
+                # noise 明けの tier 消化を乱さない)。
+                cycle_epcs = NOISE_MINIMAL_EPCS
+            elif kind == "probe":
                 cycle_epcs = PROBE_EPCS
             elif catchup_remaining > 0:
                 # spec 022: catch-up sequence after burst (dig 決定 A) —
@@ -4969,6 +5036,26 @@ def main():
                         diag_state.on_poll_success(now)
                     except Exception as e:
                         log("diag on_poll_success error: {}".format(e))
+                    if _noise_minimal:
+                        # spec 049 FR-003: noise 中でも OPC=1 なら通る仮説の
+                        # 回収率観測 (= SC-1)。
+                        try:
+                            diag_state.on_noise_minimal_poll_success()
+                        except Exception as e:
+                            log("diag on_noise_minimal_poll_success error: {}"
+                                .format(e))
+                elif _noise_minimal:
+                    # spec 049 FR-004: minimal poll の timeout は専用 counter
+                    # のみ。 erxudp_timeouts / consecutive counter / force
+                    # reconnect 判定に数えない (= spec 012 の noise 由来
+                    # reconnect storm 防止を維持)。
+                    emit_poll_failure(LOGGER,
+                                      reason="noise_minimal_poll_timeout")
+                    try:
+                        diag_state.on_noise_minimal_poll_timeout()
+                    except Exception as e:
+                        log("diag on_noise_minimal_poll_timeout error: {}"
+                            .format(e))
                 else:
                     emit_poll_failure(LOGGER, reason="erxudp_timeout")
                     try:
