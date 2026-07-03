@@ -31,11 +31,13 @@ def test_default_erxudp_intra_cycle_retries_is_0():
     assert cfg["erxudp_intra_cycle_retries"] == 0
 
 
-def test_default_erxudp_timeout_force_reconnect_threshold_is_6():
-    """spec 027 で 5→30 にしたが「30 分死」 ループの主因、 spec 032 で 6 に
-    巻き戻し。 6 cycle × 60s = 6 分で reconnect、 broute-mqtt 並み反応性。"""
+def test_default_erxudp_timeout_force_reconnect_threshold_is_2():
+    """spec 027 で 5→30 → spec 032 で 6 → spec 050 で 2。 gap 解剖
+    (2026-07-03) で「6 連続 timeout 待ち ≈ 6.8 分が blackout の 7 割」 と
+    確定、 3h A/B (= config override 試行) で 300s 超 blackout 16→2 回/3h、
+    reconnect 11.1/h (= 許容内) を実証して default 昇格。"""
     cfg = mb.apply_defaults({})
-    assert cfg["erxudp_timeout_force_reconnect_threshold"] == 6
+    assert cfg["erxudp_timeout_force_reconnect_threshold"] == 2
 
 
 def test_explicit_override_preserved_for_aggressive_polling_keys():
