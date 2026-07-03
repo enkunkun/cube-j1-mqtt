@@ -161,6 +161,15 @@ def apply_defaults(cfg):
     # spec 049: noisy cycle を完全 skip でなく 0xE7 単独 (OPC=1) minimal
     # poll に降格。 False で spec 012 の完全 skip に戻る (= kill switch)。
     out.setdefault("noise_skip_tier1_minimal_poll_enabled", True)
+    # spec 051: PANA session の計画的 refresh (= 失効前に先回り full
+    # reconnect、 不意の 2.5 分 blackout を ~15s の計画停止に変換)。
+    # 480s = spec 040 hotfix 実測 tuning (= session 寿命 10-12 分の手前)。
+    out.setdefault("proactive_rejoin_enabled", True)
+    out.setdefault("proactive_rejoin_after_sec", 480)
+    # spec 051 FR-004: SKREJOIN tick (= spec 040 Phase 2b、 94-100% reject、
+    # tako 合議 2026-07-01 で本番 OFF 推奨) を default OFF に。 proactive が
+    # supersede、 config で復活可。
+    out.setdefault("skrejoin_tick_enabled", False)
     # spec 013: poll_interval default 60s + ARIB STD-T108 floor 30s.
     # Faster polling risks exceeding the 360s/hour duty cycle once
     # retries/reconnects are factored in.
@@ -2339,6 +2348,9 @@ class DiagState(object):
         self.skrejoin_count = 0
         self.skrejoin_fail_count = 0
         self.skrejoin_active = False
+        # spec 051: 計画的 session refresh 発火回数 (= SKREJOIN tick を
+        # supersede、 full reconnect path 再利用)。
+        self.proactive_rejoin_total = 0
         # spec 046: current_r_a (= 0xE8) 救済 frame backfill 件数 counter。
         # publish_recovery_backfill helper の counter_attr 引数で inc。
         self.current_r_a_recovered_backfill_count = 0
@@ -2581,6 +2593,10 @@ class DiagState(object):
         に発火、 既存 reconnect path に fallback (= pending_wisun_rejoin=True)。"""
         self.skrejoin_fail_count += 1
 
+    def on_proactive_rejoin(self):
+        """spec 051: 計画的 session refresh 発火時 (= raise 直前) に inc。"""
+        self.proactive_rejoin_total += 1
+
     def on_erxudp_raw(self, line):
         self.last_erxudp_raw_line = line
 
@@ -2766,6 +2782,8 @@ class DiagState(object):
         # 0 でも reconnect 経由 reauth が支配的なケースの観測点)。
         out["skrejoin_total"] = self.skrejoin_count
         out["skrejoin_fail_total"] = self.skrejoin_fail_count
+        # spec 051: 計画的 session refresh counter (= 0 でも publish)。
+        out["proactive_rejoin_total"] = self.proactive_rejoin_total
         # spec 046: current_r_a (= 0xE8) 救済 frame backfill counter。
         out["current_r_a_recovered_backfill_total"] = (
             self.current_r_a_recovered_backfill_count)
@@ -3130,6 +3148,31 @@ def _wisun_init_sequence(fd, br_id, br_pwd, diag_state=None):
 # 更新に間に合わず should_fire_skrejoin 常に False に。 tick=480s (8 分) に下方
 # 修正で reconnect 周期より 3-4 分早く発火、 hotfix 後の初回 deploy で確認。
 SKREJOIN_TICK_SECONDS = 480
+
+
+class ProactiveSessionRefresh(RuntimeError):
+    """spec 051: 計画的 session refresh の signal 例外。
+
+    既存 reconnect path (= main loop 外側 except) を再利用しつつ、
+    isinstance 判定で backoff を 0 に short-circuit する (= 失敗由来では
+    ないので spec 017 の exponential backoff は不要)。"""
+    pass
+
+
+def should_fire_proactive_rejoin(last_event_25_ts, now, after_sec,
+                                 skrejoin_active):
+    """spec 051 FR-001: 計画的 full reconnect の発火判定 (pure helper)。
+
+    PANA session 失効 (~10-12 分周期) を待ち受けるのではなく、 実測寿命
+    より手前 (default 480s) で先回りして cached SKJOIN reconnect する。
+    spec 040 Phase 2b (= SKREJOIN in-place 再認証、 94-100% reject) と
+    同じ発火点・同じ base time で、 行動だけ実績のある full reconnect に
+    差し替えたもの。"""
+    if last_event_25_ts is None:
+        return False
+    if skrejoin_active:
+        return False
+    return (now - last_event_25_ts) > after_sec
 
 
 def should_fire_skrejoin(diag_state, now):
@@ -4410,6 +4453,8 @@ DIAG_SENSOR_DEFS = [
     # spec 040 Phase 2b: 能動 SKREJOIN 発火 / 失敗 counter (= BP35A1 Ver 1.3.2 p.14、 720s reauth 衝突回避)。
     ("skrejoin_total",           "SKREJOIN Active Count",                               None, None, "total_increasing", "diagnostic"),
     ("skrejoin_fail_total",      "SKREJOIN Fail Count (= fallback to reconnect)",       None, None, "total_increasing", "diagnostic"),
+    # spec 051: 計画的 session refresh (= SKREJOIN tick を supersede)。
+    ("proactive_rejoin_total",   "Proactive Session Refresh",   None, None, "total_increasing", "diagnostic"),
     # spec 046: current_r_a (= 0xE8) 救済 frame backfill (= spec 028 と同 ECHONET フレーム、 別 counter)。
     ("current_r_a_recovered_backfill_total",
      "Current R-A Recovered Backfill (= 0xE8)",                                         None, None, "total_increasing", "diagnostic"),
@@ -4807,12 +4852,30 @@ def main():
     while True:
         try:
             last_poll_start = time.time()
+            # spec 051: 計画的 session refresh — PANA 失効 (~10-12 分周期) の
+            # 手前 (default 480s) で先回り full reconnect。 専用例外で外側
+            # reconnect path を再利用 (= backoff 0、 cached SKJOIN ~15s)。
+            # 発火点は spec 040 Phase 2b hotfix v2 と同じ cycle 開始時。
+            if cfg.get("proactive_rejoin_enabled", True) and \
+                    should_fire_proactive_rejoin(
+                        diag_state.last_event_25_ts, last_poll_start,
+                        int(cfg.get("proactive_rejoin_after_sec", 480)),
+                        diag_state.skrejoin_active):
+                _elapsed = int(last_poll_start - diag_state.last_event_25_ts)
+                try:
+                    diag_state.on_proactive_rejoin()
+                except Exception as e:
+                    log("diag on_proactive_rejoin error: {}".format(e))
+                raise ProactiveSessionRefresh(
+                    "planned session refresh (last_event_25_seconds={})"
+                    .format(_elapsed))
             # spec 040 Phase 2b hotfix v2: cycle 開始時に能動 SKREJOIN 判定
             # (= poll_success 直後のみに置くと poll_failure 連続 60% baseline
             # で 480s 閾値超過しても発火機会なし、 その間に既存 reconnect path
             # が先に発火して 12 分周期 reconnect が継続する root cause 判明)。
             # cycle 開始時 = poll_success/failure に関係なく発火機会を確保。
-            if cfg.get("skrejoin_tick_enabled", True) and \
+            # spec 051 FR-004: default OFF (= proactive が supersede)。
+            if cfg.get("skrejoin_tick_enabled", False) and \
                     should_fire_skrejoin(diag_state, last_poll_start):
                 try:
                     _pan = {
@@ -5156,8 +5219,15 @@ def main():
                 _backoff_initial,
                 float(cfg.get("wisun_rejoin_backoff_multiplier", 2.0)),
                 int(cfg.get("wisun_rejoin_backoff_max_sec", 300)))
-            log("Main loop error (attempt {}): {} - reconnecting Wi-SUN in {}s"
-                .format(attempt + 1, e, _backoff))
+            # spec 051: 計画的 refresh は失敗由来ではないので backoff 不要
+            # (= 停止を reconnect 実時間 ~15s だけに抑える)。 reconnect 自体
+            # が失敗した場合は次周回で通常例外 → 既存 backoff に自然移行。
+            if isinstance(e, ProactiveSessionRefresh):
+                _backoff = 0
+                log("Planned session refresh: {} - reconnecting now".format(e))
+            else:
+                log("Main loop error (attempt {}): {} - reconnecting Wi-SUN in {}s"
+                    .format(attempt + 1, e, _backoff))
             time.sleep(_backoff)
             _reopen_after = int(cfg.get(
                 "wisun_serial_reopen_after_rejoin_failures", 5))
