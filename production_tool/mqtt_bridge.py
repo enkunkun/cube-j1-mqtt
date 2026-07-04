@@ -186,7 +186,7 @@ def apply_defaults(cfg):
     # spec 017: Wi-SUN rejoin exponential backoff + serial port reopen
     # after N consecutive wisun_connect failures, recovering from long
     # outages without hammering the meter every 30s.
-    out.setdefault("wisun_rejoin_backoff_initial_sec", 30)
+    out.setdefault("wisun_rejoin_backoff_initial_sec", 5)  # spec 052: 30→5 (threshold=2 で 11 回/h の reconnect が毎回 30s 払う隠れ損失を回収、同帯 A/B で +21% 実証)
     out.setdefault("wisun_rejoin_backoff_max_sec", 300)
     out.setdefault("wisun_rejoin_backoff_multiplier", 2.0)
     out.setdefault("wisun_serial_reopen_after_rejoin_failures", 5)

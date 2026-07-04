@@ -85,3 +85,11 @@ def test_default_skrejoin_tick_disabled():
     """spec 051 FR-004: SKREJOIN tick (= 94-100% event_24 reject、 tako
     合議 2026-07-01 で本番 OFF 推奨) を proactive が supersede."""
     assert _defaults()["skrejoin_tick_enabled"] is False
+
+
+def test_default_rejoin_backoff_initial_is_5():
+    """spec 052: 無計画 reconnect の initial backoff 30→5s。 threshold=2 で
+    11 回/h 発生する reconnect が毎回 30s 払う隠れ損失 (~5.5 分/h) を回収、
+    同時間帯 A/B (2026-07-04) で live +21% を実証。 escalation (x2、 max
+    300s clamp) は不変。"""
+    assert _defaults()["wisun_rejoin_backoff_initial_sec"] == 5
