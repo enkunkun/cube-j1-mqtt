@@ -24,3 +24,8 @@
 
 - 計画 refresh を成立させる唯一の道は **slot 消費ゼロ化** = cycle 開始 raise ではなく「poll 成功直後の idle 窓 (~55s) で inline reconnect」する設計。防止率 29% でも slot コスト 0 なら純益になる。ただし ipv6 更新・fd 状態管理が複雑化するため、backoff=5 の効果測定後に費用対効果を再評価
 - backoff 30→5 は前提非依存の回収 (~25s × 7.2 回/h ≈ 3 min/h)。本窓では after_sec の赤字と混合して判定不能 → **09:23〜12:23 の backoff=5 単独窓で判定し、有効なら spec 052 (backoff default 30→5) で昇格**
+
+
+## 追記 (2026-07-04 12:40): backoff=5 単独判定 = 有効、spec 052 昇格完了
+
+同時間帯比較 (09:30-12:30 帯): backoff=30 の昨日 23.3/h → backoff=5 の今日 **28.1/h (+21%)**、理論回収値と一致。max gap 222s / 300s 超 0 で異常なし、proactive は 1 件 (= 不発確認 ✓)。spec 052 (`1005c732`) で default 30→5 に昇格し、実機 override を削除済み。**これで実機 config override はゼロ、全 tuning が repo の default に集約された。**
