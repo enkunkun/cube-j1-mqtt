@@ -45,8 +45,11 @@ def test_apply_defaults_preserves_normal_poll_interval():
 
 
 def test_apply_defaults_uses_default_when_poll_interval_missing():
+    """spec 053: default 60 → 30 (= MIN_POLL_INTERVAL_SEC の floor ちょうど)。
+    3h A/B (2026-07-06) で live 51.2→98.7/h、 poll 倍増でも session death
+    rate 非加速 (timeout/poll 比はむしろ半減) を実証して昇格。"""
     cfg = mb.apply_defaults({})
-    assert cfg["poll_interval"] == 60
+    assert cfg["poll_interval"] == 30
 
 
 def test_validate_config_patch_other_keys_unaffected():

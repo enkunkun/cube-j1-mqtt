@@ -119,7 +119,7 @@ def apply_defaults(cfg):
     # 78% 欠損 + reconnect 430 回 (= 1 回/3 分) の主因と判明、 5 連続 fail で
     # 発火する設計はメーター応答性悪化時に loop 化。 30 連続 (= 900 秒 ≒
     # 15 分) に緩和でメーター完全 dead 検知は遅れるが欠損率劇的改善見込み。
-    out.setdefault("erxudp_timeout_force_reconnect_threshold", 2)  # spec 050: 6 → 2 (gap 解剖で 6.8 分待ちが blackout 主成分と確定、 3h A/B で実証)
+    out.setdefault("erxudp_timeout_force_reconnect_threshold", 1)  # spec 050: 6 → 2、 spec 053: 2 → 1 (単発 timeout ≈ session 死の確定信号。 spec 048 INF filter + spec 049 noise 除外が前提、 3h A/B で live +24% 実証)
     # MQTT keep-alive (seconds). Cube J1 のメインループは ECHONET Lite
     # の同期 poll で詰まることがあり、上流デフォルトの 60s では broker から
     # 切断される（実測 約 12 分間隔）。300s なら poll が一時的に滞っても
@@ -170,10 +170,11 @@ def apply_defaults(cfg):
     # tako 合議 2026-07-01 で本番 OFF 推奨) を default OFF に。 proactive が
     # supersede、 config で復活可。
     out.setdefault("skrejoin_tick_enabled", False)
-    # spec 013: poll_interval default 60s + ARIB STD-T108 floor 30s.
-    # Faster polling risks exceeding the 360s/hour duty cycle once
-    # retries/reconnects are factored in.
-    out.setdefault("poll_interval", 60)
+    # spec 013: ARIB STD-T108 floor 30s. spec 053: default 60 → 30
+    # (= floor ちょうど)。 120 poll/h の TX airtime は duty cycle 360s/h
+    # に対し 2 桁の余裕、 3h A/B で live 51.2→98.7/h + session death
+    # rate 非加速を実証。 floor 未満は引き続き clamp。
+    out.setdefault("poll_interval", 30)
     if int(out["poll_interval"]) < MIN_POLL_INTERVAL_SEC:
         log("WARN: poll_interval={} below floor, clamping to {}".format(
             out["poll_interval"], MIN_POLL_INTERVAL_SEC))
@@ -5138,7 +5139,7 @@ def main():
                     # は spec 023 で iter 冒頭計算済 ("burst" or "off")。
                     _force_threshold = compute_force_reconnect_threshold(
                         _effective_mode,
-                        int(cfg.get("erxudp_timeout_force_reconnect_threshold", 5)),
+                        int(cfg.get("erxudp_timeout_force_reconnect_threshold", 1)),
                         int(cfg.get("realtime_burst_force_reconnect_threshold",
                                     REALTIME_BURST_FORCE_RECONNECT_THRESHOLD)))
                     if should_force_wisun_reconnect(
