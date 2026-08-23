@@ -2,7 +2,27 @@
 
 **Feature Branch**: `041-silent-death-watchdog`
 **Created**: 2026-06-28
-**Status**: Phase 2a Deployed (= 2026-06-28 04:22 JST、 lab-ub01 上 cron `*/5 * * * *` で `~/bin/cube-j1-watchdog.sh` 自動実行、 dry run で `alive pid=21822` 検知成功 + kill -9 simulation で「init 自動 restart 経由で alive 検知」 確認。 Phase 2b (= stderr redirect) + Phase 2c (= heartbeat) は次セッション or 次回 silent death 再発時に対応)
+**Status**: **Phase 2b Implemented (= 2026-08-23 JST、 commit b5a788c7) / deploy 保留中** (= cube-j1 adb offline、 物理対応待ち。 bridge 内 `install_excepthook` で uncaught traceback を `/data/local/mqtt_bridge.stderr.log` append + JSON log `uncaught_exception` event に mirror、 crash loop 対策で 256KB 超過時に truncate。 unit test = tests/unit/test_excepthook.py 4 件)。 Phase 2a Deployed (= 2026-06-28 04:22 JST、 lab-ub01 上 cron `*/5 * * * *` で `~/bin/cube-j1-watchdog.sh` 自動実行、 dry run で `alive pid=21822` 検知成功 + kill -9 simulation で「init 自動 restart 経由で alive 検知」 確認。 Phase 2c (= heartbeat) は引き続き次回 silent death 再発時に対応)
+
+## Phase 2b 実装記録 (= 2026-08-23)
+
+### FR-002 の実装方針
+
+- init.rc 側の redirect (`2>>` wrapper 化) は `/system` remount + reboot が必要だが、 本日は adb offline で不可 → **bridge 内 sys.excepthook を主実装に選択** (= FR-002 の第 3 選択肢「Python の sys.excepthook で未捕捉例外を log」)。 rc 改変なしで scenario (A) (= Python uncaught exception 死) を捕捉できる
+- `production_tool/mqtt_bridge.py`:
+  - `STDERR_LOG_PATH = "/data/local/mqtt_bridge.stderr.log"` (= 定数、 config key なし)
+  - `_make_uncaught_exception_hook(logger, stderr_path, prev_hook)` (= hook factory、 全 step best-effort で hook 自身は決して raise しない)
+  - `install_excepthook(logger)` (= main() 冒頭 LOGGER 生成直後に呼び出し)
+- traceback は timestamp header 付きで append、 **256KB 超過時は truncate** (= crash loop で /data 圧迫しない簡易 cap)
+- JSON log には 1 行 summary (= 最終行) を `uncaught_exception` event で mirror → `/api/log` tail 経由でも確認可能
+- 元の excepthook (= stderr 表示) には chain するので将来 rc 側 redirect を入れた場合も二段取り込み可能
+- coverage 注記: Py2 の thread 未捕捉例外は excepthook を通らないが、 MQTT worker thread は既存 guard 済み (= _sender_loop / _keepalive_loop 全 path try/except) で Phase 2b scope 外
+
+### deploy + verify 手順 (= adb 復旧後)
+
+1. 通常通り `scripts/adb_push_update.sh cube-j1.home.arpa` (= lab-ub01 経由、 fork main から embed)
+2. Phase 1 sanity: `/api/diag` の version hash 確認 + `ssh lab-ub01 'adb shell "grep -c install_excepthook /data/local/mqtt_bridge.py"'` ≥ 1 (= [[feedback-lab-ub01-deploy-stale-git]] 式の実機 file 直接確認)
+3. SC-003 (= 次回死亡時 traceback 取得実証) は本番注入不可につき、 次回自然発生時に stderr log + JSON log 両方の記録で判定
 
 ## Phase 2a 実装記録 (= 2026-06-28 04:22 JST)
 
