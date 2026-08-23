@@ -2,7 +2,9 @@
 
 **Feature Branch**: `038-event-21-tx-result-capture`
 **Created**: 2026-06-28
-**Status**: **🚫 Reopened (= Phase 1 結論誤り判明) / 2026-06-30 JST**
+**Status**: **Closed (= 再観察完了、 PARAM=1 = 0 件で FR-003 効果ゼロ確定) / 2026-08-23 JST**
+
+Reopened 旧結論撤回後の再観察を 2026-08-23 に完了 (= observation-2026-08-23.md)。 compose fix 後 54 日窓で `sk_event_21_total` = 147,109 件 (= ~126 件/h) を bridge `/api/diag` と gcx の両側で確認、 内訳は **PARAM=0 (= TX 成功) 100%、 PARAM=1/2 = 0 件**。 ROI 判断基準表の「0 件 = spec close」に該当し、 FR-003 (= 即 retry) は非実装で確定。 FR-001/002 (= PARAM 別 metric) は commit 409fd08 で実装・deploy 済み、 diagnostic 観測として継続。
 
 旧 Status「Closed (= ROI 0 確定)」 を撤回。 gcx で `sk_event_21_total` = vector empty を「0 件発火」 と判断したが、 同日後の bridge `/api/diag` 直接 snapshot 確認で **`sk_event_21_total = 67 件 / 24h`** 計上判明 = 約 2.8 件/h、 memory baseline `erxudp_timeouts` 30 件/h の 約 10% ペースで発火している。
 
@@ -14,6 +16,7 @@ root cause = `compose/telegraf/telegraf.conf` の topics 明示列挙に `sk_eve
 - audit findings P-NEW-3 = Reopened (= Phase 1 再観察後に再評価)
 
 詳細は [[feedback-phase1-event21-zero-erxudp-rx-dominant]] (= INVALIDATED 記載) と [[feedback-compose-telegraf-pipeline]] (= 遵守必須の pipeline knowledge) を参照。
+
 **Input**: 2026-06-27 audit ([[audit-bp35a1-skstack-ip-vs-bridge]]) の P-NEW-3。 BP35A1 公式 Ver 1.3.2 p.51 で SKSENDTO 後の送信結果は EVENT 0x21 (PARAM=0/1/2) で 1-2 秒以内に通知されるが、 bridge は完全 ignore (= `grep "EVENT.*21"` 0 件) で常に ERXUDP 待ち 30s timeout に依存している。
 
 ## Background

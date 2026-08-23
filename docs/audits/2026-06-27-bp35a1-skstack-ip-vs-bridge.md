@@ -4,7 +4,7 @@
 - **bridge**: `production_tool/mqtt_bridge.py` (= 4606 行、 SK ASCII コマンド使用)
 - **公式仕様**: `docs/vendor/bp35a1-skstack-ip/bp35a1_commandmanual_tr-j.pdf` (= Ver 1.3.2、 2020.5 改訂、 2024 配布、 66 ページ)
 - **実機 firmware**: EVER 1.5.2 (= SKSTACK-IP for BP35A1 / BP35C0 共通)
-- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036、 P-NEW-1 resolved by spec 037、 **P-NEW-3 🚫 Reopened (= 2026-06-30、 spec 038 Phase 1 旧結論「EVENT 21 = 0 件」 は誤り、 bridge /api/diag で sk_event_21_total = 67 件 / 24h 計上判明、 root cause = compose/telegraf topics 未 update、 compose commit 0ba5dba1 で fix、 spec 038 Reopened で再観察 + Phase 2 PARAM 区別検討待ち)**、 P-NEW-4 Closed (= spec 039 revert)、 P-NEW-5 Phase 1 SC-002 達成 (= spec 040 24h で wisun_joined 133 件、 720s 仮説 positive、 SC-003 は spec 044 fix 後の再観察待ち)、 spec 041 (= silent death watchdog) Phase 2a Deployed、 spec 042 (= P-NEW-8 SKADDNBR) Deployed + 動作実証 (= bridge /api/diag で skaddnbr_total = 3 確認)、 spec 044 (= bug fix) Deployed + 動作実証 (= sk_event_25_total 0→3 increment)、 残 P-NEW-6/9 open
+- **status**: P-NEW-2 / P-NEW-7 resolved by spec 036、 P-NEW-1 resolved by spec 037、 **P-NEW-3 ✅ Resolved (= 2026-08-23、 spec 038 再観察で PARAM=1 = 0 件 / 147,109 件 (= TX 失敗ゼロ) 確定、 即 retry は効果ゼロで非実装・spec close。 元仮説「timeout の一部は送信失敗」 は否定 = timeout は全て RX 側要因。 詳細 = specs/038-event-21-tx-result-capture/observation-2026-08-23.md)**、 P-NEW-4 Closed (= spec 039 revert)、 P-NEW-5 Phase 1 SC-002 達成 (= spec 040 24h で wisun_joined 133 件、 720s 仮説 positive、 SC-003 は spec 044 fix 後の再観察待ち)、 spec 041 (= silent death watchdog) Phase 2a Deployed、 spec 042 (= P-NEW-8 SKADDNBR) Deployed + 動作実証 (= bridge /api/diag で skaddnbr_total = 3 確認)、 spec 044 (= bug fix) Deployed + 動作実証 (= sk_event_25_total 0→3 increment)、 残 P-NEW-6/9 open
 
 ## 0. 背景
 
@@ -68,6 +68,7 @@ Cube J1 内蔵 Wi-SUN モジュール (品番 BP35C0、 firmware SKSTACK-IP) を
 - bridge: `grep "EVENT.*21\|0x21"` で 0 件
 - 影響: SKSENDTO 後の ERXUDP 待ち timeout (= 30s 待ち) の一部は実は 1-2s で EVENT 0x21 PARAM=1 が通知されている。 これを拾えば即 retry できる
 - memory「BP35CX reconnect 床値 11s = erxudp timeout 主因」 と関連: ERXUDP timeout の一部は「メーター応答遅延」 ではなく「送信失敗」 だった可能性
+- **✅ 解決 (2026-08-23)**: spec 038 Phase 2 (= commit 409fd08) の PARAM 別 metric を実機 54 日分観察した結果、 **EVENT 21 = 147,109 件すべて PARAM=0 (= 送信成功)、 PARAM=1 = 0 件**。 「timeout の一部は送信失敗」 仮説は否定 (= timeout は全て RX 側要因)。 即 retry は効果ゼロで非実装、 spec close (= specs/038-event-21-tx-result-capture/observation-2026-08-23.md)。 PARAM 別 counter は diagnostic 継続監視中
 
 #### P-NEW-4: SKSAVE / SKLOAD / SFF レジスタ完全未使用 = spec 036 候補 (= reconnect 床値突破) の正規ルート
 
@@ -129,7 +130,7 @@ Cube J1 内蔵 Wi-SUN モジュール (品番 BP35C0、 firmware SKSTACK-IP) を
 |---|---|---|---|
 | **spec 036** | P-NEW-2 (EVENT 32/33 ラベル) + P-NEW-7 (SKSCAN コメント) | 文字列 ~3 行 + spec.md | メトリクス意味の正常化 (= 過去観測の再解釈) |
 | **spec 037** | P-NEW-1 (WOPT 毎回発行 → ROPT 確認で skip) | helper + 条件分岐 ~10 行 | FLASH 寿命延命 |
-| **spec 038** | P-NEW-3 (EVENT 0x21 PARAM=1 捕捉 + 即 retry) | serial parser 拡張 + retry hook | ERXUDP timeout 短縮 |
+| **spec 038** | P-NEW-3 (EVENT 0x21 PARAM=1 捕捉 + 即 retry) | serial parser 拡張 + retry hook | ERXUDP timeout 短縮 → **PARAM=1 = 0 件で retry 非実装・close (= 2026-08-23)、 PARAM 別 metric のみ継続** |
 | **spec 039** | P-NEW-5 検証 (= 720s 周期自動再認証の影響観察) | 実機 log grep + 解析 | 12 分周期の ERXUDP timeout の有無確認 |
 | **spec 040** | P-NEW-4 (SKSAVE + SFF=1 で reconnect 床値突破) | 初回 deploy hook + reconnect path 分岐 | reconnect 11s → ~5s |
 | **spec 041** | P-NEW-8 (SKADDNBR で UDP 送信高速化) | spec 035 path に 1 行追加 | 初回 SKSENDTO 1-2s 短縮 |
