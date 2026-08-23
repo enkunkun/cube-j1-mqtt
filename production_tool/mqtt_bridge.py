@@ -26,6 +26,7 @@ import base64
 import hmac
 import tempfile
 import subprocess
+import traceback
 
 try:
     # Python 2.7
@@ -51,6 +52,10 @@ except NameError:
 
 CONFIG_PATH = "/data/local/config.json"
 LOG_PATH    = "/data/local/mqtt_bridge.log"
+# spec 041 Phase 2b (FR-002): uncaught-exception tracebacks. Android init
+# discards the service's stderr, so a process death like the 2026-06-27
+# silent death leaves no clue. The excepthook appends here instead.
+STDERR_LOG_PATH = "/data/local/mqtt_bridge.stderr.log"
 
 LED_R = "/sys/class/leds/red/brightness"
 LED_G = "/sys/class/leds/green/brightness"
@@ -1621,6 +1626,76 @@ class JsonLogger(object):
             self._handler.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# spec 041 Phase 2b: uncaught exception capture (= stderr redirect substitute)
+# ---------------------------------------------------------------------------
+
+_STDERR_LOG_MAX_BYTES = 256 * 1024
+
+
+def _make_uncaught_exception_hook(logger=None, stderr_path=None, prev_hook=None):
+    """Build the sys.excepthook callable for spec 041 Phase 2b (FR-002).
+
+    The hook appends the full traceback of an uncaught main-thread exception
+    to *stderr_path* with a timestamp header, mirrors a one-line summary into
+    the JSON logger as ``uncaught_exception``, and finally chains to
+    *prev_hook* so the default stderr behaviour is preserved. Every step is
+    best-effort: the hook itself must never raise (Python would warn and the
+    original traceback display could be lost).
+    """
+    def _hook(exc_type, exc_value, exc_tb):
+        try:
+            tb_text = "".join(traceback.format_exception(
+                exc_type, exc_value, exc_tb))
+        except Exception:
+            tb_text = "{}: {}\n".format(
+                getattr(exc_type, "__name__", "Exception"), exc_value)
+        try:
+            path = stderr_path or STDERR_LOG_PATH
+            # Crash-loop guard: rewrite (truncate) instead of appending once
+            # the file grows past the cap, so /data cannot fill unbounded.
+            mode = "a"
+            try:
+                if (os.path.exists(path)
+                        and os.path.getsize(path) > _STDERR_LOG_MAX_BYTES):
+                    mode = "w"
+            except OSError:
+                pass
+            with open(path, mode) as f:
+                f.write("===== {} =====\n{}\n".format(
+                    time.strftime("%Y-%m-%d %H:%M:%S"), tb_text))
+        except Exception:
+            pass
+        if logger is not None:
+            try:
+                lines = tb_text.strip().splitlines()
+                logger.error(event="uncaught_exception",
+                             context={"summary": lines[-1] if lines else ""})
+            except Exception:
+                pass
+        if prev_hook is not None:
+            try:
+                prev_hook(exc_type, exc_value, exc_tb)
+            except Exception:
+                pass
+    return _hook
+
+
+def install_excepthook(logger=None, stderr_path=None):
+    """Install the spec 041 Phase 2b excepthook on sys.excepthook.
+
+    Covers death scenario (A) of the 2026-06-27 silent death: a Python-level
+    uncaught exception that init's stderr discard would otherwise lose. The
+    previous hook is chained after recording. MQTT worker threads already
+    guard their loops internally, so main-thread coverage plus the JSON log
+    mirror is sufficient for Phase 2b scope.
+    """
+    prev_hook = sys.excepthook
+    sys.excepthook = _make_uncaught_exception_hook(logger=logger,
+                                                   stderr_path=stderr_path,
+                                                   prev_hook=prev_hook)
 
 
 # ---------------------------------------------------------------------------
@@ -4725,6 +4800,10 @@ def main():
                         max_bytes=int(cfg["log_max_bytes"]),
                         backup_count=int(cfg["log_backup_count"]))
     emit_bridge_start(LOGGER, device_id=device_id, version=bridge_version())
+
+    # spec 041 Phase 2b: record uncaught-exception tracebacks before init
+    # discards the process (silent death root-cause capture).
+    install_excepthook(logger=LOGGER)
 
     # Diagnostics aggregator declared early so the admin UI can read it.
     diag_state = DiagState(start_time=time.time(), version=bridge_version())
