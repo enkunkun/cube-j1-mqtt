@@ -3531,10 +3531,20 @@ def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60,
     intervals align — losing tier4 means missing a 30-min cumulative
     energy boundary, while tier3 (coefficient/unit) is near-static and
     can wait. tier4_every <= 0 disables tier4 entirely (kill switch).
+
+    tier3 の番を tier4 が取ったら、tier3 は次の cycle に回す。既定値
+    (tier3_every=60, tier4_every=30) では tier3 の番がすべて tier4 と重なり、
+    回さないと係数・単位 (D3 / E1) が一度も取れず、積算電力量の換算が
+    単位倍 (0.01 kWh 単位のメーターで 100 倍) に化ける。
     """
-    if tier4_every > 0 and cycle_number % int(tier4_every) == 0:
+    tier4_on = tier4_every > 0
+    if tier4_on and cycle_number % int(tier4_every) == 0:
         return "tier4"
     if cycle_number % int(tier3_every) == 0:
+        return "tier3"
+    prev = cycle_number - 1
+    if (tier4_on and prev >= 0 and prev % int(tier3_every) == 0
+            and prev % int(tier4_every) == 0):
         return "tier3"
     if cycle_number % int(tier2_every) == 0:
         return "tier2"

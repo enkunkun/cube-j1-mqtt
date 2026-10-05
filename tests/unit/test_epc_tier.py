@@ -13,9 +13,32 @@ def test_decide_epc_tier_zero_is_tier4():
     assert mb.decide_epc_tier(cycle_number=0) == "tier4"
 
 
-def test_decide_epc_tier_1_to_4_are_tier1():
-    for i in range(1, 5):
+def test_decide_epc_tier_2_to_4_are_tier1():
+    for i in range(2, 5):
         assert mb.decide_epc_tier(cycle_number=i) == "tier1"
+
+
+def test_decide_epc_tier_1_is_tier3_because_tier4_took_cycle_0():
+    """tier3 の番 (cycle 0) を tier4 が取ったので、次の cycle 1 に tier3 を回す。
+    起動直後に係数と単位 (D3 / E1) を取得し、積算電力量の換算に使う。"""
+    assert mb.decide_epc_tier(cycle_number=1) == "tier3"
+
+
+def test_decide_epc_tier_61_is_tier3_because_tier4_took_cycle_60():
+    assert mb.decide_epc_tier(cycle_number=61) == "tier3"
+
+
+def test_decide_epc_tier_tier3_is_reachable_with_default_intervals():
+    """既定値 (tier3_every=60, tier4_every=30) では tier3 の番がすべて tier4 と重なる。
+    重なった番を後ろへずらさないと tier3 が一度も来ず、単位が既定値 1.0 のまま
+    積算電力量が単位倍 (0.01 kWh 単位のメーターで 100 倍) に化ける。"""
+    tiers = [mb.decide_epc_tier(cycle_number=i) for i in range(121)]
+    assert tiers.count("tier3") >= 2
+
+
+def test_decide_epc_tier_does_not_defer_tier3_when_tier4_disabled():
+    """tier4 を無効にすると tier3 は cycle 0 / 60 で取れるので、cycle 1 は tier1 のまま。"""
+    assert mb.decide_epc_tier(cycle_number=1, tier4_every=0) == "tier1"
 
 
 def test_decide_epc_tier_5_is_tier2():
@@ -28,9 +51,9 @@ def test_decide_epc_tier_10_is_tier2():
 
 
 def test_decide_epc_tier_60_is_tier4():
-    """spec 018: 60 cycle (= 1 時間) は tier4 (定時積算電力量) 優先。
-    tier3 (係数) は cycle 120 で取得。 tier4 を取り損ねると 30 分粒度の
-    累積電力量データが欠落するため、 ほぼ静的な tier3 より優先される。"""
+    """spec 018: 60 cycle は tier4 (定時積算電力量) 優先。tier3 (係数・単位) は
+    次の cycle 61 に回す。tier4 を取り損ねると 30 分粒度の累積電力量データが
+    欠落するため、ほぼ静的な tier3 より優先される。"""
     assert mb.decide_epc_tier(cycle_number=60) == "tier4"
 
 
