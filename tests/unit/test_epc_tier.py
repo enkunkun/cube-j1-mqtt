@@ -125,3 +125,23 @@ def test_epcs_for_tier_returns_correct_list():
 
 def test_epcs_for_tier_unknown_falls_back_to_tier1():
     assert mb.epcs_for_tier("garbage") == mb.TIER1_EPCS
+
+
+# ---------------------------------------------------------------------------
+# 単位 (E1) が分かるまで tier3 を優先する
+# ---------------------------------------------------------------------------
+
+def test_decide_epc_tier_prefers_tier3_until_scale_is_known():
+    """起動直後の tier3 が失敗すると、次の tier3 まで 30 分以上空く。単位が分かるまでは
+    tier4 の番以外は tier3 を問い合わせる (tier3 の要求にも tier1 の EPC が入る)。"""
+    for i in (2, 3, 5, 10, 31):
+        assert mb.decide_epc_tier(cycle_number=i, scale_known=False) == "tier3"
+
+
+def test_decide_epc_tier_keeps_tier4_slots_until_scale_is_known():
+    assert mb.decide_epc_tier(cycle_number=30, scale_known=False) == "tier4"
+
+
+def test_decide_epc_tier_default_assumes_scale_is_known():
+    assert mb.decide_epc_tier(cycle_number=2) == "tier1"
+    assert mb.decide_epc_tier(cycle_number=5) == "tier2"

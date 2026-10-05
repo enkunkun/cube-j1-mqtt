@@ -3560,8 +3560,21 @@ TIER3_EPCS = [0xD3, 0xE1]         # 係数 / 単位 — near-static
 TIER4_EPCS = [0xEA, 0xEB]         # spec 018: 定時積算電力量 fwd/rev — meter ts
 
 
+SCALED_ENERGY_KEYS = ("energy_forward_kwh", "energy_reverse_kwh",
+                      "energy_forward_fixed_kwh", "energy_reverse_fixed_kwh")
+
+
+def drop_unscaled_energy(measurements, scale_known):
+    """単位 (E1) をまだ知らないうちの積算電力量は、既定値 1.0 で換算した単位倍の
+    値なので送らない。単位が分かっていればそのまま返す。"""
+    if scale_known:
+        return measurements
+    return dict((k, v) for k, v in measurements.items()
+                if k not in SCALED_ENERGY_KEYS)
+
+
 def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60,
-                    tier4_every=30):
+                    tier4_every=30, scale_known=True):
     """Pick which EPC tier to query for cycle *cycle_number*.
 
     spec 018: tier4 (定時積算電力量) wins over tier3 wins over tier2 when
@@ -3573,10 +3586,17 @@ def decide_epc_tier(cycle_number, tier2_every=5, tier3_every=60,
     (tier3_every=60, tier4_every=30) では tier3 の番がすべて tier4 と重なり、
     回さないと係数・単位 (D3 / E1) が一度も取れず、積算電力量の換算が
     単位倍 (0.01 kWh 単位のメーターで 100 倍) に化ける。
+
+    scale_known=False (単位をまだ取れていない) のあいだは、tier4 の番以外は
+    すべて tier3 にする。1 回の tier3 が失敗すると次の番まで 30 分以上空き、
+    その間ずっと単位倍の値を送ることになるため。tier3 の要求にも tier1 の
+    EPC (瞬時電力・電流) が入るので、毎周期の値は失わない。
     """
     tier4_on = tier4_every > 0
     if tier4_on and cycle_number % int(tier4_every) == 0:
         return "tier4"
+    if not scale_known:
+        return "tier3"
     if cycle_number % int(tier3_every) == 0:
         return "tier3"
     prev = cycle_number - 1
@@ -4961,6 +4981,8 @@ def main():
     tid       = 1
     coeff     = 1
     unit_kwh  = 1.0
+    # 単位 (E1) を応答から取れるまでは False。積算電力量を送らず、tier3 を優先する。
+    scale_known = False
     last_ping = time.time()
     # spec 009 mixed pattern: track the last normal-EPCS cycle so probe
     # mode can interleave fast probes without starving HA of power values.
@@ -5120,7 +5142,8 @@ def main():
                 # cumulative energy with meter-side timestamp).
                 tier = decide_epc_tier(
                     normal_cycle_count,
-                    tier4_every=int(cfg.get("epc_tier4_every", 30)))
+                    tier4_every=int(cfg.get("epc_tier4_every", 30)),
+                    scale_known=scale_known)
                 # spec 033: 全 cycle で tier1 EPCs を batch (= mismatch 100% backfill 対象、
                 # [[feedback-cycle-counter-reconnect-tier4]] 構造的問題解消).
                 cycle_epcs = cycle_epcs_with_tier1(tier)
@@ -5194,9 +5217,9 @@ def main():
                     _payload_r, _send_ts_r = (
                         diag_state.pending_rescued_frames.popleft())
                     try:
-                        _m_r = apply_energy_scale(
+                        _m_r = drop_unscaled_energy(apply_energy_scale(
                             decode_measurements(parse_el_response(_payload_r)),
-                            coeff, unit_kwh)
+                            coeff, unit_kwh), scale_known)
                         publish_late_frame(mqtt, device_id, _m_r,
                                            _send_ts_r, cfg, diag_state)
                     except Exception as e:
@@ -5213,6 +5236,8 @@ def main():
                         coeff = m["coefficient"]
                     if "unit_kwh" in m:
                         unit_kwh = m["unit_kwh"]
+                        scale_known = True
+                    m     = drop_unscaled_energy(m, scale_known)
                     if kind == "normal":
                         # Probe responses (0x80 only) carry no power values;
                         # publish only on real measurement cycles.
