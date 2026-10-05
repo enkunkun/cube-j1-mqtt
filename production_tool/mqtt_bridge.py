@@ -858,6 +858,32 @@ def _restart_bridge_async():
     threading.Timer(0.2, _do).start()
 
 
+# spec 054 FR-001: production_tool の ADB settings と同じ手順。
+ADBD_RESTART_COMMANDS = (
+    ["setprop", "service.adb.tcp.port", "5555"],
+    ["stop", "adbd"],
+    ["start", "adbd"],
+)
+
+
+def _restart_adbd(run=None):
+    """adbd を TCP 5555 で立ち上げ直す。1 つ失敗しても残りのコマンドは続ける。"""
+    if run is None:
+        run = lambda argv: subprocess.Popen(argv).wait()
+    for argv in ADBD_RESTART_COMMANDS:
+        try:
+            rc = run(list(argv))
+            if rc:
+                log("adbd restart: {} exited {}".format(" ".join(argv), rc))
+        except Exception as e:
+            log("adbd restart: {} failed: {}".format(" ".join(argv), e))
+
+
+def _restart_adbd_async():
+    """HTTP の応答を書き終えてから adbd を立ち上げ直すよう、200 ms 後に予約する。"""
+    threading.Timer(0.2, _restart_adbd).start()
+
+
 class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """Handler injected with config / paths / lock by start_admin_server."""
 
@@ -1183,6 +1209,15 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         if path == "/api/update":
             self._handle_update()
             return
+        if path == "/api/adb/restart":
+            # spec 054 FR-001: adbd が止まって adb が届かなくなったときの復旧口。
+            self._send_json(200, {"status": "restarting adbd"})
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            _restart_adbd_async()
+            return
         if path == "/api/realtime/start":
             self._handle_realtime_start()
             return
@@ -1197,8 +1232,10 @@ class AdminHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             self._send_json(400, {"error": "missing Content-Length"})
             return
-        if length > 100 * 1024:
-            self._send_json(413, {"error": "File too large (max 100KB)"})
+        # spec 054 FR-002: mqtt_bridge.py は 241 KB (2026-10) あり、旧上限 100 KB
+        # では HTTP 更新が使えなかった。2 倍以上の余裕を持たせて 512 KB にする。
+        if length > 512 * 1024:
+            self._send_json(413, {"error": "File too large (max 512KB)"})
             return
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("multipart/form-data"):

@@ -560,11 +560,27 @@ def test_post_update_rejects_syntax_error(admin_server, admin_creds,
     assert (config_dir / "mqtt_bridge.py").read_bytes() == b"original\n"
 
 
+def test_post_update_accepts_payload_larger_than_100kb(admin_server, admin_creds,
+                                                       config_dir, monkeypatch):
+    """spec 054 FR-002: mqtt_bridge.py は 241 KB あるので、100 KB の上限では更新できなかった。"""
+    _no_restart(monkeypatch)
+    base, _ = admin_server
+    body = b"# pad\n" * (300 * 1024 // 6) + VALID_PY_BODY
+    r = requests.post(
+        base + "/api/update",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+        files={"update_file": ("mqtt_bridge.py", body, "text/x-python")},
+        timeout=5,
+    )
+    assert r.status_code == 200
+    assert (config_dir / "mqtt_bridge.py").read_bytes() == body
+
+
 def test_post_update_rejects_oversize_payload(admin_server, admin_creds,
                                                monkeypatch):
     _no_restart(monkeypatch)
     base, _ = admin_server
-    big_body = b"# big\n" + b"x" * (100 * 1024 + 100)
+    big_body = b"# big\n" + b"x" * (512 * 1024 + 100)
     r = requests.post(
         base + "/api/update",
         headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
@@ -599,6 +615,29 @@ def test_post_restart_returns_200_without_running_bridge_commands(
     )
     assert r.status_code == 200
     assert r.json()["status"] == "restarting"
+
+
+def test_post_adb_restart_requires_auth(admin_server):
+    """spec 054 FR-001: adbd の立ち上げ直しも Basic 認証が必要 (Constitution VI)。"""
+    base, _ = admin_server
+    r = requests.post(base + "/api/adb/restart", timeout=2)
+    assert r.status_code == 401
+
+
+def test_post_adb_restart_schedules_adbd_restart(admin_server, admin_creds,
+                                                  monkeypatch):
+    """spec 054 FR-001: 応答を返してから adbd の立ち上げ直しを予約する。"""
+    scheduled = []
+    monkeypatch.setattr(mb, "_restart_adbd_async", lambda: scheduled.append(True))
+    base, _ = admin_server
+    r = requests.post(
+        base + "/api/adb/restart",
+        headers={"Authorization": _basic(admin_creds["user"], admin_creds["password"])},
+        timeout=2,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "restarting adbd"
+    assert scheduled == [True]
 
 
 # ---------------------------------------------------------------------------
